@@ -24,7 +24,6 @@ app.use(express.json());
 
 const { createClient } = require('@supabase/supabase-js');
 
-const { createClient } = require('@supabase/supabase-js');
 const WebSocket = require('ws'); // <-- Add this import
 
 const supabaseUrl = process.env.SUPABASE_URL;
