@@ -27,6 +27,7 @@
     "playwright": "^1.62.1",
     "playwright-extra": "^4.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "ws": "^8.21.3",
     "youtubei.js": "^17.2.0"
   }
 }

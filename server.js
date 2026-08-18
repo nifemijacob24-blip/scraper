@@ -24,12 +24,21 @@ app.use(express.json());
 
 const { createClient } = require('@supabase/supabase-js');
 
-// 1. Initialize Supabase
-// (We MUST use the Service Role Key here to bypass RLS so the backend can look up ANY user's API key)
+const { createClient } = require('@supabase/supabase-js');
+const WebSocket = require('ws'); // <-- Add this import
+
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY; 
-const supabase = createClient(supabaseUrl, supabaseKey);
 
+// Initialize Supabase with the manual WebSocket injected
+const supabase = createClient(supabaseUrl, supabaseKey, {
+    auth: {
+        persistSession: false // Best practice for server-side clients
+    },
+    global: {
+        WebSocket: WebSocket // <-- This is the magic fix for Node 20
+    }
+});
 const mockRedisCache = {}; // Keeping your cache intact
 
 // Helper function to format and trim post payloads (Unchanged)
@@ -100,18 +109,26 @@ async function authMiddleware(req, res, next) {
         // --- THE MAGIC TRICK ---
         // This intercepts `req.user.credits -= 1` in your endpoints 
         // and automatically syncs the new balance to the database!
+        // --- THE MAGIC TRICK (Upgraded for Graphs) ---
         let currentCredits = userProfile.credits;
         Object.defineProperty(req.user, 'credits', {
             get: function() { return currentCredits; },
             set: function(newVal) {
+                const cost = currentCredits - newVal; // Calculate credits spent
                 currentCredits = newVal;
-                // Update Supabase in the background (fire-and-forget)
+                
+                // 1. Deduct from balance
                 supabase.from('profiles')
                     .update({ credits: newVal })
                     .eq('id', userProfile.id)
-                    .then(({error}) => {
-                        if (error) console.error("DB Credit sync failed:", error);
-                    });
+                    .then(({error}) => { if (error) console.error("DB Credit sync failed:", error); });
+                
+                // 2. Log it to the graph ledger! (Only if they actually spent credits)
+                if (cost > 0) {
+                    supabase.from('api_logs')
+                        .insert([{ user_id: userProfile.id, cost: cost }])
+                        .then(({error}) => { if (error) console.error("DB Log sync failed:", error); });
+                }
             }
         });
 

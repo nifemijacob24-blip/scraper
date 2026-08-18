@@ -1,6 +1,5 @@
 # 1. Use the official Node.js image based on Debian
-FROM node:20-bookworm
-
+FROM node:22-bookworm
 # 2. Set the working directory inside the server
 WORKDIR /workspace
 
