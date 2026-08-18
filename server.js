@@ -22,12 +22,17 @@ app.use(cors({
 
 app.use(express.json());
 
-const usersDB = {
-    "test_api_key_123": { credits: 33950257 }
-};
-const mockRedisCache = {};
+const { createClient } = require('@supabase/supabase-js');
 
-// Helper function to format and trim post payloads
+// 1. Initialize Supabase
+// (We MUST use the Service Role Key here to bypass RLS so the backend can look up ANY user's API key)
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY; 
+const supabase = createClient(supabaseUrl, supabaseKey);
+
+const mockRedisCache = {}; // Keeping your cache intact
+
+// Helper function to format and trim post payloads (Unchanged)
 function formatRedditPosts(rawPostsArray, trim = false) {
     if (!trim) return rawPostsArray;
 
@@ -54,25 +59,67 @@ function formatRedditPosts(rawPostsArray, trim = false) {
     }));
 }
 
-// Authentication middleware
+// 2. The NEW Supabase Authentication Middleware
 async function authMiddleware(req, res, next) {
-    const apiKey = req.headers['x-api-key'];
+    // Support both "x-api-key: sq_live_..." and "Authorization: Bearer sq_live_..." headers
+    let apiKey = req.headers['x-api-key'];
+    if (!apiKey && req.headers['authorization']) {
+        const authHeader = req.headers['authorization'];
+        if (authHeader.startsWith('Bearer ')) {
+            apiKey = authHeader.substring(7);
+        }
+    }
 
     if (!apiKey) {
-        return res.status(403).json({ success: false, error: "403 Forbidden: Missing x-api-key header" });
+        return res.status(403).json({ success: false, error: "403 Forbidden: Missing API Key header." });
     }
 
-    const user = usersDB[apiKey];
-    if (!user) {
-        return res.status(403).json({ success: false, error: "403 Forbidden: Invalid API Key" });
-    }
+    try {
+        // Fetch user from Supabase using the API key
+        const { data: userProfile, error } = await supabase
+            .from('profiles')
+            .select('id, email, credits, api_key')
+            .eq('api_key', apiKey)
+            .single();
 
-    if (user.credits <= 0) {
-        return res.status(403).json({ success: false, error: "403 Forbidden: Insufficient credits" });
-    }
+        if (error || !userProfile) {
+            return res.status(403).json({ success: false, error: "403 Forbidden: Invalid API Key." });
+        }
 
-    req.user = user;
-    next();
+        if (userProfile.credits <= 0) {
+            return res.status(403).json({ success: false, error: "403 Forbidden: Insufficient credits." });
+        }
+
+        // Create the user object for the request
+        req.user = {
+            id: userProfile.id,
+            email: userProfile.email,
+            api_key: userProfile.api_key
+        };
+
+        // --- THE MAGIC TRICK ---
+        // This intercepts `req.user.credits -= 1` in your endpoints 
+        // and automatically syncs the new balance to the database!
+        let currentCredits = userProfile.credits;
+        Object.defineProperty(req.user, 'credits', {
+            get: function() { return currentCredits; },
+            set: function(newVal) {
+                currentCredits = newVal;
+                // Update Supabase in the background (fire-and-forget)
+                supabase.from('profiles')
+                    .update({ credits: newVal })
+                    .eq('id', userProfile.id)
+                    .then(({error}) => {
+                        if (error) console.error("DB Credit sync failed:", error);
+                    });
+            }
+        });
+
+        next();
+    } catch (err) {
+        console.error("Auth Middleware Error:", err);
+        return res.status(500).json({ success: false, error: "Internal Server Error verifying API key." });
+    }
 }
 
 // --- ENDPOINT 1: SUBREDDIT DETAILS (1 CREDIT) ---
