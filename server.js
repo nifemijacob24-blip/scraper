@@ -8688,7 +8688,7 @@ app.get('/v1/trustpilot/search', authMiddleware, async (req, res) => {
     }
 });
 
-const { scrapeYellowpagesAPI } = require('./src/scrapers/Yellowpages');
+const { scrapeYellowpagesAPI } = require('./src/scrapers/yellowpages');
 
 app.get('/v1/yellowpages/search', authMiddleware, async (req, res) => {
     const { term, location, page } = req.query;
