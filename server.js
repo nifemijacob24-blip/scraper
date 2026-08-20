@@ -9,6 +9,77 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const cors = require('cors');
 
+// ⚠️ MUST BE PLACED ABOVE app.use(express.json())
+app.post('/api/webhook/dodo', express.raw({ type: 'application/json' }), async (req, res) => {
+    try {
+        // 1. Verify the cryptographic signature securely using the SDK
+        const event = dodo.webhooks.unwrap(req.body, req.headers);
+
+        // 2. Look for successful payments
+        if (event.type === 'payment.succeeded') {
+            const payment = event.data;
+            const userId = payment.metadata?.user_id;
+            
+            if (userId) {
+                // 3. Find the user in Supabase and add their credits!
+                const { data: profile } = await supabase
+                    .from('profiles')
+                    .select('credits')
+                    .eq('id', userId)
+                    .single();
+                
+                if (profile) {
+                    await supabase
+                        .from('profiles')
+                        .update({ credits: profile.credits + 1000 }) // Adjust based on your packages
+                        .eq('id', userId);
+                }
+            }
+        }
+
+        // Always return 200 OK so Dodo knows you received it and doesn't retry
+        res.status(200).send('Webhook processed');
+    } catch (err) {
+        console.error('Webhook Verification Error:', err.message);
+        res.status(401).send(`Webhook Error: ${err.message}`);
+    }
+});
+
+
+
+const { DodoPayments } = require('dodopayments');
+
+// Initialize Dodo Payments
+const dodo = new DodoPayments({
+    bearerToken: process.env.DODO_PAYMENTS_API_KEY,
+    webhookKey: process.env.DODO_PAYMENTS_WEBHOOK_KEY,
+    environment: 'live_mode' // change to 'test_mode' while developing
+});
+
+// Endpoint to generate a payment link
+app.post('/api/checkout', authMiddleware, async (req, res) => {
+    try {
+        const session = await dodo.checkoutSessions.create({
+            product_cart: [{
+                // You must create a Product in the Dodo dashboard and paste its ID here
+                product_id: 'pdt_YOUR_PRODUCT_ID', 
+                quantity: 1
+            }],
+            metadata: {
+                user_id: req.user.id // Attach the Supabase user ID invisibly!
+            },
+            // Where to send the user after a successful payment
+            return_url: 'https://signalqub.com/dashboard?payment=success'
+        });
+        
+        // Return the checkout link to the React frontend
+        res.json({ success: true, url: session.checkout_url });
+    } catch (error) {
+        console.error("Checkout Error:", error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 // Allow your frontend to talk to this API
 app.use(cors({
     origin: [
