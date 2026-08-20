@@ -4,6 +4,8 @@ const { scrapeSubredditDetails } = require('./src/scrapers/reddit');
 const { scrapeSubredditPosts } = require('./src/scrapers/reddit');
 const { notifyFailure } = require('./src/utils/notifier');
 const { scrapeSubredditSearch } = require('./src/scrapers/reddit');
+const { DodoPayments } = require('dodopayments');
+
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -67,8 +69,20 @@ app.post('/api/webhook/dodo', express.raw({ type: 'application/json' }), async (
 });
 
 
+// Allow your frontend to talk to this API
+app.use(cors({
+    origin: [
+        'https://signalqub.com', 
+        'https://www.signalqub.com',
+        'http://localhost:5173' // Helpful for local testing
+    ],
+    methods: ['GET', 'POST', 'OPTIONS'],
+    credentials: true
+}));
 
-const { DodoPayments } = require('dodopayments');
+app.use(express.json());
+
+
 
 // Map your tier names to your Dodo Payments Product IDs
 const DODO_PRODUCTS = {
@@ -103,19 +117,6 @@ app.post('/api/checkout', authMiddleware, async (req, res) => {
         res.status(500).json({ success: false, error: error.message });
     }
 });
-
-// Allow your frontend to talk to this API
-app.use(cors({
-    origin: [
-        'https://signalqub.com', 
-        'https://www.signalqub.com',
-        'http://localhost:5173' // Helpful for local testing
-    ],
-    methods: ['GET', 'POST', 'OPTIONS'],
-    credentials: true
-}));
-
-app.use(express.json());
 
 const { createClient } = require('@supabase/supabase-js');
 
