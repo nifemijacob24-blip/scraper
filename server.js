@@ -1,30 +1,61 @@
 require('dotenv').config();
 const express = require('express');
-const { scrapeSubredditDetails } = require('./src/scrapers/reddit');
-const { scrapeSubredditPosts } = require('./src/scrapers/reddit');
-const { notifyFailure } = require('./src/utils/notifier');
-const { scrapeSubredditSearch } = require('./src/scrapers/reddit');
+const cors = require('cors');
+const { createClient } = require('@supabase/supabase-js');
+const WebSocket = require('ws');
 const { DodoPayments } = require('dodopayments');
 
+// --- IMPORTS ---
+const { scrapeSubredditDetails } = require('./src/scrapers/reddit');
+const { scrapeSubredditPosts } = require('./src/scrapers/reddit');
+const { scrapeSubredditSearch } = require('./src/scrapers/reddit');
+const { notifyFailure } = require('./src/utils/notifier');
 
+// --- 1. INITIALIZE SUPABASE ---
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY; 
+
+// Initialize Supabase with the manual WebSocket injected
+const supabase = createClient(supabaseUrl, supabaseKey, {
+    auth: {
+        persistSession: false // Best practice for server-side clients
+    },
+    global: {
+        WebSocket: WebSocket // <-- This is the magic fix for Node 20
+    }
+});
+
+// --- 2. INITIALIZE DODO PAYMENTS ---
+const dodo = new DodoPayments({
+    bearerToken: process.env.DODO_PAYMENTS_API_KEY,
+    webhookKey: process.env.DODO_PAYMENTS_WEBHOOK_KEY,
+    environment: 'test_mode' // Change to 'live_mode' when you launch!
+});
+
+// --- INITIALIZE EXPRESS ---
 const app = express();
 const PORT = process.env.PORT || 3000;
-const cors = require('cors');
 
-// ⚠️ MUST BE PLACED ABOVE app.use(express.json())
-// ⚠️ MUST BE PLACED ABOVE app.use(express.json())
+// ==========================================
+// ROUTING ORDER CRITICAL
+// 1. Webhook (Raw Body)
+// 2. Global Parsers (JSON & CORS)
+// 3. Checkout & Other Routes
+// ==========================================
+
+// --- 1. WEBHOOK (Must be before express.json) ---
 app.post('/api/webhook/dodo', express.raw({ type: 'application/json' }), async (req, res) => {
     try {
-        // 1. Verify the cryptographic signature securely using the SDK
+        // Verify the cryptographic signature securely using the SDK
         const event = dodo.webhooks.unwrap(req.body, req.headers);
 
-        // 2. Look for successful payments
+        // Look for successful payments
         if (event.type === 'payment.succeeded') {
             const payment = event.data;
             
             // Extract the custom metadata we passed during checkout
             const userId = payment.metadata?.user_id;
-            const tier = payment.metadata?.tier; // 'freelance' or 'business'
+            const tier = payment.metadata?.tier; 
             
             if (userId && tier) {
                 // Determine how many credits to add based on the tier
@@ -38,7 +69,7 @@ app.post('/api/webhook/dodo', express.raw({ type: 'application/json' }), async (
                     console.warn(`Unrecognized tier mapped in webhook: ${tier}`);
                 }
 
-                // 3. Find the user in Supabase and add their credits!
+                // Find the user in Supabase and add their credits
                 if (creditsToAdd > 0) {
                     const { data: profile } = await supabase
                         .from('profiles')
@@ -60,7 +91,7 @@ app.post('/api/webhook/dodo', express.raw({ type: 'application/json' }), async (
             }
         }
 
-        // Always return 200 OK so Dodo knows you received it and doesn't retry
+        // Always return 200 OK so Dodo knows you received it
         res.status(200).send('Webhook processed');
     } catch (err) {
         console.error('Webhook Verification Error:', err.message);
@@ -68,13 +99,12 @@ app.post('/api/webhook/dodo', express.raw({ type: 'application/json' }), async (
     }
 });
 
-
-// Allow your frontend to talk to this API
+// --- 2. GLOBAL PARSERS ---
 app.use(cors({
     origin: [
         'https://signalqub.com', 
         'https://www.signalqub.com',
-        'http://localhost:5173' // Helpful for local testing
+        'http://localhost:5173'
     ],
     methods: ['GET', 'POST', 'OPTIONS'],
     credentials: true
@@ -83,16 +113,16 @@ app.use(cors({
 app.use(express.json());
 
 
-
-// Map your tier names to your Dodo Payments Product IDs
+// --- 3. CHECKOUT ROUTE ---
 const DODO_PRODUCTS = {
     freelance: 'pdt_0NgKdNG9gmvISX9PXCSHC',   // $43 / 25k credits
     business: 'pdt_YOUR_BUSINESS_PRODUCT_ID'      // $448 / 500k credits
 };
 
+// ** NOTE: Make sure your `authMiddleware` function is defined below here in your file! **
 app.post('/api/checkout', authMiddleware, async (req, res) => {
     try {
-        const { tier } = req.body; // e.g., 'freelance' or 'business'
+        const { tier } = req.body; 
         const productId = DODO_PRODUCTS[tier];
 
         if (!productId) {
@@ -118,22 +148,7 @@ app.post('/api/checkout', authMiddleware, async (req, res) => {
     }
 });
 
-const { createClient } = require('@supabase/supabase-js');
 
-const WebSocket = require('ws'); // <-- Add this import
-
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY; 
-
-// Initialize Supabase with the manual WebSocket injected
-const supabase = createClient(supabaseUrl, supabaseKey, {
-    auth: {
-        persistSession: false // Best practice for server-side clients
-    },
-    global: {
-        WebSocket: WebSocket // <-- This is the magic fix for Node 20
-    }
-});
 const mockRedisCache = {}; // Keeping your cache intact
 
 // Helper function to format and trim post payloads (Unchanged)
