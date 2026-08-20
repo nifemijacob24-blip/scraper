@@ -10,6 +10,7 @@ const PORT = process.env.PORT || 3000;
 const cors = require('cors');
 
 // ⚠️ MUST BE PLACED ABOVE app.use(express.json())
+// ⚠️ MUST BE PLACED ABOVE app.use(express.json())
 app.post('/api/webhook/dodo', express.raw({ type: 'application/json' }), async (req, res) => {
     try {
         // 1. Verify the cryptographic signature securely using the SDK
@@ -18,21 +19,41 @@ app.post('/api/webhook/dodo', express.raw({ type: 'application/json' }), async (
         // 2. Look for successful payments
         if (event.type === 'payment.succeeded') {
             const payment = event.data;
-            const userId = payment.metadata?.user_id;
             
-            if (userId) {
-                // 3. Find the user in Supabase and add their credits!
-                const { data: profile } = await supabase
-                    .from('profiles')
-                    .select('credits')
-                    .eq('id', userId)
-                    .single();
+            // Extract the custom metadata we passed during checkout
+            const userId = payment.metadata?.user_id;
+            const tier = payment.metadata?.tier; // 'freelance' or 'business'
+            
+            if (userId && tier) {
+                // Determine how many credits to add based on the tier
+                let creditsToAdd = 0;
                 
-                if (profile) {
-                    await supabase
+                if (tier === 'freelance') {
+                    creditsToAdd = 25000;
+                } else if (tier === 'business') {
+                    creditsToAdd = 500000;
+                } else {
+                    console.warn(`Unrecognized tier mapped in webhook: ${tier}`);
+                }
+
+                // 3. Find the user in Supabase and add their credits!
+                if (creditsToAdd > 0) {
+                    const { data: profile } = await supabase
                         .from('profiles')
-                        .update({ credits: profile.credits + 1000 }) // Adjust based on your packages
-                        .eq('id', userId);
+                        .select('credits')
+                        .eq('id', userId)
+                        .single();
+                    
+                    if (profile) {
+                        const newBalance = profile.credits + creditsToAdd;
+                        
+                        await supabase
+                            .from('profiles')
+                            .update({ credits: newBalance })
+                            .eq('id', userId);
+                            
+                        console.log(`✅ Payment Succeeded: Granted ${creditsToAdd} credits to user ${userId}. New balance: ${newBalance}`);
+                    }
                 }
             }
         }
@@ -49,30 +70,33 @@ app.post('/api/webhook/dodo', express.raw({ type: 'application/json' }), async (
 
 const { DodoPayments } = require('dodopayments');
 
-// Initialize Dodo Payments
-const dodo = new DodoPayments({
-    bearerToken: process.env.DODO_PAYMENTS_API_KEY,
-    webhookKey: process.env.DODO_PAYMENTS_WEBHOOK_KEY,
-    environment: 'live_mode' // change to 'test_mode' while developing
-});
+// Map your tier names to your Dodo Payments Product IDs
+const DODO_PRODUCTS = {
+    freelance: 'pdt_0NgKdNG9gmvISX9PXCSHC',   // $43 / 25k credits
+    business: 'pdt_YOUR_BUSINESS_PRODUCT_ID'      // $448 / 500k credits
+};
 
-// Endpoint to generate a payment link
 app.post('/api/checkout', authMiddleware, async (req, res) => {
     try {
+        const { tier } = req.body; // e.g., 'freelance' or 'business'
+        const productId = DODO_PRODUCTS[tier];
+
+        if (!productId) {
+            return res.status(400).json({ success: false, error: "Invalid pricing tier selected." });
+        }
+
         const session = await dodo.checkoutSessions.create({
             product_cart: [{
-                // You must create a Product in the Dodo dashboard and paste its ID here
-                product_id: 'pdt_YOUR_PRODUCT_ID', 
+                product_id: productId,
                 quantity: 1
             }],
             metadata: {
-                user_id: req.user.id // Attach the Supabase user ID invisibly!
+                user_id: req.user.id,
+                tier: tier
             },
-            // Where to send the user after a successful payment
             return_url: 'https://signalqub.com/dashboard?payment=success'
         });
         
-        // Return the checkout link to the React frontend
         res.json({ success: true, url: session.checkout_url });
     } catch (error) {
         console.error("Checkout Error:", error);
