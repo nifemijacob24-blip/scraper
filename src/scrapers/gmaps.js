@@ -115,6 +115,7 @@ async function scrapeGoogleMapsSearch(query) {
                 let rating = null;
                 let reviews = 0;
                 
+                // Attempt 1: Hidden Aria-label (Sometimes has both, sometimes just rating)
                 const ratingEl = container.querySelector('[aria-label*="star"]');
                 if (ratingEl) {
                     const aria = ratingEl.getAttribute('aria-label'); 
@@ -125,11 +126,17 @@ async function scrapeGoogleMapsSearch(query) {
                     if (reviewMatch) reviews = parseInt(reviewMatch[1].replace(/,/g, ''), 10);
                 }
 
-                if (rating === null) {
-                    const textMatch = container.innerText.match(/([\d.]+)\s*\(([\d,]+)\)/);
+                // Attempt 2: Visible Text (Fallback if aria-label missed the review count)
+                // Looks for exact patterns like "4.8 (1,234)" or just "(1,234)" in the text
+                if (rating === null || reviews === 0) {
+                    const textMatch = container.innerText.match(/([\d.]+)?\s*\(([\d,]+)\)/);
                     if (textMatch) {
-                        rating = parseFloat(textMatch[1]);
-                        reviews = parseInt(textMatch[2].replace(/,/g, ''), 10);
+                        if (rating === null && textMatch[1]) {
+                            rating = parseFloat(textMatch[1]);
+                        }
+                        if (reviews === 0 && textMatch[2]) {
+                            reviews = parseInt(textMatch[2].replace(/,/g, ''), 10);
+                        }
                     }
                 }
 
