@@ -42,9 +42,10 @@ async function scrapeGoogleMapsSearch(query) {
 
         const page = await context.newPage();
 
+        // ⚠️ FIXED: We MUST allow 'stylesheet' so Google Maps can build the scrollable layout!
         await page.route('**/*', (route) => {
             const type = route.request().resourceType();
-            if (['image', 'media', 'stylesheet', 'font'].includes(type)) {
+            if (['image', 'media', 'font'].includes(type)) { // Images and fonts are blocked to save RAM
                 route.abort();
             } else {
                 route.continue();
@@ -71,43 +72,34 @@ async function scrapeGoogleMapsSearch(query) {
             return [];
         }
 
-        // --- ULTIMATE AUTO-SCROLL LOGIC ---
+        // --- FIXED AUTO-SCROLL LOGIC ---
         let previousCount = 0;
         let unchangedCount = 0;
         const scrollStartTime = Date.now();
 
-        // Move the virtual mouse into the left-side panel where the feed actually lives
-        await page.mouse.move(300, 400).catch(() => {});
-
-        while (unchangedCount < 4) { // Give it 4 tries to account for proxy lag
+        while (unchangedCount < 4) {
             if (Date.now() - scrollStartTime > 45000) {
                 console.log("[Maps Scraper] Scroll timeout reached (45s). Extracting results.");
                 break;
             }
 
-            // Method 1: Playwright Hardware Scroll (Simulates real mouse wheel spam)
-            await page.mouse.wheel(0, 15000).catch(() => {});
-
-            // Method 2: DOM Native Scroll (Finds the true scrollable container dynamically)
             await page.evaluate(() => {
+                // Scroll the feed container directly
+                const feed = document.querySelector('div[role="feed"]');
+                if (feed) {
+                    feed.scrollTop = feed.scrollHeight;
+                    // Failsafe: Scroll its immediate parents if Google moved the overflow property
+                    if (feed.parentElement) feed.parentElement.scrollTop = feed.parentElement.scrollHeight;
+                }
+                
+                // Scroll the last element into view
                 const links = document.querySelectorAll('a[href*="/maps/place/"]');
                 if (links.length > 0) {
-                    const lastLink = links[links.length - 1];
-                    lastLink.scrollIntoView({ behavior: 'instant', block: 'end' });
-                    
-                    // Walk up the DOM tree and forcefully scroll EVERY scrollable parent to the bottom
-                    let parent = lastLink.parentElement;
-                    while (parent && parent !== document.body) {
-                        if (parent.scrollHeight > parent.clientHeight) {
-                            parent.scrollTop = parent.scrollHeight;
-                        }
-                        parent = parent.parentElement;
-                    }
+                    links[links.length - 1].scrollIntoView({ behavior: 'smooth', block: 'end' });
                 }
             });
             
-            // Wait for the spinning loader to finish fetching the new JSON batch
-            await new Promise(resolve => setTimeout(resolve, 3000));
+            await new Promise(resolve => setTimeout(resolve, 3000)); // Wait for lazy load
 
             const currentCount = await page.evaluate(() => document.querySelectorAll('a[href*="/maps/place/"]').length);
             
@@ -142,7 +134,7 @@ async function scrapeGoogleMapsSearch(query) {
                 let reviews = 0;
                 let phone = null;
                 
-                // 1. Phone Extraction
+                // 1. Phone Extraction (Safe format checking)
                 const phoneRegex = /(?:\+?\d{1,3}[\s.-]?)?(?:\(?\d{2,4}\)?[\s.-]?)?\d{3,4}[\s.-]?\d{3,4}/g;
                 const matches = textContent.match(phoneRegex);
                 if (matches) {
@@ -150,7 +142,7 @@ async function scrapeGoogleMapsSearch(query) {
                     if (validPhone) phone = validPhone.trim();
                 }
 
-                // 2. Rating & Reviews
+                // 2. Rating Extraction
                 const ratingEl = container.querySelector('[aria-label*="star"]');
                 if (ratingEl) {
                     const aria = ratingEl.getAttribute('aria-label'); 
@@ -163,28 +155,36 @@ async function scrapeGoogleMapsSearch(query) {
 
                 // Fallback for Rating
                 if (rating === null) {
-                    // Looks strictly for "4.5 (1,234)" format to avoid area codes
                     const ratingTextMatch = textContent.match(/([1-5](?:\.\d)?)\s*\(([\d,]+)\)/);
                     if (ratingTextMatch) {
                         rating = parseFloat(ratingTextMatch[1]);
-                        if (reviews === 0) reviews = parseInt(ratingTextMatch[2].replace(/,/g, ''), 10);
                     }
                 }
 
-                // Bulletproof Fallback for Reviews
+                // 3. Bulletproof Reviews Extraction
                 if (reviews === 0) {
-                    // Find a span that contains EXACTLY a number in parentheses, e.g. "(1,234)"
-                    const spans = Array.from(container.querySelectorAll('span'));
-                    for (const span of spans) {
-                        const txt = span.innerText.trim();
-                        if (/^\([\d,]+\)$/.test(txt)) {
-                            reviews = parseInt(txt.replace(/\D/g, ''), 10);
-                            break;
+                    // Method A: Check for the explicit review aria-label (Maps recently added this)
+                    const reviewEl = container.querySelector('[aria-label*="review"]');
+                    if (reviewEl) {
+                        const rMatch = reviewEl.getAttribute('aria-label').match(/([\d,]+)/);
+                        if (rMatch) reviews = parseInt(rMatch[1].replace(/,/g, ''), 10);
+                    } else {
+                        // Method B: Find span with exact "(123)" format, making sure it isn't the phone area code
+                        const spans = Array.from(container.querySelectorAll('span'));
+                        for (const span of spans) {
+                            const txt = span.innerText.trim();
+                            if (/^\([\d,]+\)$/.test(txt)) {
+                                // If this exact "(602)" is part of the phone string, ignore it!
+                                if (phone && phone.includes(txt)) continue;
+                                
+                                reviews = parseInt(txt.replace(/\D/g, ''), 10);
+                                break;
+                            }
                         }
                     }
                 }
 
-                // 3. Coordinates
+                // 4. Coordinates
                 let lat = null;
                 let lng = null;
                 const coordMatch = url.match(/!3d([-.\d]+)!4d([-.\d]+)/);
@@ -199,14 +199,14 @@ async function scrapeGoogleMapsSearch(query) {
                     }
                 }
                 
-                // 4. Place ID
+                // 5. Place ID
                 let place_id = null;
                 const placeIdMatch = url.match(/!19s([^?!&]+)/);
                 if (placeIdMatch) {
                     place_id = placeIdMatch[1];
                 }
 
-                // 5. Website & Domain
+                // 6. Website & Domain
                 let website = null;
                 let domain = null;
                 let websiteEl = container.querySelector('a[data-value="Website"]') || 
