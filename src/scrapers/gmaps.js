@@ -26,8 +26,10 @@ async function scrapeGoogleMapsSearch(query) {
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-web-security',
-                '--disable-dev-shm-usage', // ⚠️ CRITICAL: Fixes the Code 128 / 137 Docker crash
-                '--disable-gpu',           // ⚠️ Saves massive RAM by disabling hardware acceleration
+                '--disable-dev-shm-usage', // Critical for Docker/DigitalOcean
+                '--disable-gpu',           // Critical for saving RAM
+                '--disable-features=IsolateOrigins,site-per-process', // Reduces multi-process memory
+                '--js-flags="--max-old-space-size=256"' // Forces aggressive garbage collection
             ]
         });
 
@@ -40,10 +42,9 @@ async function scrapeGoogleMapsSearch(query) {
 
         const page = await context.newPage();
 
-        // ⚠️ Expanded Interceptor: Block CSS and Fonts too!
+        // Aggressive resource blocking to save RAM
         await page.route('**/*', (route) => {
             const type = route.request().resourceType();
-            // Allow XHR/Fetch (needed for lazy loading) and Script (needed for Maps logic)
             if (['image', 'media', 'stylesheet', 'font'].includes(type)) {
                 route.abort();
             } else {
@@ -51,7 +52,7 @@ async function scrapeGoogleMapsSearch(query) {
             }
         });
 
-        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 35000 });
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
 
         const consentButton = await page.$('button:has-text("Accept all"), button:has-text("Agree")');
         if (consentButton) {
@@ -66,56 +67,66 @@ async function scrapeGoogleMapsSearch(query) {
         if (!feedElement) {
             const title = await page.title();
             if (title.includes('Google Maps')) {
-                throw new Error("No search feed found. Google Maps might have loaded a direct exact-match place, or the proxy was blocked.");
+                throw new Error("No search feed found. Google Maps loaded a direct place match, or the proxy was blocked.");
             }
-            return []; // No results
+            return [];
         }
 
-        // --- SMART AUTO-SCROLL LOGIC ---
+        // --- SMART AUTO-SCROLL LOGIC WITH HARD RAM PROTECTIONS ---
         let previousCount = 0;
         let unchangedCount = 0;
+        const scrollStartTime = Date.now();
 
-        // Keep scrolling until the item count stops increasing (max 3 checks)
         while (unchangedCount < 3) {
-            await page.evaluate((selector) => {
-                const el = document.querySelector(selector);
-                if (el) el.scrollTop = el.scrollHeight;
-            }, feedSelector);
+            // RAM Protection: Never scroll for more than 45 seconds
+            if (Date.now() - scrollStartTime > 45000) {
+                console.log("[Maps Scraper] Scroll timeout reached. Extracting current results to prevent memory crash.");
+                break;
+            }
+
+            await page.evaluate(() => {
+                const links = document.querySelectorAll('a[href*="/maps/place/"]');
+                if (links.length > 0) {
+                    links[links.length - 1].scrollIntoView({ behavior: 'smooth', block: 'end' });
+                }
+            });
             
-            await new Promise(resolve => setTimeout(resolve, 2000)); // Wait for lazy load
+            await new Promise(resolve => setTimeout(resolve, 2500)); 
 
             const currentCount = await page.evaluate(() => document.querySelectorAll('a[href*="/maps/place/"]').length);
             
             if (currentCount === previousCount) {
+                const endText = await page.evaluate(() => document.body.innerText.includes("You've reached the end of the list"));
+                if (endText) break;
                 unchangedCount++;
             } else {
                 unchangedCount = 0;
                 previousCount = currentCount;
             }
 
-            // Failsafe: Google caps at ~120, stop if we miraculously exceed 150 to prevent infinite loops
-            if (currentCount >= 150) break;
+            if (currentCount >= 120) break;
         }
 
-        // --- DOM EXTRACTION ---
+        // --- DOM EXTRACTION (Now including Phone Numbers) ---
         const rawListings = await page.evaluate(() => {
             const items = [];
             const links = document.querySelectorAll('a[href*="/maps/place/"]');
             
             links.forEach(a => {
                 const url = a.href;
-                
                 let container = a.parentElement;
                 if (container && container.parentElement) {
                     container = container.parentElement;
                 }
                 
                 const name = a.getAttribute('aria-label') || container.querySelector('.qBF1Pd')?.innerText || "";
+                const textContent = container.innerText || "";
                 
                 let rating = null;
                 let reviews = 0;
+                let phone = null;
                 
-                // Attempt 1: Hidden Aria-label (Sometimes has both, sometimes just rating)
+                // 1. Rating & Reviews
                 const ratingEl = container.querySelector('[aria-label*="star"]');
                 if (ratingEl) {
                     const aria = ratingEl.getAttribute('aria-label'); 
@@ -126,20 +137,24 @@ async function scrapeGoogleMapsSearch(query) {
                     if (reviewMatch) reviews = parseInt(reviewMatch[1].replace(/,/g, ''), 10);
                 }
 
-                // Attempt 2: Visible Text (Fallback if aria-label missed the review count)
-                // Looks for exact patterns like "4.8 (1,234)" or just "(1,234)" in the text
                 if (rating === null || reviews === 0) {
-                    const textMatch = container.innerText.match(/([\d.]+)?\s*\(([\d,]+)\)/);
+                    const textMatch = textContent.match(/([\d.]+)?\s*\(([\d,]+)\)/);
                     if (textMatch) {
-                        if (rating === null && textMatch[1]) {
-                            rating = parseFloat(textMatch[1]);
-                        }
-                        if (reviews === 0 && textMatch[2]) {
-                            reviews = parseInt(textMatch[2].replace(/,/g, ''), 10);
-                        }
+                        if (rating === null && textMatch[1]) rating = parseFloat(textMatch[1]);
+                        if (reviews === 0 && textMatch[2]) reviews = parseInt(textMatch[2].replace(/,/g, ''), 10);
                     }
                 }
 
+                // 2. Phone Extraction (Matches standard UK/US and international formats found in GMaps text)
+                const phoneRegex = /(?:\+?\d{1,3}[\s.-]?)?(?:\(?\d{2,4}\)?[\s.-]?)?\d{3,4}[\s.-]?\d{3,4}/g;
+                const matches = textContent.match(phoneRegex);
+                if (matches) {
+                    // Filter out years/dates and focus on typical phone number lengths (10-15 chars)
+                    const validPhone = matches.find(m => m.replace(/[\s.-]/g, '').length >= 10);
+                    if (validPhone) phone = validPhone.trim();
+                }
+
+                // 3. Coordinates
                 let lat = null;
                 let lng = null;
                 const coordMatch = url.match(/!3d([-.\d]+)!4d([-.\d]+)/);
@@ -154,12 +169,14 @@ async function scrapeGoogleMapsSearch(query) {
                     }
                 }
                 
+                // 4. Place ID
                 let place_id = null;
                 const placeIdMatch = url.match(/!19s([^?!&]+)/);
                 if (placeIdMatch) {
                     place_id = placeIdMatch[1];
                 }
 
+                // 5. Website & Domain
                 let website = null;
                 let domain = null;
                 let websiteEl = container.querySelector('a[data-value="Website"]') || 
@@ -180,10 +197,11 @@ async function scrapeGoogleMapsSearch(query) {
                 }
 
                 if (name) {
-                    items.push({ name, url, rating, reviews, lat, lng, place_id, website, domain });
+                    items.push({ name, url, rating, reviews, phone, lat, lng, place_id, website, domain });
                 }
             });
             
+            // Deduplicate by URL
             const unique = [];
             const seen = new Set();
             for (const item of items) {
