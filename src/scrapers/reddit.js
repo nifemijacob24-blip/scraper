@@ -338,6 +338,7 @@ async function scrapeSubredditSearch(subredditName, query, sort = 'relevance', t
 
 
 
+// --- 1. TRIMMED PARSER ---
 function parseCommentsTree(childrenArray) {
     const items = [];
     let more = { has_more: false, cursor: null };
@@ -346,17 +347,22 @@ function parseCommentsTree(childrenArray) {
         if (child.kind === 't1') { // It's a Comment
             const c = child.data;
             
-            // Build the core comment object
+            // Explicitly pick ONLY the relevant fields
             const parsedComment = {
-                ...c, // Spread raw data to keep all Reddit fields
-                url: `https://www.reddit.com${c.permalink}`,
+                id: c.id,
+                author: c.author,
+                body: c.body,
+                score: c.score, // Upvotes
+                is_op: c.is_submitter, // True if the commenter is the original poster
                 created_at_iso: new Date(c.created_utc * 1000).toISOString(),
-                replies: { items: [], more: { has_more: false, cursor: null } }
+                url: `https://www.reddit.com${c.permalink}`,
+                replies: [] // Default to empty array
             };
 
             // Recursively process replies if they exist
             if (c.replies && c.replies.data && c.replies.data.children) {
-                parsedComment.replies = parseCommentsTree(c.replies.data.children);
+                const nestedReplies = parseCommentsTree(c.replies.data.children);
+                parsedComment.replies = nestedReplies.items;
             }
 
             items.push(parsedComment);
@@ -371,23 +377,28 @@ function parseCommentsTree(childrenArray) {
     return { items, more };
 }
 
-// --- 1. UPDATED FORMATTER ---
+// --- 2. TRIMMED FORMATTER ---
 function formatRedditPostAndComments(rawJson) {
     // rawJson[0] is the post, rawJson[1] is the comment tree
-    const postData = rawJson[0].data.children[0].data;
+    const p = rawJson[0].data.children[0].data;
     const commentsData = rawJson[1].data.children;
 
     const parsedCommentsTree = parseCommentsTree(commentsData);
 
     return {
         post: {
-            ...postData,
-            created_at_iso: new Date(postData.created_utc * 1000).toISOString()
+            id: p.id,
+            title: p.title,
+            author: p.author,
+            body: p.selftext,
+            score: p.score,
+            num_comments: p.num_comments,
+            url: `https://www.reddit.com${p.permalink}`,
+            created_at_iso: new Date(p.created_utc * 1000).toISOString()
         },
         comments: parsedCommentsTree.items,
-        // Standardize the pagination naming for your API consumers
-        next_cursor: parsedCommentsTree.more && parsedCommentsTree.more.length > 0 ? parsedCommentsTree.more[0] : null,
-        more: parsedCommentsTree.more
+        next_cursor: parsedCommentsTree.more && parsedCommentsTree.more.cursor ? parsedCommentsTree.more.cursor : null,
+        has_more: parsedCommentsTree.more ? parsedCommentsTree.more.has_more : false
     };
 }
 
