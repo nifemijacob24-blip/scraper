@@ -25,7 +25,9 @@ async function scrapeGoogleMapsSearch(query) {
                 '--disable-blink-features=AutomationControlled',
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
-                '--disable-web-security'
+                '--disable-web-security',
+                '--disable-dev-shm-usage', // ⚠️ CRITICAL: Fixes the Code 128 / 137 Docker crash
+                '--disable-gpu',           // ⚠️ Saves massive RAM by disabling hardware acceleration
             ]
         });
 
@@ -38,9 +40,11 @@ async function scrapeGoogleMapsSearch(query) {
 
         const page = await context.newPage();
 
+        // ⚠️ Expanded Interceptor: Block CSS and Fonts too!
         await page.route('**/*', (route) => {
             const type = route.request().resourceType();
-            if (['image', 'media'].includes(type)) {
+            // Allow XHR/Fetch (needed for lazy loading) and Script (needed for Maps logic)
+            if (['image', 'media', 'stylesheet', 'font'].includes(type)) {
                 route.abort();
             } else {
                 route.continue();
