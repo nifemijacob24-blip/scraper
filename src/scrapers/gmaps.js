@@ -71,36 +71,43 @@ async function scrapeGoogleMapsSearch(query) {
             return [];
         }
 
-        // --- UPGRADED AUTO-SCROLL LOGIC ---
+        // --- ULTIMATE AUTO-SCROLL LOGIC ---
         let previousCount = 0;
         let unchangedCount = 0;
         const scrollStartTime = Date.now();
 
-        // Focus the feed so keyboard events work
-        await feedElement.focus().catch(() => {});
+        // Move the virtual mouse into the left-side panel where the feed actually lives
+        await page.mouse.move(300, 400).catch(() => {});
 
-        while (unchangedCount < 3) {
+        while (unchangedCount < 4) { // Give it 4 tries to account for proxy lag
             if (Date.now() - scrollStartTime > 45000) {
                 console.log("[Maps Scraper] Scroll timeout reached (45s). Extracting results.");
                 break;
             }
 
+            // Method 1: Playwright Hardware Scroll (Simulates real mouse wheel spam)
+            await page.mouse.wheel(0, 15000).catch(() => {});
+
+            // Method 2: DOM Native Scroll (Finds the true scrollable container dynamically)
             await page.evaluate(() => {
-                // 1. Scroll the feed container directly
-                const feed = document.querySelector('div[role="feed"]');
-                if (feed) feed.scrollTop = feed.scrollHeight;
-                
-                // 2. Scroll the last element into view
                 const links = document.querySelectorAll('a[href*="/maps/place/"]');
                 if (links.length > 0) {
-                    links[links.length - 1].scrollIntoView({ behavior: 'smooth', block: 'end' });
+                    const lastLink = links[links.length - 1];
+                    lastLink.scrollIntoView({ behavior: 'instant', block: 'end' });
+                    
+                    // Walk up the DOM tree and forcefully scroll EVERY scrollable parent to the bottom
+                    let parent = lastLink.parentElement;
+                    while (parent && parent !== document.body) {
+                        if (parent.scrollHeight > parent.clientHeight) {
+                            parent.scrollTop = parent.scrollHeight;
+                        }
+                        parent = parent.parentElement;
+                    }
                 }
             });
             
-            // 3. Simulate pressing the 'End' key to trigger listeners
-            await page.keyboard.press('End').catch(() => {});
-            
-            await new Promise(resolve => setTimeout(resolve, 3000)); // Wait for lazy load
+            // Wait for the spinning loader to finish fetching the new JSON batch
+            await new Promise(resolve => setTimeout(resolve, 3000));
 
             const currentCount = await page.evaluate(() => document.querySelectorAll('a[href*="/maps/place/"]').length);
             
