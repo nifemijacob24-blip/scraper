@@ -115,8 +115,8 @@ app.use(express.json());
 
 // --- 3. CHECKOUT ROUTE ---
 const DODO_PRODUCTS = {
-    freelance: 'pdt_0NgKdNG9gmvISX9PXCSHC',   // $43 / 25k credits
-    business: 'pdt_YOUR_BUSINESS_PRODUCT_ID'      // $448 / 500k credits
+    freelance: 'pdt_0Nm64vHyFBNMYQ8psOOvG',   // $43 / 25k credits
+    business: 'pdt_0Nm65NK5dcgDghkgeaYD5'      // $448 / 500k credits
 };
 
 // ** NOTE: Make sure your `authMiddleware` function is defined below here in your file! **
