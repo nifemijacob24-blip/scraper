@@ -29,7 +29,7 @@ const supabase = createClient(supabaseUrl, supabaseKey, {
 const dodo = new DodoPayments({
     bearerToken: process.env.DODO_PAYMENTS_API_KEY,
     webhookKey: process.env.DODO_PAYMENTS_WEBHOOK_KEY,
-    environment: 'test_mode' // Change to 'live_mode' when you launch!
+    environment: 'live_mode' // Change to 'live_mode' when you launch!
 });
 
 // --- INITIALIZE EXPRESS ---
