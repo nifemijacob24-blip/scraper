@@ -914,50 +914,86 @@ const { transcribeVideoBuffer } = require('./src/services/transcription');
 const { scrapeSinglePost } = require('./src/scrapers/instagram');
 
 app.get('/v1/instagram/post', authMiddleware, async (req, res) => {
-    const { shortcode } = req.query;
+    // 1. Extract parameters from your user's request
+    const { shortcode, region, trim, download_media, cache_max_age } = req.query;
 
     if (!shortcode) {
         return res.status(400).json({ 
             success: false, 
-            error: "Missing required parameter 'shortcode'" 
+            error: "400 Bad Request: Missing required parameter 'shortcode'" 
         });
     }
 
-    const costPerRequest = 1;
+    // 2. Determine the maximum potential cost to protect your margins
+    const isDownloadRequested = String(download_media).toLowerCase() === 'true';
+    const maxExpectedCost = isDownloadRequested ? 10 : 1;
 
-    if (req.user.credits < costPerRequest) {
+    // Check if the user has enough credits to attempt this request
+    if (req.user.credits < maxExpectedCost) {
         return res.status(403).json({
             success: false,
-            error: `403 Forbidden: Insufficient credits. This request requires ${costPerRequest} credits.`
+            error: `403 Forbidden: Insufficient credits. This request requires up to ${maxExpectedCost} credits.`
         });
     }
 
+    // 3. Construct the upstream URL
+    const upstreamUrl = new URL('https://api.scrapecreators.com/v1/instagram/post');
+    
+    // Convert the shortcode into a full URL for the upstream API
+    upstreamUrl.searchParams.append('url', `https://www.instagram.com/p/${shortcode}/`);
+    
+    // Pass optional parameters if your user provided them
+    if (region) upstreamUrl.searchParams.append('region', region);
+    if (trim) upstreamUrl.searchParams.append('trim', trim);
+    if (download_media) upstreamUrl.searchParams.append('download_media', download_media);
+    if (cache_max_age) upstreamUrl.searchParams.append('cache_max_age', cache_max_age);
+
     try {
-        const post = await scrapeSinglePost(shortcode);
-        
-        // Handle 404 or scraper errors cleanly
-        if (post.status === "error") {
-            return res.status(404).json({
+        // 4. Make the call to ScrapeCreators
+        const response = await fetch(upstreamUrl.toString(), {
+            method: 'GET',
+            headers: {
+                'x-api-key': process.env.SCRAPECREATORS_API_KEY, // Ensure this is set in your .env file
+                'Content-Type': 'application/json'
+            }
+        });
+
+        const targetData = await response.json();
+
+        // 5. Handle upstream errors cleanly without crashing your server
+        if (!response.ok || !targetData.success) {
+            return res.status(response.status === 200 ? 500 : response.status).json({
                 success: false,
-                error: post.error || "Post not found or account is private."
+                error: targetData.error || "Upstream connection failure or post not found."
             });
         }
 
-        // Deduct the credits
-        req.user.credits -= costPerRequest;
+        // 6. Deduct the EXACT credits charged by the upstream provider
+        // If download_media was true but no media was found, this safely deducts 1 instead of 10.
+        const actualCreditsCharged = targetData.credits_charged || 1;
+        req.user.credits -= actualCreditsCharged;
 
-        // Return the formatted response
-        res.status(200).json({
+        // NOTE: If you save user data to a DB (like Supabase or MongoDB), update the balance here.
+        // await updateUserBalance(req.user.id, req.user.credits);
+
+        // 7. Return the formatted response back to your user
+        return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
-            credits_charged: costPerRequest,
+            credits_charged: actualCreditsCharged,
             status: "success",
-            data: post.data
+            data: targetData.data // This contains the 'xdt_shortcode_media' object from upstream
         });
+
     } catch (error) {
-        res.status(error.statusCode || 500).json({ 
+        console.error('Instagram Scraper Proxy Error:', error);
+        
+        // Log the failure to your internal tracking system if you have one
+        // notifyFailure({ endpoint: '/v1/instagram/post', errorMsg: error.message });
+
+        return res.status(500).json({ 
             success: false, 
-            error: error.message 
+            error: "500 Internal Server Error: Failed to reach extraction provider." 
         });
     }
 });
