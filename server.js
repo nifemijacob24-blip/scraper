@@ -961,7 +961,7 @@ app.get('/v1/instagram/post', authMiddleware, async (req, res) => {
         const response = await fetch(upstreamUrl.toString(), {
             method: 'GET',
             headers: {
-                'x-api-key': process.env.SCRAPER_API_KEY, // Ensure this is set in DigitalOcean!
+                'x-api-key': process.env.SCRAPE_CREATORS_API_KEY, // Ensure this is set in DigitalOcean!
                 'Content-Type': 'application/json'
             }
         });
@@ -1061,7 +1061,7 @@ app.get('/v1/instagram/transcript', authMiddleware, async (req, res) => {
         const response = await fetch(upstreamUrl.toString(), {
             method: 'GET',
             headers: {
-                'x-api-key': process.env.SCRAPER_API_KEY,
+                'x-api-key': process.env.SCRAPE_CREATORS_API_KEY,
                 'Content-Type': 'application/json'
             }
         });
