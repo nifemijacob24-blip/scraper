@@ -914,7 +914,7 @@ const { transcribeVideoBuffer } = require('./src/services/transcription');
 const { scrapeSinglePost } = require('./src/scrapers/instagram');
 
 app.get('/v1/instagram/post', authMiddleware, async (req, res) => {
-    // 1. Extract parameters from your user's request
+    // 1. Extract parameters from the user's request
     const { shortcode, region, trim, download_media, cache_max_age } = req.query;
 
     if (!shortcode) {
@@ -924,11 +924,11 @@ app.get('/v1/instagram/post', authMiddleware, async (req, res) => {
         });
     }
 
-    // 2. Determine the maximum potential cost to protect your margins
+    // 2. Determine maximum expected cost to protect user margins
+    // Upstream charges up to 10 credits if media is successfully downloaded
     const isDownloadRequested = String(download_media).toLowerCase() === 'true';
     const maxExpectedCost = isDownloadRequested ? 10 : 1;
 
-    // Check if the user has enough credits to attempt this request
     if (req.user.credits < maxExpectedCost) {
         return res.status(403).json({
             success: false,
@@ -936,78 +936,105 @@ app.get('/v1/instagram/post', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Construct the upstream URL
+    // 3. Safely construct the Upstream URL
     const upstreamUrl = new URL('https://api.scrapecreators.com/v1/instagram/post');
     
-    // Convert the shortcode into a full URL for the upstream API
-    upstreamUrl.searchParams.append('url', `https://www.instagram.com/p/${shortcode}/`);
+    // Auto-correct: If user passed a full URL instead of a shortcode, pass it directly.
+    // Otherwise, convert the shortcode to an IG post URL.
+    let targetUrl = shortcode;
+    if (!shortcode.startsWith('http')) {
+        targetUrl = `https://www.instagram.com/p/${shortcode}/`;
+    }
     
-    // Pass optional parameters if your user provided them
+    upstreamUrl.searchParams.append('url', targetUrl);
+    
+    // Append optional upstream parameters if the user provided them
     if (region) upstreamUrl.searchParams.append('region', region);
     if (trim) upstreamUrl.searchParams.append('trim', trim);
     if (download_media) upstreamUrl.searchParams.append('download_media', download_media);
     if (cache_max_age) upstreamUrl.searchParams.append('cache_max_age', cache_max_age);
 
     try {
-        // 4. Make the call to ScrapeCreators
+        console.log(`[SignalQub] Calling ScrapeCreators for: ${targetUrl}`);
+
+        // 4. Make the API call to ScrapeCreators
         const response = await fetch(upstreamUrl.toString(), {
             method: 'GET',
             headers: {
-                'x-api-key': process.env.SCRAPECREATORS_API_KEY, // Ensure this is set in your .env file
+                'x-api-key': process.env.SCRAPER_API_KEY, // Ensure this is set in DigitalOcean!
                 'Content-Type': 'application/json'
             }
         });
 
         const targetData = await response.json();
+        
+        // 🚨 DIAGNOSTIC LOG: Prints the EXACT response to DigitalOcean logs so you can debug failures
+        console.log(`[Upstream Response] Status: ${response.status}`, JSON.stringify(targetData).substring(0, 250));
 
-        // 5. Handle upstream errors cleanly without crashing your server
+        // 5. Intercept and Sanitize Errors (White-labeling)
         if (!response.ok || !targetData.success) {
-            return res.status(response.status === 200 ? 500 : response.status).json({
+            const statusCode = response.status === 200 ? 500 : response.status;
+            
+            // Extract the real error message safely
+            const rawError = targetData.detail || targetData.message || targetData.error || "Unknown extraction error occurred.";
+            
+            let cleanErrorMsg = "500 Internal Server Error: Extraction failed. The engineering team has been notified.";
+
+            if (statusCode === 404) {
+                cleanErrorMsg = "404 Not Found: The requested Instagram post does not exist, was deleted, or the account is private.";
+            } else if (statusCode === 429) {
+                cleanErrorMsg = "429 Too Many Requests: Extraction rate limit exceeded. Please back off and retry.";
+            } else if (statusCode === 400 || statusCode === 422 || statusCode === 401 || statusCode === 403) {
+                // Pass the specific error but sanitize upstream names to maintain the SignalQub brand
+                cleanErrorMsg = `${statusCode} Error: ${rawError.replace(/scrapecreators|upstream|provider/ig, 'SignalQub')}`;
+            } else if (statusCode >= 500) {
+                cleanErrorMsg = "500 Internal Server Error: Instagram anti-bot protection triggered. Please try again in a few moments.";
+            }
+
+            return res.status(statusCode).json({
                 success: false,
-                error: targetData.error || "Upstream connection failure or post not found."
+                error: cleanErrorMsg
             });
         }
 
-        // 6. Deduct the EXACT credits charged by the upstream provider
-        // If download_media was true but no media was found, this safely deducts 1 instead of 10.
+        // 6. Deduct the EXACT credits charged by the provider
         const actualCreditsCharged = targetData.credits_charged || 1;
         req.user.credits -= actualCreditsCharged;
 
-        // NOTE: If you save user data to a DB (like Supabase or MongoDB), update the balance here.
-        // await updateUserBalance(req.user.id, req.user.credits);
-
-        // 7. Return the formatted response back to your user
+        // 7. Return the formatted success response
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
             credits_charged: actualCreditsCharged,
             status: "success",
-            data: targetData.data // This contains the 'xdt_shortcode_media' object from upstream
+            data: targetData.data // The raw xdt_shortcode_media object
         });
 
     } catch (error) {
-        console.error('Instagram Scraper Proxy Error:', error);
+        console.error('[SignalQub] Extraction Error:', error);
         
-        // Log the failure to your internal tracking system if you have one
-        // notifyFailure({ endpoint: '/v1/instagram/post', errorMsg: error.message });
-
-        return res.status(500).json({ 
+        // Catch network timeouts or fetch crashes
+        return res.status(504).json({ 
             success: false, 
-            error: "500 Internal Server Error: Failed to reach extraction provider." 
+            error: `504 Gateway Timeout: The extraction engine took too long to respond or failed. (${error.message})` 
         });
     }
 });
+
 app.get('/v1/instagram/transcript', authMiddleware, async (req, res) => {
-    const { shortcode } = req.query;
+    // 1. Extract parameters
+    const { shortcode, cache_max_age } = req.query;
 
     if (!shortcode) {
-        return res.status(400).json({ error: "Missing required parameter 'shortcode'" });
+        return res.status(400).json({ 
+            success: false, 
+            error: "400 Bad Request: Missing required parameter 'shortcode'" 
+        });
     }
 
+    // 2. Set your internal pricing
     const costPerRequest = 2;
 
-    // The authMiddleware confirmed req.user exists and has > 0 credits, 
-    // but we need to ensure they have enough for this specific premium endpoint
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({
             success: false,
@@ -1015,76 +1042,89 @@ app.get('/v1/instagram/transcript', authMiddleware, async (req, res) => {
         });
     }
 
+    // 3. Construct the Upstream URL for ScrapeCreators V2
+    const upstreamUrl = new URL('https://api.scrapecreators.com/v2/instagram/media/transcript');
+    
+    // Auto-correct: Ensure we pass a full URL to the upstream provider
+    let targetUrl = shortcode;
+    if (!shortcode.startsWith('http')) {
+        targetUrl = `https://www.instagram.com/p/${shortcode}/`;
+    }
+    
+    upstreamUrl.searchParams.append('url', targetUrl);
+    if (cache_max_age) upstreamUrl.searchParams.append('cache_max_age', cache_max_age);
+
     try {
-        const post = await scrapeSinglePost(shortcode);
-        
-        // Handle 404 clean returns
-        if (post.status === "error") {
-            return res.status(404).json(post);
-        }
+        console.log(`[SignalQub] Requesting AI Transcript for: ${targetUrl}`);
 
-        const results = [];
-        
-        // Support both standard posts and carousels seamlessly
-        const itemsToProcess = post.data.media_type === 'carousel' 
-            ? post.data.carousel_media 
-            : [post.data];
-
-        for (const item of itemsToProcess) {
-            if (item.media_type !== 'video') {
-                results.push({ id: item.id, type: 'image', transcript: null });
-                continue;
+        // 4. Call the upstream AI transcription endpoint
+        const response = await fetch(upstreamUrl.toString(), {
+            method: 'GET',
+            headers: {
+                'x-api-key': process.env.SCRAPER_API_KEY,
+                'Content-Type': 'application/json'
             }
+        });
 
-            const duration = item.video_duration || 0;
-            if (duration > 120) {
-                results.push({ 
-                    id: item.id, 
-                    type: 'video', 
-                    transcript: null, 
-                    error: `Video duration (${duration}s) exceeds the 120-second limit.` 
-                });
-                continue;
-            }
+        const targetData = await response.json();
 
-            // Extract the MP4 URL
-            const videoUrl = item.media_urls ? item.media_urls.video : item.video_versions[0].url;
+        // 🚨 Diagnostic Log
+        console.log(`[Upstream Transcript] Status: ${response.status}`, JSON.stringify(targetData).substring(0, 200));
+
+        // 5. White-labeled Error Handling
+        if (!response.ok || !targetData.success) {
+            const statusCode = response.status === 200 ? 500 : response.status;
+            const rawError = targetData.detail || targetData.message || targetData.error || "Failed to generate transcript.";
             
-            const videoResponse = await fetch(videoUrl);
-            
-            if (!videoResponse.ok) {
-                results.push({ id: item.id, type: 'video', transcript: null, error: "Failed to download media from CDN." });
-                continue;
+            let cleanErrorMsg = "500 Internal Server Error: AI Transcription failed. The engineering team has been notified.";
+
+            if (statusCode === 404) {
+                cleanErrorMsg = "404 Not Found: The requested video does not exist or the account is private.";
+            } else if (statusCode === 429) {
+                cleanErrorMsg = "429 Too Many Requests: Rate limit exceeded. Please back off and retry.";
+            } else if (statusCode === 400 || statusCode === 422 || statusCode === 401 || statusCode === 403) {
+                cleanErrorMsg = `${statusCode} Error: ${rawError.replace(/scrapecreators|upstream|provider/ig, 'SignalQub')}`;
+            } else if (statusCode >= 500) {
+                cleanErrorMsg = "500 Internal Server Error: Video extraction or transcription process failed. Please ensure the video is under 2 minutes.";
             }
 
-            const arrayBuffer = await videoResponse.arrayBuffer();
-            const buffer = Buffer.from(arrayBuffer);
-
-            const transcript = await transcribeVideoBuffer(buffer);
-
-            results.push({
-                id: item.id,
-                type: 'video',
-                transcript: transcript
+            return res.status(statusCode).json({
+                success: false,
+                error: cleanErrorMsg
             });
         }
 
-        // Deduct the credits directly from the in-memory database reference
+        // 6. Map the upstream data to match your existing SignalQub schema
+        // The upstream returns "text", but your Apify Actor expects "transcript" and "type"
+        const formattedTranscripts = (targetData.transcripts || []).map(t => ({
+            id: t.id,
+            type: 'video', 
+            transcript: t.text || null // Map "text" to "transcript"
+        }));
+
+        // 7. Deduct the credits
         req.user.credits -= costPerRequest;
 
-        res.json({
+        // 8. Return the final payload
+        return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
             credits_charged: costPerRequest,
             status: "success",
             data: {
                 shortcode: shortcode,
-                transcripts: results
+                transcripts: formattedTranscripts
             }
         });
 
     } catch (error) {
-        res.status(error.statusCode || 500).json({ error: error.message });
+        console.error('[SignalQub] Transcript Error:', error);
+        
+        // AI Transcriptions can take 10-30 seconds, making Gateway Timeouts more common here
+        return res.status(504).json({ 
+            success: false, 
+            error: "504 Gateway Timeout: The AI transcription engine took too long to respond. The video may be too long or the queue is full." 
+        });
     }
 });
 
