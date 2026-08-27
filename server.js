@@ -2132,20 +2132,12 @@ function extractVideoId(url) {
 }
 
 app.get('/v1/youtube/video', authMiddleware, async (req, res) => {
-    const { url, language } = req.query;
+    const { url, language, cache_max_age } = req.query;
 
     if (!url) {
         return res.status(400).json({
             success: false,
             error: "400 Bad Request: Missing required parameter 'url'"
-        });
-    }
-
-    const videoId = extractVideoId(url);
-    if (!videoId) {
-        return res.status(400).json({
-            success: false,
-            error: "400 Bad Request: Invalid YouTube video or short URL"
         });
     }
 
@@ -2159,94 +2151,62 @@ app.get('/v1/youtube/video', authMiddleware, async (req, res) => {
         });
     }
 
-    const cacheKey = `yt_video_custom_${videoId}_${language || 'en'}`;
-
     try {
-        // 1. Cache Check
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
+        // 1. Build the Upstream Request URL
+        const upstreamUrl = new URL('https://api.scrapecreators.com/v1/youtube/video');
+        upstreamUrl.searchParams.append('url', url);
+        
+        if (language) {
+            upstreamUrl.searchParams.append('language', language);
+        }
+        
+        // Let ScrapeCreators handle the cache (defaults to 7 days to save your upstream credits)
+        upstreamUrl.searchParams.append('cache_max_age', cache_max_age || '7d');
+
+        // 2. Fetch from ScrapeCreators
+        const response = await fetch(upstreamUrl.toString(), {
+            method: 'GET',
+            headers: {
+                'x-api-key': process.env.SCRAPE_CREATORS_API_KEY,
+                'Accept': 'application/json'
+            }
+        });
+
+        const data = await response.json();
+
+        // 3. Handle Upstream Errors (e.g. Age-Restricted 403s or Invalid URLs)
+        if (!response.ok || !data.success) {
+            const errorMessage = data.error || data.reason || "Upstream extraction failed.";
+            const statusCode = response.status === 200 ? 500 : response.status; // Fallback to 500 if success is false but status was 200
+            
+            throw new Error(`${statusCode} API Error: ${errorMessage}`);
         }
 
-        // 2. Ensure scraper is ready
-        if (!ytClient) {
-            throw new Error("500 Internal Server Error: Scraper client is still booting. Try again in a few seconds.");
-        }
-
-        // 3. Fetch directly from YouTube
-        const info = await ytClient.getInfo(videoId);
-
-        // Handle Age Restrictions / Private Videos
-        if (info.playability_status?.status === 'LOGIN_REQUIRED' || info.playability_status?.status === 'UNPLAYABLE') {
-            return res.status(403).json({
-                success: false,
-                error: "403 Forbidden: Video is age-restricted or private and cannot be fetched without logging in."
-            });
-        }
-
-        const basicInfo = info.basic_info;
-
-        // 4. Map the raw YouTube data to your established wrapper schema
-        const responseData = {
-            id: basicInfo.id,
-            thumbnail: basicInfo.thumbnail?.[0]?.url || `https://img.youtube.com/vi/${basicInfo.id}/maxresdefault.jpg`,
-            url: `https://www.youtube.com/watch?v=${basicInfo.id}`,
-            publishDate: info.primary_info?.published?.text || null,
-            type: basicInfo.is_short ? "short" : "video",
-            title: basicInfo.title,
-            description: basicInfo.short_description || null,
-            likeCountInt: basicInfo.like_count || 0,
-            viewCountInt: basicInfo.view_count || 0,
-            channel: {
-                id: basicInfo.channel_id,
-                url: basicInfo.channel?.url,
-                title: basicInfo.channel?.name
-            },
-            // Grabbing the first few recommended videos to match the wrapper's behavior
-            // Filter out UI elements (like chips) and grab the first 5 actual videos
-            watchNextVideos: (info.watch_next_feed || [])
-                .filter(v => v.type === 'CompactVideo' || v.type === 'Video')
-                .slice(0, 5)
-                .map(v => ({
-                    id: v.id,
-                    title: v.title?.toString() || null,
-                    channel: {
-                        title: v.author?.name || null,
-                        url: v.author?.url ? `https://www.youtube.com${v.author.url}` : null
-                    },
-                    viewCountText: v.view_count?.toString() || v.short_view_count?.toString() || null,
-                    lengthText: v.duration?.toString() || null,
-                    videoUrl: v.id ? `https://www.youtube.com/watch?v=${v.id}` : null
-                }))
-        };
-
-        // 5. Deduct Credits & Cache
+        // 4. Deduct User Credits
         req.user.credits -= costPerRequest;
-        mockRedisCache[cacheKey] = responseData;
+        // await req.user.save(); // Don't forget to save the user's new credit balance to your DB!
 
-        // 6. Return to Consumer
+        // 5. Return the beautiful payload to the user
         return res.status(200).json({
+            ...data, // Spread the rich ScrapeCreators data first
             success: true,
+            // SECURITY OVERRIDE: Prevent leaking your master ScrapeCreators credit balance!
             credits_remaining: req.user.credits,
-            credits_charged: costPerRequest,
-            ...responseData
+            credits_charged: costPerRequest
         });
 
     } catch (error) {
-        const errorMessage = error.message || "Internal Server Error";
+        const errorMessage = error.message || "500 Internal Server Error";
         
-        // Custom check since we aren't using fetch anymore
-        const statusCode = errorMessage.includes('403') || errorMessage.includes('LOGIN_REQUIRED') ? 403 : 500;
+        // Extract status code from the custom error string if it exists, default to 500
+        const statusCodeMatch = errorMessage.match(/^(\d{3})/);
+        const statusCode = statusCodeMatch ? parseInt(statusCodeMatch[1], 10) : 500;
 
         // Discord Failure Alert
         if (typeof notifyFailure === 'function') {
             notifyFailure({
                 endpoint: '/v1/youtube/video',
-                params: { url, videoId },
+                params: { url, language },
                 statusCode: statusCode,
                 errorMsg: errorMessage
             });
