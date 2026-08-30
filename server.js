@@ -3900,7 +3900,7 @@ app.get('/v1/tiktok/profile', authMiddleware, async (req, res) => {
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: {
-                'x-api-key': process.env.SCRAPECREATORS_API_KEY, // Store in your .env file
+                'x-api-key': process.env.SCRAPE_CREATORS_API_KEY, // Store in your .env file
                 'Content-Type': 'application/json'
             },
             signal: controller.signal
