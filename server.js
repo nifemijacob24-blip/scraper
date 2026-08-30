@@ -2719,7 +2719,6 @@ app.get('/v1/google/search', authMiddleware, async (req, res) => {
     }
 });
 
-const {scrapeTikTokProfileNative} = require('./src/scrapers/tiktok');
 
 app.get('/v1/tiktok/search/keyword', authMiddleware, async (req, res) => {
     const { query, date_posted, sort_by, region, cursor, trim } = req.query;
@@ -3857,17 +3856,16 @@ app.get('/v1/tiktok/profile', authMiddleware, async (req, res) => {
         cache_max_age 
     } = req.query;
 
-    // 1. Validation - We strictly require the handle for the Playwright web scraper
-    if (!handle) {
+    // 1. Validation - Allow EITHER handle OR user_id based on ScrapeCreators specs
+    if (!handle && !user_id) {
         return res.status(400).json({
             success: false,
-            error: "400 Bad Request: Missing required parameter 'handle'. Custom scraper cannot resolve raw user_id."
+            error: "400 Bad Request: Missing required parameter. You must provide either 'handle' or 'user_id'."
         });
     }
 
-    // Dynamic Pricing Logic: 1 credit per lookup
+    // 2. Billing Check
     const costPerRequest = 1;
-
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({
             success: false,
@@ -3875,67 +3873,98 @@ app.get('/v1/tiktok/profile', authMiddleware, async (req, res) => {
         });
     }
 
-    const cleanHandle = handle.startsWith('@') ? handle.substring(1) : handle;
-    const cacheKey = `tiktok_profile_${cleanHandle.toLowerCase()}`;
+    // 3. Construct Upstream URL & Parameters
+    const targetUrl = new URL('https://api.scrapecreators.com/v1/tiktok/profile');
+    
+    if (handle) {
+        // Strip '@' if the user accidentally included it
+        const cleanHandle = handle.startsWith('@') ? handle.substring(1) : handle;
+        targetUrl.searchParams.append('handle', cleanHandle);
+    }
+    
+    if (user_id) {
+        targetUrl.searchParams.append('user_id', user_id);
+    }
+
+    // Allow cache options like '1d', '3d', '7d' as specified by ScrapeCreators
+    if (cache_max_age) {
+        targetUrl.searchParams.append('cache_max_age', cache_max_age);
+    }
+
+    // Best Practice: Setup an AbortController so hanging upstream requests don't lock up your server
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 20000); // 20-second hard timeout
 
     try {
-        // 1. Cache Check - Crucial for 100% margin on viral/trending handles
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
+        // 4. Call ScrapeCreators API
+        const response = await fetch(targetUrl.toString(), {
+            method: 'GET',
+            headers: {
+                'x-api-key': process.env.SCRAPECREATORS_API_KEY, // Store in your .env file
+                'Content-Type': 'application/json'
+            },
+            signal: controller.signal
+        });
+
+        clearTimeout(timeoutId);
+
+        let data;
+        try {
+            data = await response.json();
+        } catch (parseError) {
+            throw new Error(`Upstream returned invalid JSON. Status: ${response.status}`);
         }
 
-        // 2. Execute Custom Playwright Scraper
-        // Wrapped in a Promise.race to enforce a strict timeout independent of Playwright's internal timeouts
-        const timeoutPromise = new Promise((_, reject) => 
-            setTimeout(() => reject(new Error("TimeoutError")), 25000)
-        );
-        
-        const scrapedData = await Promise.race([
-            scrapeTikTokProfileNative(cleanHandle),
-            timeoutPromise
-        ]);
+        // Handle upstream API failures (e.g., 404 Not Found, 403 Invalid API Key)
+        if (!response.ok || !data.success) {
+            const upStreamError = data.error || data.message || `Upstream error: ${response.statusText}`;
+            throw new Error(`[${response.status}] ${upStreamError}`);
+        }
 
-        // 3. Deduct Credits & Cache
+        // 5. Deduct Credits
+        // Note: You can also choose to read `data.credits_charged` from ScrapeCreators
+        // if you want to mirror their 0-credit cached response logic to your users.
         req.user.credits -= costPerRequest;
         
-        // Cache lifetime configuration
-        mockRedisCache[cacheKey] = scrapedData;
+        // Save the updated user credits to your database here if applicable
+        // await req.user.save();
 
-        // 4. Return to Consumer matching the ScrapeCreators schema perfectly
+        // 6. Return Payload to Your User
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
             credits_charged: costPerRequest,
-            ...scrapedData
+            user: data.user,
+            stats: data.stats,
+            cached: data.cached || false,
+            cached_at: data.cached_at || null
         });
 
     } catch (error) {
-        const errorMessage = error.message || "Internal Server Error";
+        clearTimeout(timeoutId);
         
-        const isTimeout = errorMessage === 'TimeoutError' || error.name === 'TimeoutError';
-        const isNotFound = errorMessage.includes('404');
+        const isTimeout = error.name === 'AbortError';
+        const isNotFound = error.message.includes('[404]');
         
         const statusCode = isNotFound ? 404 : (isTimeout ? 504 : 500);
-        const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Custom scraper took too long or proxy was blocked." 
-            : errorMessage;
+        let finalErrorMsg = error.message || "Internal Server Error";
 
-        // Discord Failure Alert - Essential for tracking Playwright/Proxy health
-        if (typeof notifyFailure === 'function') {
+        if (isTimeout) {
+            finalErrorMsg = "504 Gateway Timeout: Upstream scraping service took too long to respond.";
+        } else if (isNotFound) {
+            finalErrorMsg = "404 Not Found: The requested TikTok profile does not exist or is banned.";
+        }
+
+        // 7. Discord Failure Alert (Tracks upstream health/outages)
+        if (typeof notifyFailure === 'function' && !isNotFound) { // Ignore 404s to reduce spam
             notifyFailure({
                 endpoint: '/v1/tiktok/profile',
-                params: { handle },
+                params: { handle, user_id },
                 statusCode: statusCode,
                 errorMsg: finalErrorMsg
             });
         }
 
-        // Only refund/don't charge the user if the request failed
         return res.status(statusCode).json({
             success: false,
             error: finalErrorMsg
