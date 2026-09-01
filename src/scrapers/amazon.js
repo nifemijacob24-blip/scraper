@@ -197,13 +197,19 @@ async function scrapeAmazonProductAPI(asin, marketplace = 'us') {
                 if (item.brand && item.brand.name) product.brand = cleanText(item.brand.name);
                 if (item.description) product.about_product = cleanText(item.description);
                 
-                if (item.offers) {
-                    if (item.offers.price) product.price = parseFloat(item.offers.price);
-                    else if (item.offers.lowPrice) product.price = parseFloat(item.offers.lowPrice); 
+                // Fix: Handle when Amazon wraps 'offers' in an array
+                let offers = item.offers;
+                if (Array.isArray(offers)) {
+                    offers = offers.find(o => o.price || o.lowPrice);
+                }
+                
+                if (offers) {
+                    if (offers.price) product.price = parseFloat(offers.price);
+                    else if (offers.lowPrice) product.price = parseFloat(offers.lowPrice); 
                     
-                    if (item.offers.priceCurrency) {
-                        if (item.offers.priceCurrency === 'GBP') product.currency = '£';
-                        else if (item.offers.priceCurrency === 'EUR') product.currency = '€';
+                    if (offers.priceCurrency) {
+                        if (offers.priceCurrency === 'GBP') product.currency = '£';
+                        else if (offers.priceCurrency === 'EUR') product.currency = '€';
                     }
                 }
             }
@@ -217,23 +223,33 @@ async function scrapeAmazonProductAPI(asin, marketplace = 'us') {
         product.brand = brandText || title.split(' ')[0]; 
     }
 
-    // --- 3A. AGGRESSIVE DOM PRICE EXTRACTION ---
+    // --- 3A. HIDDEN TWISTER INPUT EXTRACTION ---
+    if (!product.price) {
+        const twisterPrice = $('#twister-plus-price-data-price').val() || $('#twister-plus-price-data-price-core').val();
+        if (twisterPrice) {
+            const parsed = parseFloat(twisterPrice);
+            if (!isNaN(parsed) && parsed > 0) product.price = parsed;
+        }
+    }
+
+    // --- 3B. AGGRESSIVE DOM PRICE EXTRACTION (BUY BOX) ---
     if (!product.price) {
         const priceSelectors = [
             '#corePriceDisplay_desktop_feature_div .a-price .a-offscreen',
             '#corePrice_desktop .a-price .a-offscreen',
+            '#price_inside_buybox',
+            '#newBuyBoxPrice',
             '.priceToPay .a-offscreen',
             '.apexPriceToPay .a-offscreen',
             '#priceblock_ourprice',
             '#priceblock_dealprice',
-            '.a-price-range .a-price:first-child .a-offscreen', // Grabs lower end of range
-            'span.a-price span.a-offscreen' // Ultimate fallback
+            '.a-price-range .a-price:first-child .a-offscreen',
+            'span.a-price span.a-offscreen'
         ];
 
-        // Loop through all matching nodes across all selectors
         for (const selector of priceSelectors) {
             $(selector).each((_, el) => {
-                if (product.price) return; // Skip if already found
+                if (product.price) return;
                 const priceText = $(el).text();
                 const priceMatch = priceText.replace(/\s/g, '').match(/[\d,]+\.\d{2}/) || priceText.replace(/\s/g, '').match(/[\d,]+/);
                 
@@ -250,22 +266,17 @@ async function scrapeAmazonProductAPI(asin, marketplace = 'us') {
         }
     }
 
-    // --- 3B. THE "TWISTER MATRIX" REGEX RIPPER ---
-    // If the DOM is completely empty because it's a parent ASIN without a size selected,
-    // we rip the price directly out of Amazon's hidden frontend variables.
+    // --- 3C. DEEP REGEX SEARCH (ULTIMATE FALLBACK) ---
     if (!product.price) {
         const rawMatches = [
             ...htmlBody.matchAll(/"priceAmount":\s*([\d.]+)/g),
             ...htmlBody.matchAll(/&quot;priceAmount&quot;:\s*([\d.]+)/g),
-            ...htmlBody.matchAll(/"displayPrice":"[^0-9]*([\d.]+)"/g),
-            ...htmlBody.matchAll(/data-asin-price="([\d.]+)"/g),
-            ...htmlBody.matchAll(/value="([\d.]+)"\s+id="twister-plus-price-data-price"/g),
-            ...htmlBody.matchAll(/"lowPrice":\s*([\d.]+)/g)
+            ...htmlBody.matchAll(/"displayPrice":"[^0-9]*([\d.]+)"/g)
         ];
         
         for (const m of rawMatches) {
             const parsed = parseFloat(m[1]);
-            if (!isNaN(parsed) && parsed > 0) {
+            if (!isNaN(parsed) && parsed > 0 && parsed < 50000) {
                 product.price = parsed;
                 break;
             }
