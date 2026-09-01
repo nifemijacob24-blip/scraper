@@ -9543,8 +9543,6 @@ app.use((req, res) => {
     });
 });
 
-app.listen(3000, () => console.log('API running on port 3000'));
-
-app.listen(PORT, () => {
-    console.log(`🚀 API Server running on http://localhost:${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`SignalQub API is awake and listening on port ${PORT}`);
 });
