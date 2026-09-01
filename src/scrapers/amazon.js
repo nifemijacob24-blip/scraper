@@ -217,54 +217,57 @@ async function scrapeAmazonProductAPI(asin, marketplace = 'us') {
         product.brand = brandText || title.split(' ')[0]; 
     }
 
-    // --- 3A. ADVANCED PRICE EXTRACTION (CSS FALLBACKS) ---
+    // --- 3A. AGGRESSIVE DOM PRICE EXTRACTION ---
     if (!product.price) {
         const priceSelectors = [
-            '.priceToPay .a-offscreen',
-            '.apexPriceToPay .a-offscreen',
             '#corePriceDisplay_desktop_feature_div .a-price .a-offscreen',
             '#corePrice_desktop .a-price .a-offscreen',
-            '#corePrice_feature_div .a-price .a-offscreen',
-            '.a-price-range .a-price .a-offscreen',
+            '.priceToPay .a-offscreen',
+            '.apexPriceToPay .a-offscreen',
             '#priceblock_ourprice',
             '#priceblock_dealprice',
-            'span.a-price span.a-offscreen'
+            '.a-price-range .a-price:first-child .a-offscreen', // Grabs lower end of range
+            'span.a-price span.a-offscreen' // Ultimate fallback
         ];
 
+        // Loop through all matching nodes across all selectors
         for (const selector of priceSelectors) {
-            const priceNodes = $(selector);
-            if (priceNodes.length > 0) {
-                const priceText = priceNodes.first().text(); 
+            $(selector).each((_, el) => {
+                if (product.price) return; // Skip if already found
+                const priceText = $(el).text();
                 const priceMatch = priceText.replace(/\s/g, '').match(/[\d,]+\.\d{2}/) || priceText.replace(/\s/g, '').match(/[\d,]+/);
                 
                 if (priceMatch) {
-                    product.price = parseFloat(priceMatch[0].replace(/,/g, ''));
-                    if (priceText.includes('£')) product.currency = '£';
-                    else if (priceText.includes('€')) product.currency = '€';
-                    break;
+                    const parsedPrice = parseFloat(priceMatch[0].replace(/,/g, ''));
+                    if (parsedPrice > 0) {
+                        product.price = parsedPrice;
+                        if (priceText.includes('£')) product.currency = '£';
+                        else if (priceText.includes('€')) product.currency = '€';
+                    }
                 }
-            }
+            });
+            if (product.price) break;
         }
     }
 
-    // --- 3B. DEEP REGEX SEARCH (For Unselected Apparel/Shoes) ---
+    // --- 3B. THE "TWISTER MATRIX" REGEX RIPPER ---
+    // If the DOM is completely empty because it's a parent ASIN without a size selected,
+    // we rip the price directly out of Amazon's hidden frontend variables.
     if (!product.price) {
-        const regexes = [
-            /"priceAmount":\s*([\d.]+)/,
-            /"price":\s*([\d.]+)/,
-            /"displayPrice":"\$([\d.]+)"/,
-            /data-asin-price="([\d.]+)"/,
-            /<input type="hidden" id="twister-plus-price-data-price" value="([\d.]+)"/
+        const rawMatches = [
+            ...htmlBody.matchAll(/"priceAmount":\s*([\d.]+)/g),
+            ...htmlBody.matchAll(/&quot;priceAmount&quot;:\s*([\d.]+)/g),
+            ...htmlBody.matchAll(/"displayPrice":"[^0-9]*([\d.]+)"/g),
+            ...htmlBody.matchAll(/data-asin-price="([\d.]+)"/g),
+            ...htmlBody.matchAll(/value="([\d.]+)"\s+id="twister-plus-price-data-price"/g),
+            ...htmlBody.matchAll(/"lowPrice":\s*([\d.]+)/g)
         ];
         
-        for (const regex of regexes) {
-            const match = htmlBody.match(regex);
-            if (match && match[1]) {
-                const parsed = parseFloat(match[1]);
-                if (!isNaN(parsed) && parsed > 0) {
-                    product.price = parsed;
-                    break;
-                }
+        for (const m of rawMatches) {
+            const parsed = parseFloat(m[1]);
+            if (!isNaN(parsed) && parsed > 0) {
+                product.price = parsed;
+                break;
             }
         }
     }
