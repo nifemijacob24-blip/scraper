@@ -167,7 +167,6 @@ async function scrapeAmazonProductAPI(asin, marketplace = 'us') {
         throw new Error(`Product not found. The ASIN '${cleanAsin}' may be invalid or unavailable in the '${code}' marketplace.`);
     }
 
-    // Helper to clean strings
     const cleanText = (text) => text ? text.replace(/\s+/g, ' ').trim() : '';
 
     const product = {
@@ -190,7 +189,6 @@ async function scrapeAmazonProductAPI(asin, marketplace = 'us') {
     };
 
     // --- 1. HIDDEN JSON-LD SCHEMA EXTRACTION ---
-    // Amazon embeds a clean JSON schema for search engines. This is the most reliable data source.
     $('script[type="application/ld+json"]').each((_, el) => {
         try {
             const data = JSON.parse($(el).html());
@@ -199,10 +197,9 @@ async function scrapeAmazonProductAPI(asin, marketplace = 'us') {
                 if (item.brand && item.brand.name) product.brand = cleanText(item.brand.name);
                 if (item.description) product.about_product = cleanText(item.description);
                 
-                // Grab price directly from Schema if available
                 if (item.offers) {
                     if (item.offers.price) product.price = parseFloat(item.offers.price);
-                    else if (item.offers.lowPrice) product.price = parseFloat(item.offers.lowPrice); // Handles price ranges
+                    else if (item.offers.lowPrice) product.price = parseFloat(item.offers.lowPrice); 
                     
                     if (item.offers.priceCurrency) {
                         if (item.offers.priceCurrency === 'GBP') product.currency = '£';
@@ -220,8 +217,7 @@ async function scrapeAmazonProductAPI(asin, marketplace = 'us') {
         product.brand = brandText || title.split(' ')[0]; 
     }
 
-    // --- 3. ADVANCED PRICE EXTRACTION (CSS FALLBACKS) ---
-    // Only run if JSON-LD didn't catch the price
+    // --- 3A. ADVANCED PRICE EXTRACTION (CSS FALLBACKS) ---
     if (!product.price) {
         const priceSelectors = [
             '.priceToPay .a-offscreen',
@@ -229,22 +225,44 @@ async function scrapeAmazonProductAPI(asin, marketplace = 'us') {
             '#corePriceDisplay_desktop_feature_div .a-price .a-offscreen',
             '#corePrice_desktop .a-price .a-offscreen',
             '#corePrice_feature_div .a-price .a-offscreen',
-            '.a-price-range .a-price .a-offscreen', // Apparel ranges
+            '.a-price-range .a-price .a-offscreen',
             '#priceblock_ourprice',
             '#priceblock_dealprice',
-            'span.a-price span.a-offscreen' // Ultimate fallback
+            'span.a-price span.a-offscreen'
         ];
 
         for (const selector of priceSelectors) {
             const priceNodes = $(selector);
             if (priceNodes.length > 0) {
-                const priceText = priceNodes.first().text(); // Grabs the first node (lower end of ranges)
+                const priceText = priceNodes.first().text(); 
                 const priceMatch = priceText.replace(/\s/g, '').match(/[\d,]+\.\d{2}/) || priceText.replace(/\s/g, '').match(/[\d,]+/);
                 
                 if (priceMatch) {
                     product.price = parseFloat(priceMatch[0].replace(/,/g, ''));
                     if (priceText.includes('£')) product.currency = '£';
                     else if (priceText.includes('€')) product.currency = '€';
+                    break;
+                }
+            }
+        }
+    }
+
+    // --- 3B. DEEP REGEX SEARCH (For Unselected Apparel/Shoes) ---
+    if (!product.price) {
+        const regexes = [
+            /"priceAmount":\s*([\d.]+)/,
+            /"price":\s*([\d.]+)/,
+            /"displayPrice":"\$([\d.]+)"/,
+            /data-asin-price="([\d.]+)"/,
+            /<input type="hidden" id="twister-plus-price-data-price" value="([\d.]+)"/
+        ];
+        
+        for (const regex of regexes) {
+            const match = htmlBody.match(regex);
+            if (match && match[1]) {
+                const parsed = parseFloat(match[1]);
+                if (!isNaN(parsed) && parsed > 0) {
+                    product.price = parsed;
                     break;
                 }
             }
@@ -319,14 +337,12 @@ async function scrapeAmazonProductAPI(asin, marketplace = 'us') {
     // --- 10. DEEP VARIANT EXTRACTION ---
     const variantSet = new Set();
 
-    // 10A: Standard variant buttons
     $('[data-defaultasin], [data-dp-url]').each((_, el) => {
         const dpUrl = $(el).attr('data-dp-url') || "";
         const vAsin = $(el).attr('data-defaultasin') || (dpUrl.match(/\/dp\/([A-Z0-9]{10})/) || [])[1];
         if (vAsin && vAsin.toUpperCase() !== cleanAsin) variantSet.add(vAsin.toUpperCase());
     });
 
-    // 10B: Dropdown/Script parsing (Fix for Shoes/Apparel)
     const variantRegex = /"asin":"(B[A-Z0-9]{9})"/gi;
     let match;
     while ((match = variantRegex.exec(htmlBody)) !== null) {
