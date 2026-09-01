@@ -141,7 +141,7 @@ async function scrapeAmazonProductAPI(asin, marketplace = 'us') {
     const code = marketplace.toLowerCase().trim();
     const targetMarket = MARKETPLACE_MAP[code] || MARKETPLACE_MAP['us'];
     const cleanAsin = asin.toUpperCase().trim();
-    
+
     const targetUrl = `https://www.${targetMarket.domain}/dp/${cleanAsin}?th=1&psc=1`;
 
     const response = await axios.get('https://api.scraperapi.com/', {
@@ -166,6 +166,9 @@ async function scrapeAmazonProductAPI(asin, marketplace = 'us') {
     if (!title) {
         throw new Error(`Product not found. The ASIN '${cleanAsin}' may be invalid or unavailable in the '${code}' marketplace.`);
     }
+
+    // Helper to clean strings
+    const cleanText = (text) => text ? text.replace(/\s+/g, ' ').trim() : '';
 
     const product = {
         asin: cleanAsin,
@@ -195,6 +198,17 @@ async function scrapeAmazonProductAPI(asin, marketplace = 'us') {
             if (item['@type'] === 'Product' || item['@type'] === 'ItemPage') {
                 if (item.brand && item.brand.name) product.brand = cleanText(item.brand.name);
                 if (item.description) product.about_product = cleanText(item.description);
+                
+                // Grab price directly from Schema if available
+                if (item.offers) {
+                    if (item.offers.price) product.price = parseFloat(item.offers.price);
+                    else if (item.offers.lowPrice) product.price = parseFloat(item.offers.lowPrice); // Handles price ranges
+                    
+                    if (item.offers.priceCurrency) {
+                        if (item.offers.priceCurrency === 'GBP') product.currency = '£';
+                        else if (item.offers.priceCurrency === 'EUR') product.currency = '€';
+                    }
+                }
             }
         } catch (e) {}
     });
@@ -203,28 +217,36 @@ async function scrapeAmazonProductAPI(asin, marketplace = 'us') {
     if (!product.brand) {
         let brandText = $('#bylineInfo, #brand, .po-brand .a-span9').first().text();
         brandText = cleanText(brandText).replace(/^Visit the /i, '').replace(/ Store$/i, '').replace(/^Brand:\s*/i, '');
-        product.brand = brandText || title.split(' ')[0]; // Fallback to first word of title (e.g., "adidas")
+        product.brand = brandText || title.split(' ')[0]; 
     }
 
-    // --- 3. ADVANCED PRICE EXTRACTION ---
-    // Handles standard prices, ranges (for shoes), and sale prices
-    const priceSelectors = [
-        '#corePriceDisplay_desktop_feature_div .a-price .a-offscreen',
-        '#corePrice_desktop .a-price .a-offscreen',
-        '.a-price-range .a-price .a-offscreen', // Apparel ranges
-        '#priceblock_ourprice',
-        '#priceblock_dealprice'
-    ];
+    // --- 3. ADVANCED PRICE EXTRACTION (CSS FALLBACKS) ---
+    // Only run if JSON-LD didn't catch the price
+    if (!product.price) {
+        const priceSelectors = [
+            '.priceToPay .a-offscreen',
+            '.apexPriceToPay .a-offscreen',
+            '#corePriceDisplay_desktop_feature_div .a-price .a-offscreen',
+            '#corePrice_desktop .a-price .a-offscreen',
+            '#corePrice_feature_div .a-price .a-offscreen',
+            '.a-price-range .a-price .a-offscreen', // Apparel ranges
+            '#priceblock_ourprice',
+            '#priceblock_dealprice',
+            'span.a-price span.a-offscreen' // Ultimate fallback
+        ];
 
-    for (const selector of priceSelectors) {
-        const priceText = $(selector).first().text();
-        if (priceText) {
-            const priceMatch = priceText.replace(/\s/g, '').match(/[\d,]+\.\d{2}/) || priceText.replace(/\s/g, '').match(/[\d,]+/);
-            if (priceMatch) {
-                product.price = parseFloat(priceMatch[0].replace(/,/g, ''));
-                if (priceText.includes('£')) product.currency = '£';
-                else if (priceText.includes('€')) product.currency = '€';
-                break;
+        for (const selector of priceSelectors) {
+            const priceNodes = $(selector);
+            if (priceNodes.length > 0) {
+                const priceText = priceNodes.first().text(); // Grabs the first node (lower end of ranges)
+                const priceMatch = priceText.replace(/\s/g, '').match(/[\d,]+\.\d{2}/) || priceText.replace(/\s/g, '').match(/[\d,]+/);
+                
+                if (priceMatch) {
+                    product.price = parseFloat(priceMatch[0].replace(/,/g, ''));
+                    if (priceText.includes('£')) product.currency = '£';
+                    else if (priceText.includes('€')) product.currency = '€';
+                    break;
+                }
             }
         }
     }
@@ -263,7 +285,6 @@ async function scrapeAmazonProductAPI(asin, marketplace = 'us') {
     });
 
     // --- 8. TRUE HIGH-RES IMAGE GALLERY ---
-    // Grabs from the thumbnail bar and strips the scaling artifacts to expose the original 1500px image
     const imageSet = new Set();
     $('#altImages img').each((_, el) => {
         const src = $(el).attr('src');
@@ -297,7 +318,7 @@ async function scrapeAmazonProductAPI(asin, marketplace = 'us') {
 
     // --- 10. DEEP VARIANT EXTRACTION ---
     const variantSet = new Set();
-    
+
     // 10A: Standard variant buttons
     $('[data-defaultasin], [data-dp-url]').each((_, el) => {
         const dpUrl = $(el).attr('data-dp-url') || "";
@@ -311,7 +332,7 @@ async function scrapeAmazonProductAPI(asin, marketplace = 'us') {
     while ((match = variantRegex.exec(htmlBody)) !== null) {
         if (match[1] !== cleanAsin) variantSet.add(match[1]);
     }
-    
+
     product.variants = Array.from(variantSet);
 
     return product;
