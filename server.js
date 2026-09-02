@@ -1,5 +1,7 @@
 require('dotenv').config();
 const express = require('express');
+const { chromium } = require('playwright-extra');
+
 chromium.launch = async function(options = {}) {
     let wsEndpoint = `wss://chrome.browserless.io?token=${process.env.BROWSER}`;
 
