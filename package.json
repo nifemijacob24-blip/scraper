@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "npx playwright install chromium && node server.js",
     "postinstall": "npx playwright install chromium",
     "test": "echo \"No tests to run\""
   },
