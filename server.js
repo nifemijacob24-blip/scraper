@@ -3446,7 +3446,6 @@ app.get('/v1/tiktok/video/transcript', authMiddleware, async (req, res) => {
     }
 
     // 2. Pre-flight Credit Check
-    // If AI fallback is requested, pre-flight check for up to 10 credits. Otherwise 1 credit.
     const maxPotentialCost = use_ai_as_fallback === 'true' ? 15 : 2;
     if (req.user.credits < maxPotentialCost) {
         return res.status(403).json({ 
@@ -3504,7 +3503,8 @@ app.get('/v1/tiktok/video/transcript', authMiddleware, async (req, res) => {
         };
 
         // 8. Dynamic Credit Deduction & Local Caching
-        const actualCost = credits_charged;
+        // FIX: We now use the actual credits charged by the upstream payload, or fallback to your maxPotentialCost
+        const actualCost = upstreamPayload.credits_charged || maxPotentialCost; 
         req.user.credits -= actualCost;
 
         mockRedisCache[cacheKey] = responseData;
