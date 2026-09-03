@@ -13,6 +13,7 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@sparticuz/chromium": "^149.0.0",
     "@supabase/supabase-js": "^2.112.3",
     "apify-client": "^2.25.0",
     "axios": "^1.19.0",
@@ -26,6 +27,7 @@
     "https-proxy-agent": "^9.1.0",
     "openai": "^7.3.0",
     "playwright": "^1.62.1",
+    "playwright-core": "^1.62.1",
     "playwright-extra": "^4.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
     "ws": "^8.21.3",
