@@ -1,6 +1,5 @@
 # 1. Use the official Microsoft Playwright image (has all Linux UI libraries)
-FROM mcr.microsoft.com/playwright:v1.45.0-jammy
-
+FROM mcr.microsoft.com/playwright:v1.62.1-jammy
 # 2. Set the working directory inside the container
 WORKDIR /app
 
