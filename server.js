@@ -1,4 +1,5 @@
 require('dotenv').config();
+require('./patch-playwright');
 const express = require('express');
 const sparticuz = require('@sparticuz/chromium');
 const { chromium } = require('playwright-core');
