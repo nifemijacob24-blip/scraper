@@ -1,4 +1,6 @@
-const sparticuz = require('@sparticuz/chromium');
+const sparticuzRaw = require('@sparticuz/chromium');
+// 1. Handle ES module imports automatically
+const sparticuz = sparticuzRaw.default || sparticuzRaw; 
 
 function applyPatch(moduleName) {
     try {
@@ -8,12 +10,18 @@ function applyPatch(moduleName) {
         const originalLaunch = pkg.chromium.launch.bind(pkg.chromium);
 
         pkg.chromium.launch = async function(options = {}) {
-            const execPath = await sparticuz.executablePath();
+            // 2. Safely handle both getter and function versions of Sparticuz
+            const execPath = typeof sparticuz.executablePath === 'function' 
+                ? await sparticuz.executablePath() 
+                : await sparticuz.executablePath;
+                
             console.log(`[Playwright Patch] Launching custom binary: ${execPath}`);
 
             options.executablePath = execPath;
+            
+            const sparticuzArgs = sparticuz.args || [];
             options.args = [
-                ...(sparticuz.args || []),
+                ...sparticuzArgs,
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
@@ -29,6 +37,5 @@ function applyPatch(moduleName) {
     }
 }
 
-// Patch both possible packages
 applyPatch('playwright');
 applyPatch('playwright-core');
