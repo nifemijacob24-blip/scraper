@@ -1,22 +1,7 @@
 require('dotenv').config();
 require('./patch-playwright');
 const express = require('express');
-const sparticuz = require('@sparticuz/chromium');
-const { chromium } = require('playwright-core');
 
-// 🚨 GLOBALLY INTERCEPT PLAYWRIGHT TO USE THE SERVERLESS BINARY
-const originalLaunch = chromium.launch.bind(chromium);
-chromium.launch = async function(options = {}) {
-    // 1. Point Playwright to the bundled, pre-compiled Linux Chromium
-    options.executablePath = await sparticuz.executablePath();
-    
-    // 2. Merge your custom Decodo proxy and args with Sparticuz's cloud-optimized args
-    const userArgs = options.args || [];
-    options.args = [...sparticuz.args, ...userArgs];
-    
-    // 3. Launch natively on Azure
-    return await originalLaunch(options);
-};
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const WebSocket = require('ws');

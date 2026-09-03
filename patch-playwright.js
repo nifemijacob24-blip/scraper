@@ -1,6 +1,5 @@
-const sparticuzRaw = require('@sparticuz/chromium');
-// 1. Handle ES module imports automatically
-const sparticuz = sparticuzRaw.default || sparticuzRaw; 
+const rawModule = require('@sparticuz/chromium');
+const sparticuz = rawModule.default || rawModule;
 
 function applyPatch(moduleName) {
     try {
@@ -10,18 +9,23 @@ function applyPatch(moduleName) {
         const originalLaunch = pkg.chromium.launch.bind(pkg.chromium);
 
         pkg.chromium.launch = async function(options = {}) {
-            // 2. Safely handle both getter and function versions of Sparticuz
-            const execPath = typeof sparticuz.executablePath === 'function' 
-                ? await sparticuz.executablePath() 
-                : await sparticuz.executablePath;
-                
+            console.log(`[Playwright Patch] Sparticuz Module exports:`, Object.keys(sparticuz));
+
+            // Safely extract the path regardless of NPM package version
+            let execPath;
+            if (typeof sparticuz.executablePath === 'function') {
+                execPath = await sparticuz.executablePath();
+            } else if (sparticuz.executablePath) {
+                execPath = await sparticuz.executablePath;
+            } else {
+                throw new Error("Sparticuz did not export executablePath. Verify the GitHub Action installed the package.");
+            }
+
             console.log(`[Playwright Patch] Launching custom binary: ${execPath}`);
 
             options.executablePath = execPath;
-            
-            const sparticuzArgs = sparticuz.args || [];
             options.args = [
-                ...sparticuzArgs,
+                ...(sparticuz.args || []),
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
