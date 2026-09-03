@@ -1,5 +1,4 @@
 require('dotenv').config();
-require('./patch-playwright');
 const express = require('express');
 
 const cors = require('cors');
