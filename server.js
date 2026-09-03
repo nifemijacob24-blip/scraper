@@ -1,23 +1,6 @@
 require('dotenv').config();
 const express = require('express');
-const { chromium } = require('playwright-extra');
 
-chromium.launch = async function(options = {}) {
-    let wsEndpoint = `wss://chrome.browserless.io?token=${process.env.BROWSER}`;
-
-    if (options.proxy) {
-        const { server, username, password } = options.proxy;
-        const cleanServer = server.replace('http://', '').replace('https://', '');
-        wsEndpoint += `&externalProxyServer=http://${username}:${password}@${cleanServer}`;
-    }
-
-    if (options.args) {
-        const launchOpts = JSON.stringify({ args: options.args });
-        wsEndpoint += `&launch=${encodeURIComponent(launchOpts)}`;
-    }
-
-    return await chromium.connect({ wsEndpoint });
-};
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const WebSocket = require('ws');
