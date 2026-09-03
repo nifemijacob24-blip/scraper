@@ -2114,24 +2114,7 @@ app.get('/v1/youtube/channel/shorts', authMiddleware, async (req, res) => {
     }
 });
 
-const { Innertube } = require('youtubei.js');
 
-// Initialize globally so it boots once when your server starts
-let ytClient;
-(async () => {
-    try {
-        ytClient = await Innertube.create();
-        console.log("YouTube scraper initialized for video endpoint");
-    } catch (error) {
-        console.error("Failed to initialize YouTube scraper", error);
-    }
-})();
-
-// Helper to extract the 11-character video ID from any YouTube or Shorts URL
-function extractVideoId(url) {
-    const match = url.match(/(?:youtu\.be\/|youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|shorts\/)([^"&?\/\s]{11})/);
-    return match ? match[1] : null;
-}
 
 app.get('/v1/youtube/video', authMiddleware, async (req, res) => {
     const { url, language, cache_max_age } = req.query;
