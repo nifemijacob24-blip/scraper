@@ -19,10 +19,11 @@ const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 // Initialize Supabase with the manual WebSocket injected
 const supabase = createClient(supabaseUrl, supabaseKey, {
     auth: {
-        persistSession: false // Best practice for server-side clients
+        persistSession: false 
     },
-    global: {
-        WebSocket: WebSocket // <-- This is the magic fix for Node 20
+    // DELETE the 'global' block and replace it with this 'realtime' block:
+    realtime: {
+        transport: WebSocket
     }
 });
 
