@@ -1,5 +1,6 @@
 require('dotenv').config();
 const express = require('express');
+const redditOrchestrator = require('./src/services/reddit-orchestrator');
 
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
@@ -270,20 +271,36 @@ app.get('/v1/reddit/subreddit/details', authMiddleware, async (req, res) => {
                 success: true,
                 credits_remaining: req.user.credits,
                 credits_charged: 0,
+                provider: 'cache',
                 ...mockRedisCache[cacheKey]
             });
         }
 
-        const data = await scrapeSubredditDetails(name);
+        // --- NEW: Use fallback orchestrator ---
+        const result = await redditOrchestrator.execute(
+            () => scrapeSubredditDetails(name),
+            'subreddit/details'
+        );
 
-        req.user.credits -= 1; 
-        mockRedisCache[cacheKey] = data;
+        if (!result.success) {
+            return res.status(503).json({
+                success: false,
+                error: result.error,
+                details: result.details
+            });
+        }
+
+            // Always deduct 1 credit (all requests charged, Playwright or fallback)
+            req.user.credits -= result.creditCost;
+        
+        mockRedisCache[cacheKey] = result.data;
 
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
-            credits_charged: 1,
-            ...data
+            credits_charged: result.creditCost,
+            provider: result.provider,
+            ...result.data
         });
 
     } catch (error) {
@@ -326,10 +343,10 @@ app.get('/v1/reddit/subreddit/posts', authMiddleware, async (req, res) => {
         });
     }
 
-    if (req.user.credits < 2) {
+    if (req.user.credits < 1) {
         return res.status(403).json({
             success: false,
-            error: "403 Forbidden: Insufficient credits (Requires 2 credits)"
+            error: "403 Forbidden: Insufficient credits (Requires 1 credit)"
         });
     }
 
@@ -342,18 +359,33 @@ app.get('/v1/reddit/subreddit/posts', authMiddleware, async (req, res) => {
                 success: true,
                 credits_remaining: req.user.credits,
                 credits_charged: 0,
+                provider: 'cache',
                 ...mockRedisCache[cacheKey]
             });
         }
 
-        const data = await scrapeSubredditPosts(subreddit, sort, timeframe, cursor, limit);
-        const formattedPosts = formatRedditPosts(data.posts, trim);
+        // --- NEW: Use fallback orchestrator ---
+        const result = await redditOrchestrator.execute(
+            () => scrapeSubredditPosts(subreddit, sort, timeframe, cursor, limit),
+            'subreddit/posts'
+        );
 
-        req.user.credits -= 2;
+        if (!result.success) {
+            return res.status(503).json({
+                success: false,
+                error: result.error,
+                details: result.details
+            });
+        }
+
+        const formattedPosts = formatRedditPosts(result.data.posts, trim);
+
+        // Always deduct 1 credit (all requests charged, Playwright or fallback)
+        req.user.credits -= result.creditCost;
 
         const responsePayload = {
             posts: formattedPosts,
-            next_cursor: data.next_cursor
+            next_cursor: result.data.next_cursor
         };
 
         mockRedisCache[cacheKey] = responsePayload;
@@ -361,7 +393,8 @@ app.get('/v1/reddit/subreddit/posts', authMiddleware, async (req, res) => {
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
-            credits_charged: 2,
+            credits_charged: result.creditCost,
+            provider: result.provider,
             ...responsePayload
         });
 
@@ -423,21 +456,37 @@ app.get('/v1/reddit/subreddit/search', authMiddleware, async (req, res) => {
                 success: true,
                 credits_remaining: req.user.credits,
                 credits_charged: 0,
+                provider: 'cache',
                 ...mockRedisCache[cacheKey]
             });
         }
 
-        // Pass limit into scraper
-        const searchData = await scrapeSubredditSearch(subreddit, query, sort, timeframe, cursor, limit);
+        // --- NEW: Use fallback orchestrator ---
+        const result = await redditOrchestrator.execute(
+            () => scrapeSubredditSearch(subreddit, query, sort, timeframe, cursor, limit),
+            'subreddit/search'
+        );
 
-        req.user.credits -= costPerRequest;
-        mockRedisCache[cacheKey] = searchData;
+        if (!result.success) {
+            return res.status(503).json({
+                success: false,
+                error: result.error,
+                details: result.details
+            });
+        }
+
+        // Only deduct credits if external API was used
+        // Always deduct 1 credit (all requests charged, Playwright or fallback)
+        req.user.credits -= result.creditCost;
+        
+        mockRedisCache[cacheKey] = result.data;
 
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
-            credits_charged: costPerRequest,
-            ...searchData
+            credits_charged: result.creditCost,
+            provider: result.provider,
+            ...result.data
         });
 
     } catch (error) {
@@ -507,21 +556,37 @@ app.get('/v1/reddit/post/comments', authMiddleware, async (req, res) => {
                 success: true,
                 credits_remaining: req.user.credits,
                 credits_charged: 0,
+                provider: 'cache',
                 ...mockRedisCache[cacheKey]
             });
         }
 
-        // Pass limit and cursor to the scraper
-        const data = await scrapePostComments(postUrl, limit, cursor);
+        // --- NEW: Use fallback orchestrator ---
+        const result = await redditOrchestrator.execute(
+            () => scrapePostComments(postUrl, limit, cursor),
+            'post/comments'
+        );
 
-        req.user.credits -= costPerRequest;
-        mockRedisCache[cacheKey] = data;
+        if (!result.success) {
+            return res.status(503).json({
+                success: false,
+                error: result.error,
+                details: result.details
+            });
+        }
+
+        // Only deduct credits if external API was used
+        // Always deduct 1 credit (all requests charged, Playwright or fallback)
+        req.user.credits -= result.creditCost;
+        
+        mockRedisCache[cacheKey] = result.data;
 
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
-            credits_charged: costPerRequest,
-            ...data
+            credits_charged: result.creditCost,
+            provider: result.provider,
+            ...result.data
         });
 
     } catch (error) {
@@ -583,21 +648,37 @@ app.get('/v1/reddit/search', authMiddleware, async (req, res) => {
                 success: true,
                 credits_remaining: req.user.credits,
                 credits_charged: 0,
+                provider: 'cache',
                 ...mockRedisCache[cacheKey]
             });
         }
 
-        // Pass cursor and limit to the scraper
-        const data = await scrapeGlobalSearch(query, sort, timeframe, cursor, limit);
+        // --- NEW: Use fallback orchestrator ---
+        const result = await redditOrchestrator.execute(
+            () => scrapeGlobalSearch(query, sort, timeframe, cursor, limit),
+            'global/search'
+        );
 
-        req.user.credits -= costPerRequest;
-        mockRedisCache[cacheKey] = data;
+        if (!result.success) {
+            return res.status(503).json({
+                success: false,
+                error: result.error,
+                details: result.details
+            });
+        }
+
+        // Only deduct credits if external API was used
+        // Always deduct 1 credit (all requests charged, Playwright or fallback)
+        req.user.credits -= result.creditCost;
+        
+        mockRedisCache[cacheKey] = result.data;
 
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
-            credits_charged: costPerRequest,
-            ...data
+            credits_charged: result.creditCost,
+            provider: result.provider,
+            ...result.data
         });
 
     } catch (error) {
