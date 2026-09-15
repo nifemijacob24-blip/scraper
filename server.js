@@ -1,6 +1,9 @@
 require('dotenv').config();
 const express = require('express');
 const redditOrchestrator = require('./src/services/reddit-orchestrator');
+const instagramOrchestrator = require('./src/services/instagram-orchestrator');
+const trustpilotOrchestrator = require('./src/services/trustpilot-orchestrator');
+const amazonOrchestrator = require('./src/services/amazon-orchestrator');
 
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
@@ -254,16 +257,37 @@ async function authMiddleware(req, res, next) {
 
 // --- ENDPOINT 1: SUBREDDIT DETAILS (1 CREDIT) ---
 app.get('/v1/reddit/subreddit/details', authMiddleware, async (req, res) => {
-    const name = req.query.name || req.query.subreddit;
+    // Support both 'subreddit' and 'name' query params
+    const rawInput = req.query.subreddit || req.query.name;
+    const cacheMaxAge = req.query.cache_max_age || '7d';
 
-    if (!name) {
+    if (!rawInput) {
         return res.status(400).json({
             success: false,
-            error: "400 Bad Request: Missing required parameter 'name' or 'subreddit'"
+            error: "400 Bad Request: Missing required parameter 'subreddit' or 'name'"
         });
     }
 
-    const cacheKey = `reddit_sub_${name.toLowerCase()}`;
+    // Clean up handle/name in case consumers pass full URLs, 'r/', or trailing slashes
+    // Note: preserve exact casing for ScrapeCreators API compliance
+    let cleanSubreddit = rawInput.trim().split('?')[0].replace(/\/$/, '');
+    if (cleanSubreddit.includes('reddit.com/r/')) {
+        cleanSubreddit = cleanSubreddit.split('reddit.com/r/')[1].split('/')[0];
+    } else if (cleanSubreddit.startsWith('r/')) {
+        cleanSubreddit = cleanSubreddit.replace(/^r\//, '');
+    }
+
+    const costPerRequest = 1; // DaaS markup (adjust as needed)
+
+    if (req.user.credits < costPerRequest) {
+        return res.status(403).json({
+            success: false,
+            error: `403 Forbidden: Insufficient credits. This request requires ${costPerRequest} credit(s).`
+        });
+    }
+
+    // Use lowercased key for local cache lookups to prevent duplicate hits across casing variations
+    const cacheKey = `reddit_sub_details_v1_${cleanSubreddit.toLowerCase()}`;
 
     try {
         if (mockRedisCache[cacheKey]) {
@@ -271,54 +295,79 @@ app.get('/v1/reddit/subreddit/details', authMiddleware, async (req, res) => {
                 success: true,
                 credits_remaining: req.user.credits,
                 credits_charged: 0,
-                provider: 'cache',
                 ...mockRedisCache[cacheKey]
             });
         }
 
-        // --- NEW: Use fallback orchestrator ---
-        const result = await redditOrchestrator.execute(
-            () => scrapeSubredditDetails(name),
-            'subreddit/details'
-        );
+        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
 
-        if (!result.success) {
-            return res.status(503).json({
-                success: false,
-                error: result.error,
-                details: result.details
-            });
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/reddit/subreddit/details');
+        targetUrl.searchParams.append('subreddit', cleanSubreddit);
+        targetUrl.searchParams.append('cache_max_age', cacheMaxAge);
+
+        const response = await fetch(targetUrl.toString(), {
+            method: 'GET',
+            headers: {
+                'x-api-key': upstreamApiKey,
+                'Content-Type': 'application/json'
+            },
+            signal: AbortSignal.timeout(15000)
+        });
+
+        const upstreamPayload = await response.json();
+
+        if (!response.ok || upstreamPayload.success === false) {
+            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch subreddit details'}`);
         }
 
-            // Always deduct 1 credit (all requests charged, Playwright or fallback)
-            req.user.credits -= result.creditCost;
-        
-        mockRedisCache[cacheKey] = result.data;
+        // Standardize output payload for your consumers
+        const responseData = {
+            subreddit_id: upstreamPayload.subreddit_id || null,
+            display_name: upstreamPayload.display_name || cleanSubreddit,
+            subscribers: upstreamPayload.subscribers || 0,
+            weekly_active_users: upstreamPayload.weekly_active_users || 0,
+            weekly_contributions: upstreamPayload.weekly_contributions || 0,
+            description: upstreamPayload.description || "",
+            rules: upstreamPayload.rules || "",
+            icon_img: upstreamPayload.icon_img || null,
+            header_img: upstreamPayload.header_img || null,
+            advertiser_category: upstreamPayload.advertiser_category || "",
+            created_at: upstreamPayload.created_at || null,
+            submit_text: upstreamPayload.submit_text || ""
+        };
+
+        req.user.credits -= costPerRequest;
+        mockRedisCache[cacheKey] = responseData;
 
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
-            credits_charged: result.creditCost,
-            provider: result.provider,
-            ...result.data
+            credits_charged: costPerRequest,
+            ...responseData
         });
 
     } catch (error) {
-        const statusCode = error.statusCode || 500;
         const errorMessage = error.message || "Internal Server Error";
+        const isTimeout = error.name === 'TimeoutError';
+        const statusCode = isTimeout ? 504 : 500;
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: Upstream provider took too long to respond." 
+            : errorMessage;
 
-        if (statusCode >= 500 || statusCode === 403 || statusCode === 429) {
+        // Discord Failure Alert
+        if (typeof notifyFailure === 'function') {
             notifyFailure({
                 endpoint: '/v1/reddit/subreddit/details',
-                params: { name },
-                statusCode,
-                errorMsg: errorMessage
+                params: { subreddit: cleanSubreddit, cache_max_age: cacheMaxAge },
+                statusCode: statusCode,
+                errorMsg: finalErrorMsg
             });
         }
 
         return res.status(statusCode).json({
             success: false,
-            error: `${statusCode}: ${errorMessage}`
+            error: finalErrorMsg
         });
     }
 });
@@ -420,22 +469,30 @@ app.get('/v1/reddit/subreddit/posts', authMiddleware, async (req, res) => {
 
 
 app.get('/v1/reddit/subreddit/search', authMiddleware, async (req, res) => {
-    const subreddit = req.query.subreddit || req.query.name;
+    const rawInput = req.query.subreddit || req.query.name;
     const query = req.query.q || req.query.query;
     const sort = req.query.sort || 'relevance';
     const timeframe = req.query.timeframe || 'all';
     
-    // Support both 'cursor' and 'after' for backward compatibility
+    // Support 'after' for legacy consumers, but strictly use 'cursor' going forward
     const cursor = req.query.cursor || req.query.after || null;
     
-    // Parse limit, fallback to 100
+    // Parse limit for your internal tracking/webhooks (ScrapeCreators handles limit implicitly)
     const limit = parseInt(req.query.limit, 10) || 100;
 
-    if (!subreddit || !query) {
+    if (!rawInput || !query) {
         return res.status(400).json({
             success: false,
-            error: "400 Bad Request: Missing required parameters 'subreddit' and 'q'"
+            error: "400 Bad Request: Missing required parameters 'subreddit' and 'q' (or 'query')"
         });
+    }
+
+    // Clean up input while preserving case sensitivity
+    let cleanSubreddit = rawInput.trim().split('?')[0].replace(/\/$/, '');
+    if (cleanSubreddit.includes('reddit.com/r/')) {
+        cleanSubreddit = cleanSubreddit.split('reddit.com/r/')[1].split('/')[0];
+    } else if (cleanSubreddit.startsWith('r/')) {
+        cleanSubreddit = cleanSubreddit.replace(/^r\//, '');
     }
 
     const costPerRequest = 1;
@@ -443,12 +500,12 @@ app.get('/v1/reddit/subreddit/search', authMiddleware, async (req, res) => {
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({
             success: false,
-            error: `403 Forbidden: Insufficient credits. This request requires ${costPerRequest} credits.`
+            error: `403 Forbidden: Insufficient credits. This request requires ${costPerRequest} credit(s).`
         });
     }
 
-    // Cache key now includes limit and cursor
-    const cacheKey = `reddit_search_${subreddit.toLowerCase()}_${Buffer.from(query).toString('base64')}_${sort}_${timeframe}_${cursor || 'start'}_${limit}`;
+    // Cache key includes base64 query to safely handle special characters in search terms
+    const cacheKey = `reddit_search_v1_${cleanSubreddit.toLowerCase()}_${Buffer.from(query).toString('base64')}_${sort}_${timeframe}_${cursor || 'start'}`;
 
     try {
         if (mockRedisCache[cacheKey]) {
@@ -461,49 +518,76 @@ app.get('/v1/reddit/subreddit/search', authMiddleware, async (req, res) => {
             });
         }
 
-        // --- NEW: Use fallback orchestrator ---
-        const result = await redditOrchestrator.execute(
-            () => scrapeSubredditSearch(subreddit, query, sort, timeframe, cursor, limit),
-            'subreddit/search'
-        );
+        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
 
-        if (!result.success) {
-            return res.status(503).json({
-                success: false,
-                error: result.error,
-                details: result.details
-            });
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/reddit/subreddit/search');
+        targetUrl.searchParams.append('subreddit', cleanSubreddit);
+        targetUrl.searchParams.append('query', query);
+        targetUrl.searchParams.append('sort', sort);
+        targetUrl.searchParams.append('timeframe', timeframe);
+        
+        // ScrapeCreators natively uses 'cursor' for this specific endpoint
+        if (cursor) {
+            targetUrl.searchParams.append('cursor', cursor);
         }
 
-        // Only deduct credits if external API was used
-        // Always deduct 1 credit (all requests charged, Playwright or fallback)
-        req.user.credits -= result.creditCost;
+        const response = await fetch(targetUrl.toString(), {
+            method: 'GET',
+            headers: {
+                'x-api-key': upstreamApiKey,
+                'Content-Type': 'application/json'
+            },
+            signal: AbortSignal.timeout(15000)
+        });
+
+        const upstreamPayload = await response.json();
+
+        if (!response.ok || upstreamPayload.success === false) {
+            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to search subreddit'}`);
+        }
+
+        // --- NAMED 'cursor' AND PLACED AT THE TOP OF THE PAYLOAD ---
+        const responseData = {
+            cursor: upstreamPayload.cursor || null,
+            posts: upstreamPayload.posts || [],
+            comments: upstreamPayload.comments || [],
+            media: upstreamPayload.media || []
+        };
         
-        mockRedisCache[cacheKey] = result.data;
+        req.user.credits -= costPerRequest;
+        mockRedisCache[cacheKey] = responseData;
 
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
-            credits_charged: result.creditCost,
-            provider: result.provider,
-            ...result.data
+            credits_charged: costPerRequest,
+            provider: 'scrapecreators',
+            ...responseData // cursor renders right below provider
         });
 
     } catch (error) {
-        const statusCode = error.statusCode || 500;
         const errorMessage = error.message || "Internal Server Error";
+        const isTimeout = error.name === 'TimeoutError';
+        const statusCode = isTimeout ? 504 : (error.statusCode || 500);
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: Upstream provider took too long to respond." 
+            : errorMessage;
 
-        // Ping Discord immediately on failure
-        notifyFailure({
-            endpoint: '/v1/reddit/subreddit/search',
-            params: { subreddit, query, sort, timeframe, cursor, limit }, // Added limit to webhook payload
-            statusCode,
-            errorMsg: errorMessage
-        });
+        if (statusCode >= 500 || statusCode === 403 || statusCode === 429) {
+            if (typeof notifyFailure === 'function') {
+                notifyFailure({
+                    endpoint: '/v1/reddit/subreddit/search',
+                    params: { subreddit: cleanSubreddit, query, sort, timeframe, cursor, limit },
+                    statusCode: statusCode,
+                    errorMsg: finalErrorMsg
+                });
+            }
+        }
 
         return res.status(statusCode).json({
             success: false,
-            error: `${statusCode}: ${errorMessage}`
+            error: finalErrorMsg
         });
     }
 });
@@ -515,8 +599,11 @@ const { scrapePostComments } = require('./src/scrapers/reddit');
 app.get('/v1/reddit/post/comments', authMiddleware, async (req, res) => {
     const postUrl = req.query.url || req.query.permalink;
     
-    // Support both 'cursor' and 'after' for standard API inputs
+    // Support 'after' for legacy consumers, but strictly use 'cursor' going forward
     const cursor = req.query.cursor || req.query.after || null;
+    const trim = req.query.trim === 'true';
+    
+    // Limit is tracked for cache keys and internal webhooks, but ScrapeCreators handles volume implicitly
     const limit = parseInt(req.query.limit, 10) || 100;
 
     if (!postUrl) {
@@ -526,7 +613,7 @@ app.get('/v1/reddit/post/comments', authMiddleware, async (req, res) => {
         });
     }
 
-    // Basic validation to ensure it's a reddit URL
+    // Basic validation to ensure it's a valid Reddit post URL format
     if (!postUrl.includes('reddit.com/r/') || !postUrl.includes('/comments/')) {
         return res.status(400).json({
             success: false,
@@ -539,7 +626,7 @@ app.get('/v1/reddit/post/comments', authMiddleware, async (req, res) => {
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({
             success: false,
-            error: `403 Forbidden: Insufficient credits. This request requires ${costPerRequest} credits.`
+            error: `403 Forbidden: Insufficient credits. This request requires ${costPerRequest} credit(s).`
         });
     }
 
@@ -547,8 +634,8 @@ app.get('/v1/reddit/post/comments', authMiddleware, async (req, res) => {
     const urlParts = postUrl.split('/comments/');
     const postId = urlParts.length > 1 ? urlParts[1].split('/')[0] : 'unknown';
     
-    // Include limit and cursor in cache key to avoid collisions
-    const cacheKey = `reddit_comments_${postId}_${cursor || 'start'}_${limit}`;
+    // Cache key incorporates the cursor and trim parameter
+    const cacheKey = `reddit_comments_v1_${postId}_${cursor || 'start'}_trim_${trim}`;
 
     try {
         if (mockRedisCache[cacheKey]) {
@@ -561,53 +648,77 @@ app.get('/v1/reddit/post/comments', authMiddleware, async (req, res) => {
             });
         }
 
-        // --- NEW: Use fallback orchestrator ---
-        const result = await redditOrchestrator.execute(
-            () => scrapePostComments(postUrl, limit, cursor),
-            'post/comments'
-        );
+        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
 
-        if (!result.success) {
-            return res.status(503).json({
-                success: false,
-                error: result.error,
-                details: result.details
-            });
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/reddit/post/comments');
+        targetUrl.searchParams.append('url', postUrl);
+        
+        if (cursor) {
+            targetUrl.searchParams.append('cursor', cursor);
+        }
+        if (trim) {
+            targetUrl.searchParams.append('trim', 'true');
         }
 
-        // Only deduct credits if external API was used
-        // Always deduct 1 credit (all requests charged, Playwright or fallback)
-        req.user.credits -= result.creditCost;
+        const response = await fetch(targetUrl.toString(), {
+            method: 'GET',
+            headers: {
+                'x-api-key': upstreamApiKey,
+                'Content-Type': 'application/json'
+            },
+            signal: AbortSignal.timeout(15000)
+        });
+
+        const upstreamPayload = await response.json();
+
+        if (!response.ok || upstreamPayload.success === false) {
+            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch post comments'}`);
+        }
+
+        // --- PLACED AT THE TOP: 'more' object containing the pagination cursor ---
+        const responseData = {
+            more: upstreamPayload.more || null, 
+            post: upstreamPayload.post || null,
+            comments: upstreamPayload.comments || []
+        };
         
-        mockRedisCache[cacheKey] = result.data;
+        req.user.credits -= costPerRequest;
+        mockRedisCache[cacheKey] = responseData;
 
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
-            credits_charged: result.creditCost,
-            provider: result.provider,
-            ...result.data
+            credits_charged: costPerRequest,
+            provider: 'scrapecreators',
+            ...responseData // 'more' renders right below provider
         });
 
     } catch (error) {
-        const statusCode = error.statusCode || 500;
         const errorMessage = error.message || "Internal Server Error";
+        const isTimeout = error.name === 'TimeoutError';
+        const statusCode = isTimeout ? 504 : (error.statusCode || 500);
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: Upstream provider took too long to respond." 
+            : errorMessage;
 
-        // Ping Discord immediately on failure
-        notifyFailure({
-            endpoint: '/v1/reddit/post/comments',
-            params: { postUrl, cursor, limit },
-            statusCode,
-            errorMsg: errorMessage
-        });
+        if (statusCode >= 500 || statusCode === 403 || statusCode === 429) {
+            if (typeof notifyFailure === 'function') {
+                notifyFailure({
+                    endpoint: '/v1/reddit/post/comments',
+                    params: { postUrl, cursor, limit, trim },
+                    statusCode: statusCode,
+                    errorMsg: finalErrorMsg
+                });
+            }
+        }
 
         return res.status(statusCode).json({
             success: false,
-            error: `${statusCode}: ${errorMessage}`
+            error: finalErrorMsg
         });
     }
 });
-
 const { scrapeGlobalSearch } = require('./src/scrapers/reddit');
 
 // --- ENDPOINT 5: GLOBAL SEARCH (1 CREDIT) ---
@@ -617,16 +728,20 @@ app.get('/v1/reddit/search', authMiddleware, async (req, res) => {
     const sort = req.query.sort || 'relevance';
     const timeframe = req.query.timeframe || 'all';
     
-    // Support both 'cursor' and 'after' for backward compatibility
-    const cursor = req.query.cursor || req.query.after || null;
+    // ScrapeCreators supports filtering by 'posts' or 'comments' for global search
+    const filter = req.query.filter || 'posts';
     
-    // Parse limit, fallback to 100
+    // Support 'after' for legacy consumers, but strictly use 'cursor' for output
+    const cursor = req.query.cursor || req.query.after || null;
+    const trim = req.query.trim === 'true';
+    
+    // Limit is tracked for cache keys and internal webhooks
     const limit = parseInt(req.query.limit, 10) || 100;
 
     if (!query) {
         return res.status(400).json({
             success: false,
-            error: "400 Bad Request: Missing required parameter 'q'"
+            error: "400 Bad Request: Missing required parameter 'q' (or 'query')"
         });
     }
 
@@ -635,12 +750,12 @@ app.get('/v1/reddit/search', authMiddleware, async (req, res) => {
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({
             success: false,
-            error: `403 Forbidden: Insufficient credits. This request requires ${costPerRequest} credits.`
+            error: `403 Forbidden: Insufficient credits. This request requires ${costPerRequest} credit(s).`
         });
     }
 
-    // Cache key now includes limit and cursor
-    const cacheKey = `reddit_global_search_${Buffer.from(query).toString('base64')}_${sort}_${timeframe}_${cursor || 'start'}_${limit}`;
+    // Cache key uses base64 query to safely handle special characters (e.g., query="scrape API data")
+    const cacheKey = `reddit_global_search_v1_${Buffer.from(query).toString('base64')}_${filter}_${sort}_${timeframe}_${cursor || 'start'}_trim_${trim}`;
 
     try {
         if (mockRedisCache[cacheKey]) {
@@ -653,49 +768,82 @@ app.get('/v1/reddit/search', authMiddleware, async (req, res) => {
             });
         }
 
-        // --- NEW: Use fallback orchestrator ---
-        const result = await redditOrchestrator.execute(
-            () => scrapeGlobalSearch(query, sort, timeframe, cursor, limit),
-            'global/search'
-        );
+        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
 
-        if (!result.success) {
-            return res.status(503).json({
-                success: false,
-                error: result.error,
-                details: result.details
-            });
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/reddit/search');
+        targetUrl.searchParams.append('query', query);
+        targetUrl.searchParams.append('sort', sort);
+        targetUrl.searchParams.append('timeframe', timeframe);
+        
+        // Pass the filter if the user explicitly provided it (e.g., searching for comments only)
+        if (req.query.filter) {
+            targetUrl.searchParams.append('filter', filter);
         }
 
-        // Only deduct credits if external API was used
-        // Always deduct 1 credit (all requests charged, Playwright or fallback)
-        req.user.credits -= result.creditCost;
+        // Secretly map your 'cursor' to ScrapeCreators' 'after' requirement
+        if (cursor) {
+            targetUrl.searchParams.append('after', cursor);
+        }
+        if (trim) {
+            targetUrl.searchParams.append('trim', 'true');
+        }
+
+        const response = await fetch(targetUrl.toString(), {
+            method: 'GET',
+            headers: {
+                'x-api-key': upstreamApiKey,
+                'Content-Type': 'application/json'
+            },
+            signal: AbortSignal.timeout(15000)
+        });
+
+        const upstreamPayload = await response.json();
+
+        if (!response.ok || upstreamPayload.success === false) {
+            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to execute global search'}`);
+        }
+
+        // --- NAMED 'cursor' AND PLACED AT THE TOP OF THE PAYLOAD ---
+        const responseData = {
+            cursor: upstreamPayload.after || null,
+            posts: upstreamPayload.posts || [],
+            comments: upstreamPayload.comments || []
+        };
         
-        mockRedisCache[cacheKey] = result.data;
+        req.user.credits -= costPerRequest;
+        mockRedisCache[cacheKey] = responseData;
 
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
-            credits_charged: result.creditCost,
-            provider: result.provider,
-            ...result.data
+            credits_charged: costPerRequest,
+            provider: 'scrapecreators',
+            ...responseData // cursor renders right below provider
         });
 
     } catch (error) {
-        const statusCode = error.statusCode || 500;
         const errorMessage = error.message || "Internal Server Error";
+        const isTimeout = error.name === 'TimeoutError';
+        const statusCode = isTimeout ? 504 : (error.statusCode || 500);
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: Upstream provider took too long to respond." 
+            : errorMessage;
 
-        // Ping Discord immediately on failure
-        notifyFailure({
-            endpoint: '/v1/reddit/search',
-            params: { query, sort, timeframe, cursor, limit }, // Added limit to payload
-            statusCode,
-            errorMsg: errorMessage
-        });
+        if (statusCode >= 500 || statusCode === 403 || statusCode === 429) {
+            if (typeof notifyFailure === 'function') {
+                notifyFailure({
+                    endpoint: '/v1/reddit/search',
+                    params: { query, filter, sort, timeframe, cursor, limit, trim },
+                    statusCode: statusCode,
+                    errorMsg: finalErrorMsg
+                });
+            }
+        }
 
         return res.status(statusCode).json({
             success: false,
-            error: `${statusCode}: ${errorMessage}`
+            error: finalErrorMsg
         });
     }
 });
@@ -704,13 +852,22 @@ const { scrapeInstagramProfile } = require('./src/scrapers/instagram');
 
 // --- ENDPOINT 6: INSTAGRAM PROFILE (1 CREDIT) ---
 app.get('/v1/instagram/profile', authMiddleware, async (req, res) => {
-    const username = req.query.username || req.query.user;
+    // Support 'username', 'user', and 'handle' to ensure zero breaking changes for your API consumers
+    const rawInput = req.query.username || req.query.user || req.query.handle;
+    const trim = req.query.trim === 'true';
+    const cacheMaxAge = req.query.cache_max_age || '7d';
 
-    if (!username) {
+    if (!rawInput) {
         return res.status(400).json({
             success: false,
-            error: "400 Bad Request: Missing required parameter 'username'"
+            error: "400 Bad Request: Missing required parameter 'username' or 'handle'"
         });
+    }
+
+    // Aggressive sanitization: strip @ symbols, tracking params, trailing slashes, and full URLs
+    let cleanHandle = rawInput.trim().replace('@', '').split('?')[0].replace(/\/$/, '').toLowerCase();
+    if (cleanHandle.includes('instagram.com/')) {
+        cleanHandle = cleanHandle.split('instagram.com/')[1].split('/')[0];
     }
 
     const costPerRequest = 1;
@@ -718,13 +875,12 @@ app.get('/v1/instagram/profile', authMiddleware, async (req, res) => {
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({
             success: false,
-            error: `403 Forbidden: Insufficient credits. This request requires ${costPerRequest} credits.`
+            error: `403 Forbidden: Insufficient credits. This request requires ${costPerRequest} credit(s).`
         });
     }
 
-    // Clean username for cache key
-    const cleanUsername = username.replace('@', '').split('?')[0].replace(/\/$/, '').toLowerCase();
-    const cacheKey = `instagram_profile_${cleanUsername}`;
+    // Cache key explicitly locks to the cleaned handle and trim parameter
+    const cacheKey = `instagram_profile_v1_${cleanHandle}_trim_${trim}`;
 
     try {
         if (mockRedisCache[cacheKey]) {
@@ -732,36 +888,75 @@ app.get('/v1/instagram/profile', authMiddleware, async (req, res) => {
                 success: true,
                 credits_remaining: req.user.credits,
                 credits_charged: 0,
+                provider: 'cache',
                 ...mockRedisCache[cacheKey]
             });
         }
 
-        const data = await scrapeInstagramProfile(cleanUsername);
+        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
 
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/instagram/profile');
+        targetUrl.searchParams.append('handle', cleanHandle);
+        targetUrl.searchParams.append('cache_max_age', cacheMaxAge);
+        
+        if (trim) {
+            targetUrl.searchParams.append('trim', 'true');
+        }
+
+        const response = await fetch(targetUrl.toString(), {
+            method: 'GET',
+            headers: {
+                'x-api-key': upstreamApiKey,
+                'Content-Type': 'application/json'
+            },
+            signal: AbortSignal.timeout(15000)
+        });
+
+        const upstreamPayload = await response.json();
+
+        if (!response.ok || upstreamPayload.success === false) {
+            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch Instagram profile'}`);
+        }
+
+        // Map ScrapeCreators' nested data.user payload directly to the root for your consumers
+        const responseData = {
+            user: upstreamPayload.data?.user || upstreamPayload.user || null
+        };
+        
         req.user.credits -= costPerRequest;
-        mockRedisCache[cacheKey] = data;
+        mockRedisCache[cacheKey] = responseData;
 
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
             credits_charged: costPerRequest,
-            ...data
+            provider: 'scrapecreators',
+            ...responseData 
         });
 
     } catch (error) {
-        const statusCode = error.statusCode || 500;
         const errorMessage = error.message || "Internal Server Error";
+        const isTimeout = error.name === 'TimeoutError';
+        const statusCode = isTimeout ? 504 : (error.statusCode || 500);
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: Upstream provider took too long to respond." 
+            : errorMessage;
 
-        notifyFailure({
-            endpoint: '/v1/instagram/profile',
-            params: { username: cleanUsername },
-            statusCode,
-            errorMsg: errorMessage
-        });
+        if (statusCode >= 500 || statusCode === 403 || statusCode === 429) {
+            if (typeof notifyFailure === 'function') {
+                notifyFailure({
+                    endpoint: '/v1/instagram/profile',
+                    params: { handle: cleanHandle, trim },
+                    statusCode: statusCode,
+                    errorMsg: finalErrorMsg
+                });
+            }
+        }
 
         return res.status(statusCode).json({
             success: false,
-            error: `${statusCode}: ${errorMessage}`
+            error: finalErrorMsg
         });
     }
 });
@@ -8861,12 +9056,24 @@ app.get('/v1/trustpilot/reviews', authMiddleware, async (req, res) => {
                 success: true,
                 credits_remaining: req.user.credits,
                 credits_charged: 0, 
+                provider: 'cache',
                 ...mockRedisCache[cacheKey]
             });
         }
 
-        // 5. Execute the Native Scraper
-        const data = await scrapeTrustpilotReviews(cleanDomain, safePage, safeSort, safeStars);
+        // 5. Try Playwright first, then SocialCrawl when its parameters are supported
+        const result = await trustpilotOrchestrator.executeReviews(
+            () => scrapeTrustpilotReviews(cleanDomain, safePage, safeSort, safeStars),
+            { domain: cleanDomain, page: safePage, sort: safeSort, stars: safeStars }
+        );
+
+        if (!result.success) {
+            return res.status(503).json({
+                success: false,
+                error: result.error,
+                details: result.details
+            });
+        }
 
         const responseData = {
             query: {
@@ -8875,18 +9082,19 @@ app.get('/v1/trustpilot/reviews', authMiddleware, async (req, res) => {
                 sort: safeSort,
                 stars: safeStars
             },
-            ...data
+            ...result.data
         };
 
         // 6. Deduct Credit & Store in Cache
-        req.user.credits -= costToUser;
+        req.user.credits -= result.creditCost;
         mockRedisCache[cacheKey] = responseData;
 
         // 7. Return Response
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
-            credits_charged: costToUser,
+            credits_charged: result.creditCost,
+            provider: result.provider,
             ...responseData
         });
 
@@ -8945,28 +9153,37 @@ app.get('/v1/trustpilot/search', authMiddleware, async (req, res) => {
                 success: true,
                 credits_remaining: req.user.credits,
                 credits_charged: 0, 
+                provider: 'cache',
                 ...mockRedisCache[cacheKey]
             });
         }
 
-        // 5. Execute the Native Scraper
-        const businesses = await scrapeTrustpilotSearch(cleanQuery);
+        // 5. Try Playwright first, then SocialCrawl
+        const result = await trustpilotOrchestrator.executeSearch(
+            () => scrapeTrustpilotSearch(cleanQuery),
+            cleanQuery
+        );
 
-        const responseData = {
-            query: cleanQuery,
-            total_results: businesses.length,
-            businesses: businesses
-        };
+        if (!result.success) {
+            return res.status(503).json({
+                success: false,
+                error: result.error,
+                details: result.details
+            });
+        }
+
+        const responseData = result.data;
 
         // 6. Deduct Credit & Store in Cache
-        req.user.credits -= costToUser;
+        req.user.credits -= result.creditCost;
         mockRedisCache[cacheKey] = responseData;
 
         // 7. Return Response
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
-            credits_charged: costToUser,
+            credits_charged: result.creditCost,
+            provider: result.provider,
             ...responseData
         });
 
@@ -9376,23 +9593,36 @@ app.get('/v1/amazon/product', authMiddleware, async (req, res) => {
                 success: true,
                 credits_remaining: req.user.credits,
                 credits_charged: 0,
+                provider: 'cache',
                 data: mockRedisCache[cacheKey]
             });
         }
 
-        // 5. Execute Scraper
-        const product = await scrapeAmazonProductAPI(cleanAsin, marketCode);
+        // 5. Try Playwright/ScraperAPI first, then SocialCrawl
+        const result = await amazonOrchestrator.executeProduct(
+            () => scrapeAmazonProductAPI(cleanAsin, marketCode),
+            { asin: cleanAsin, country: MARKETPLACE_MAP[marketCode]?.country || 'us' }
+        );
+
+        if (!result.success) {
+            return res.status(503).json({
+                success: false,
+                error: result.error,
+                details: result.details
+            });
+        }
 
         // 6. Deduct Credit & Store in Cache
-        req.user.credits -= costToUser;
-        mockRedisCache[cacheKey] = product;
+        req.user.credits -= result.creditCost;
+        mockRedisCache[cacheKey] = result.data;
 
         // 7. Response
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
-            credits_charged: costToUser,
-            data: product
+            credits_charged: result.creditCost,
+            provider: result.provider,
+            data: result.data
         });
 
     } catch (error) {
@@ -9461,24 +9691,35 @@ app.get('/v1/amazon/search', authMiddleware, async (req, res) => {
                 success: true,
                 credits_remaining: req.user.credits,
                 credits_charged: 0,
+                provider: 'cache',
                 ...mockRedisCache[cacheKey]
             });
         }
 
-        // 5. Execute Scraper
-        const products = await scrapeAmazonSearchAPI(cleanKeyword, marketCode, pageNum);
+        // 5. Try ScraperAPI first, then SocialCrawl
+        const result = await amazonOrchestrator.executeSearch(
+            () => scrapeAmazonSearchAPI(cleanKeyword, marketCode, pageNum),
+            {
+                keyword: cleanKeyword,
+                marketplace: marketCode,
+                country: MARKETPLACE_MAP[marketCode].country,
+                page: pageNum
+            }
+        );
 
-        const responseData = {
-            keyword: cleanKeyword,
-            marketplace: marketCode,
-            page: pageNum,
-            total_products_extracted: products.length,
-            products: products
-        };
+        if (!result.success) {
+            return res.status(503).json({
+                success: false,
+                error: result.error,
+                details: result.details
+            });
+        }
+
+        const responseData = result.data;
 
         // 6. Deduct Credit & Cache Non-Empty Responses
-        req.user.credits -= costToUser;
-        if (products.length > 0) {
+        req.user.credits -= result.creditCost;
+        if (responseData.products.length > 0) {
             mockRedisCache[cacheKey] = responseData;
         }
 
@@ -9486,7 +9727,8 @@ app.get('/v1/amazon/search', authMiddleware, async (req, res) => {
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
-            credits_charged: costToUser,
+            credits_charged: result.creditCost,
+            provider: result.provider,
             ...responseData
         });
 
@@ -9553,28 +9795,37 @@ const cacheKey = `amazon_storefront_${urlHash}`;
                 success: true,
                 credits_remaining: req.user.credits,
                 credits_charged: 0, 
+                provider: 'cache',
                 ...mockRedisCache[cacheKey]
             });
         }
 
-        // 5. Execute the Scraper API Wrapper
-        const products = await scrapeAmazonStorefront(cleanUrl);
+        // 5. Try Playwright first, then SocialCrawl
+        const result = await amazonOrchestrator.executeStorefront(
+            () => scrapeAmazonStorefront(cleanUrl),
+            { url: cleanUrl }
+        );
 
-        const responseData = {
-            storefront_url: cleanUrl,
-            total_products_extracted: products.length,
-            products: products
-        };
+        if (!result.success) {
+            return res.status(503).json({
+                success: false,
+                error: result.error,
+                details: result.details
+            });
+        }
+
+        const responseData = result.data;
 
         // 6. Deduct Credit & Store in Cache
-        req.user.credits -= costToUser;
+        req.user.credits -= result.creditCost;
         mockRedisCache[cacheKey] = responseData;
 
         // 7. Return Response
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
-            credits_charged: costToUser,
+            credits_charged: result.creditCost,
+            provider: result.provider,
             ...responseData
         });
 
