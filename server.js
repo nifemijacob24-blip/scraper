@@ -4,6 +4,7 @@ const redditOrchestrator = require('./src/services/reddit-orchestrator');
 const instagramOrchestrator = require('./src/services/instagram-orchestrator');
 const trustpilotOrchestrator = require('./src/services/trustpilot-orchestrator');
 const amazonOrchestrator = require('./src/services/amazon-orchestrator');
+const sequenzy = require('./src/services/sequenzy');
 
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
@@ -203,7 +204,7 @@ async function authMiddleware(req, res, next) {
         // Fetch user from Supabase using the API key
         const { data: userProfile, error } = await supabase
             .from('profiles')
-            .select('id, email, credits, api_key')
+            .select('*')
             .eq('api_key', apiKey)
             .single();
 
@@ -219,8 +220,25 @@ async function authMiddleware(req, res, next) {
         req.user = {
             id: userProfile.id,
             email: userProfile.email,
-            api_key: userProfile.api_key
+            api_key: userProfile.api_key,
+            firstName: userProfile.first_name || userProfile.firstName || undefined
         };
+
+        let lastResponseBody;
+        const originalJson = res.json.bind(res);
+        res.json = body => {
+            lastResponseBody = body;
+            return originalJson(body);
+        };
+        res.on('finish', () => {
+            sequenzy.trackSuccessfulApiCall(req.user, req, res.statusCode, lastResponseBody);
+
+            if (req.path.startsWith('/v1/') && res.statusCode === 200 && lastResponseBody?.success && lastResponseBody.credits_charged === 0) {
+                supabase.from('api_logs')
+                    .insert([{ user_id: req.user.id, cost: 0 }])
+                    .then(({error}) => { if (error) console.error("DB Zero-cost API log failed:", error); });
+            }
+        });
 
         // --- THE MAGIC TRICK ---
         // This intercepts `req.user.credits -= 1` in your endpoints 
@@ -231,6 +249,7 @@ async function authMiddleware(req, res, next) {
             get: function() { return currentCredits; },
             set: function(newVal) {
                 const cost = currentCredits - newVal; // Calculate credits spent
+                const crossedDepletionThreshold = currentCredits > 200 && newVal <= 200;
                 currentCredits = newVal;
                 
                 // 1. Deduct from balance
@@ -244,6 +263,10 @@ async function authMiddleware(req, res, next) {
                     supabase.from('api_logs')
                         .insert([{ user_id: userProfile.id, cost: cost }])
                         .then(({error}) => { if (error) console.error("DB Log sync failed:", error); });
+                }
+
+                if (crossedDepletionThreshold) {
+                    sequenzy.trackCreditDepletion(req.user, newVal);
                 }
             }
         });
@@ -9862,4 +9885,5 @@ app.use((req, res) => {
 
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`SignalQub API is awake and listening on port ${PORT}`);
+    sequenzy.startIdleUserScanner(supabase);
 });
