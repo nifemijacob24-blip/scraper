@@ -1,4 +1,5 @@
 const SEQUENZY_BASE_URL = 'https://api.sequenzy.com/api/v1';
+const accountCreatedInFlight = new Set();
 
 function isConfigured() {
     return Boolean(process.env.SEQUENZY_API_KEY);
@@ -19,6 +20,10 @@ async function request(path, body) {
     const payload = await response.json().catch(() => ({}));
     if (!response.ok || payload.success === false) {
         throw new Error(`Sequenzy ${response.status}: ${payload.error?.message || payload.error || response.statusText}`);
+    }
+
+    if (payload.sideEffectFailures?.length) {
+        throw new Error(`Sequenzy side effects failed: ${payload.sideEffectFailures.join(', ')}`);
     }
 
     if (path === '/subscribers/events') {
@@ -125,28 +130,38 @@ async function scanForIdleUsers(supabase) {
 
 async function trackAccountCreated(profile) {
     if (!profile?.email || !isConfigured()) return;
+    if (!profile.id || accountCreatedInFlight.has(profile.id)) return;
 
-    const user = {
-        id: profile.id,
-        email: profile.email,
-        firstName: profile.first_name || profile.firstName || undefined
-    };
+    accountCreatedInFlight.add(profile.id);
 
-    await trackEvent(user, 'signalqub.account_created', {
-        creditsLoaded: profile.credits,
-        dashboardUrl: 'https://signalqub.com/dashboard',
-        docsUrl: 'https://signalqub.com/docs'
-    }, `account-created-${profile.id}`, {
-        signalqubUserId: profile.id,
-        signupDate: profile.created_at
-    });
+    try {
+        const user = {
+            id: profile.id,
+            email: profile.email,
+            firstName: profile.first_name || profile.firstName || undefined
+        };
 
-    syncSubscriber(user, {
-        signalqubUserId: profile.id,
-        signupDate: profile.created_at
-    }).catch(error => {
-        console.error('Sequenzy signup subscriber sync failed:', error.message);
-    });
+        await trackEvent(user, 'signalqub.account_created', {
+            creditsLoaded: profile.credits,
+            dashboardUrl: 'https://signalqub.com/dashboard',
+            docsUrl: 'https://signalqub.com/docs'
+        }, `account-created-${profile.id}`, {
+            signalqubUserId: profile.id,
+            signupDate: profile.created_at
+        });
+
+        console.log(`Sequenzy welcome event accepted for ${profile.email}`);
+
+        syncSubscriber(user, {
+            signalqubUserId: profile.id,
+            signupDate: profile.created_at
+        }).catch(error => {
+            console.error('Sequenzy signup subscriber sync failed:', error.message);
+        });
+    } catch (error) {
+        accountCreatedInFlight.delete(profile.id);
+        throw error;
+    }
 }
 
 function startSignupListener(supabase) {
@@ -188,7 +203,11 @@ async function scanRecentSignups(supabase) {
     if (error) throw error;
 
     for (const profile of profiles || []) {
-        await trackAccountCreated(profile);
+        try {
+            await trackAccountCreated(profile);
+        } catch (error) {
+            console.error(`Sequenzy welcome event failed for ${profile.email}:`, error.message);
+        }
     }
 }
 
