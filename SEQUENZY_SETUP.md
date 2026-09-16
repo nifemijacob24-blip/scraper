@@ -56,4 +56,4 @@ Create and activate these sequences in the Sequenzy dashboard:
    - Email subject: `SignalQub credits running low`
    - Use `{{event.creditsRemaining}}` and link to `https://signalqub.com/dashboard` for upgrading.
 
-The signup listener requires Supabase Realtime to be enabled for `public.profiles`. It expects `profiles.id`, `profiles.email`, `profiles.created_at`, and `profiles.credits`, plus the existing `api_logs.user_id` column. The idle scanner runs hourly after the API starts as a retry/backfill path.
+The signup listener requires Supabase Realtime to be enabled for `public.profiles`, but a fallback query also retries profiles created in the last 24 hours every minute. This protects signups when Realtime publication settings are missing or the server reconnects. It expects `profiles.id`, `profiles.email`, `profiles.first_name`, `profiles.created_at`, and `profiles.credits`, plus the existing `api_logs.user_id` column. The idle scanner runs hourly after the API starts as a retry/backfill path.

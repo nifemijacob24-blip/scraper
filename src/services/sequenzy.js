@@ -155,8 +155,27 @@ function startSignupListener(supabase) {
         .subscribe(status => {
             if (status === 'SUBSCRIBED') {
                 console.log('Sequenzy signup listener enabled');
+            } else {
+                console.error(`Sequenzy signup listener status: ${status}`);
             }
         });
+}
+
+async function scanRecentSignups(supabase) {
+    if (!isConfigured()) return;
+
+    const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const { data: profiles, error } = await supabase
+        .from('profiles')
+        .select('id, email, first_name, created_at, credits')
+        .gte('created_at', cutoff)
+        .limit(1000);
+
+    if (error) throw error;
+
+    for (const profile of profiles || []) {
+        await trackAccountCreated(profile);
+    }
 }
 
 function startIdleUserScanner(supabase) {
@@ -168,9 +187,14 @@ function startIdleUserScanner(supabase) {
     const run = () => scanForIdleUsers(supabase).catch(error => {
         console.error('Sequenzy idle-user scan failed:', error.message);
     });
+    const retryRecentSignups = () => scanRecentSignups(supabase).catch(error => {
+        console.error('Sequenzy signup retry failed:', error.message);
+    });
 
     run();
+    retryRecentSignups();
     setInterval(run, 60 * 60 * 1000);
+    setInterval(retryRecentSignups, 60 * 1000);
 }
 
 module.exports = {
