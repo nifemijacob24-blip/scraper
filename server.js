@@ -9885,5 +9885,6 @@ app.use((req, res) => {
 
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`SignalQub API is awake and listening on port ${PORT}`);
+    sequenzy.startSignupListener(supabase);
     sequenzy.startIdleUserScanner(supabase);
 });

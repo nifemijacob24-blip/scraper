@@ -118,6 +118,47 @@ async function scanForIdleUsers(supabase) {
     }
 }
 
+async function trackAccountCreated(profile) {
+    if (!profile?.email || !isConfigured()) return;
+
+    const user = {
+        id: profile.id,
+        email: profile.email,
+        firstName: profile.first_name || profile.firstName || undefined
+    };
+
+    await syncSubscriber(user, {
+        signalqubUserId: profile.id,
+        signupDate: profile.created_at
+    });
+    await trackEvent(user, 'signalqub.account_created', {
+        creditsLoaded: profile.credits,
+        dashboardUrl: 'https://signalqub.com/dashboard',
+        docsUrl: 'https://signalqub.com/docs'
+    }, `account-created-${profile.id}`);
+}
+
+function startSignupListener(supabase) {
+    if (!isConfigured()) return;
+
+    supabase
+        .channel('sequenzy-signups')
+        .on('postgres_changes', {
+            event: 'INSERT',
+            schema: 'public',
+            table: 'profiles'
+        }, payload => {
+            trackAccountCreated(payload.new).catch(error => {
+                console.error('Sequenzy account-created event failed:', error.message);
+            });
+        })
+        .subscribe(status => {
+            if (status === 'SUBSCRIBED') {
+                console.log('Sequenzy signup listener enabled');
+            }
+        });
+}
+
 function startIdleUserScanner(supabase) {
     if (!isConfigured()) {
         console.log('Sequenzy integration disabled: SEQUENZY_API_KEY is not set');
@@ -135,7 +176,9 @@ function startIdleUserScanner(supabase) {
 module.exports = {
     isConfigured,
     syncSubscriber,
+    trackAccountCreated,
     trackSuccessfulApiCall,
     trackCreditDepletion,
+    startSignupListener,
     startIdleUserScanner
 };
