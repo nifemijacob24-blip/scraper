@@ -6,7 +6,7 @@ The backend sends these Sequenzy events:
 | --- | --- |
 | `signalqub.account_created` | A new row is inserted into the Supabase `profiles` table |
 | `signalqub.user_idle_48h` | A profile is at least 48 hours old and has no `api_logs` rows |
-| `signalqub.api_call_succeeded` | An authenticated `/v1/*` request returns HTTP 200 |
+| `signalqub.api_aha` | The account reaches five successful API calls |
 | `signalqub.credit_depletion` | The account crosses from above 200 credits to 200 or fewer |
 
 All event delivery is asynchronous and fail-open. A Sequenzy outage never delays an API response. Event IDs make the idle and depletion events safe to retry.
@@ -49,7 +49,8 @@ Create and activate these sequences in the Sequenzy dashboard:
    - Body: use `{{firstName}}`, link to the n8n/Reddit video, and invite the user to reply with setup issues.
 
 3. **Aha moment**
-   - Trigger: frequency of `signalqub.api_call_succeeded`, five occurrences for the same subscriber.
+   - Trigger: event `signalqub.api_aha`.
+   - The backend emits this event once, after the user reaches five successful API calls. Do not use a frequency trigger for this sequence.
    - Email subject: `nice pulls`
    - Explain that fallback routing is returning payloads and invite a production integration or higher rate-limit conversation.
 

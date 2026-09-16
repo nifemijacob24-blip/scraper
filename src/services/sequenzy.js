@@ -70,15 +70,33 @@ function fireAndForget(action, label) {
     });
 }
 
-function trackSuccessfulApiCall(user, req, statusCode, responseBody) {
+function trackSuccessfulApiCall(user, req, statusCode, responseBody, supabase) {
     if (!req.path.startsWith('/v1/') || statusCode !== 200) return;
 
-    fireAndForget(() => trackEvent(user, 'signalqub.api_call_succeeded', {
-        endpoint: req.path,
-        method: req.method,
-        provider: responseBody?.provider || null,
-        creditsCharged: responseBody?.credits_charged || 0
-    }), 'successful API call');
+    fireAndForget(() => trackAhaMoment(user, supabase), 'aha moment');
+}
+
+async function trackAhaMoment(user, supabase) {
+    if (!user?.email || !isConfigured() || !supabase) return;
+
+    const { count, error } = await supabase
+        .from('api_logs')
+        .select('*', { count: 'exact', head: true })
+        .eq('user_id', user.id);
+
+    if (error) throw error;
+    if ((count || 0) < 4) return;
+
+    await request('/subscribers/events', {
+        ...subscriberIdentity(user),
+        event: 'signalqub.api_aha',
+        properties: {
+            successfulCalls: 5,
+            message: 'User completed five successful API calls'
+        },
+        eventId: `api-aha-${user.id}`
+    });
+
 }
 
 function trackCreditDepletion(user, creditsRemaining) {

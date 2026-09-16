@@ -231,7 +231,7 @@ async function authMiddleware(req, res, next) {
             return originalJson(body);
         };
         res.on('finish', () => {
-            sequenzy.trackSuccessfulApiCall(req.user, req, res.statusCode, lastResponseBody);
+            sequenzy.trackSuccessfulApiCall(req.user, req, res.statusCode, lastResponseBody, supabase);
 
             if (req.path.startsWith('/v1/') && res.statusCode === 200 && lastResponseBody?.success && lastResponseBody.credits_charged === 0) {
                 supabase.from('api_logs')
