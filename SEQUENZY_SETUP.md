@@ -19,6 +19,8 @@ Add the workspace API key to the backend environment:
 SEQUENZY_API_KEY=your_sequenzy_api_key
 ```
 
+This variable must be present in the environment where `node server.js` runs, including the production host. Restart the backend after adding it. On startup, the log must contain `Sequenzy signup listener enabled`; if it says `Sequenzy signup emails disabled`, no emails can be sent.
+
 The key needs `subscribers:write` and `automations:trigger` permissions. Without the key, the integration stays disabled.
 
 ## Sequenzy sequences

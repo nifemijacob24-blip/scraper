@@ -21,6 +21,10 @@ async function request(path, body) {
         throw new Error(`Sequenzy ${response.status}: ${payload.error?.message || payload.error || response.statusText}`);
     }
 
+    if (path === '/subscribers/events') {
+        console.log(`Sequenzy event accepted: ${body.event}`);
+    }
+
     return payload;
 }
 
@@ -43,13 +47,14 @@ async function syncSubscriber(user, customAttributes = {}) {
     });
 }
 
-async function trackEvent(user, event, properties = {}, eventId) {
+async function trackEvent(user, event, properties = {}, eventId, customAttributes = {}) {
     if (!user?.email || !isConfigured()) return;
 
     await request('/subscribers/events', {
         ...subscriberIdentity(user),
         event,
         properties,
+        customAttributes,
         ...(eventId ? { eventId } : {})
     });
 }
@@ -127,19 +132,28 @@ async function trackAccountCreated(profile) {
         firstName: profile.first_name || profile.firstName || undefined
     };
 
-    await syncSubscriber(user, {
-        signalqubUserId: profile.id,
-        signupDate: profile.created_at
-    });
     await trackEvent(user, 'signalqub.account_created', {
         creditsLoaded: profile.credits,
         dashboardUrl: 'https://signalqub.com/dashboard',
         docsUrl: 'https://signalqub.com/docs'
-    }, `account-created-${profile.id}`);
+    }, `account-created-${profile.id}`, {
+        signalqubUserId: profile.id,
+        signupDate: profile.created_at
+    });
+
+    syncSubscriber(user, {
+        signalqubUserId: profile.id,
+        signupDate: profile.created_at
+    }).catch(error => {
+        console.error('Sequenzy signup subscriber sync failed:', error.message);
+    });
 }
 
 function startSignupListener(supabase) {
-    if (!isConfigured()) return;
+    if (!isConfigured()) {
+        console.log('Sequenzy signup emails disabled: SEQUENZY_API_KEY is not set');
+        return;
+    }
 
     supabase
         .channel('sequenzy-signups')
@@ -167,7 +181,7 @@ async function scanRecentSignups(supabase) {
     const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     const { data: profiles, error } = await supabase
         .from('profiles')
-        .select('id, email, first_name, created_at, credits')
+        .select('*')
         .gte('created_at', cutoff)
         .limit(1000);
 
