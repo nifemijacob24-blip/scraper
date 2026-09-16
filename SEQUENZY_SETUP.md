@@ -29,13 +29,13 @@ Create and activate these sequences in the Sequenzy dashboard:
 
 1. **Account creation welcome**
     - Trigger: event `signalqub.account_created`
-    - Email subject: `your 1,000 SignalQub credits + API key`
+   - Email subject: `your 100 SignalQub credits + API key`
     - Body:
 
        ```text
        Hey {{firstName}},
 
-       Your 1,000 free credits are loaded. You can generate your API key here: https://signalqub.com/dashboard
+      Your 100 free credits are loaded. You can generate your API key here: https://signalqub.com/dashboard
 
        To test the provider fallback instantly, just drop your API key into this curl request:
        curl -H "x-api-key: YOUR_KEY" https://api.signalqub.com/v1/reddit/subreddit/details?name=AskReddit
