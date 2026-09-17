@@ -9564,8 +9564,6 @@ app.get('/v1/gmaps/reviews', authMiddleware, async (req, res) => {
 
 const { ApifyClient } = require('apify-client');
 
-const { ApifyClient } = require('apify-client');
-
 app.get('/v1/gmaps/search', authMiddleware, async (req, res) => {
     const { query, location, limit } = req.query;
 
