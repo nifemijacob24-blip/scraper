@@ -9564,6 +9564,8 @@ app.get('/v1/gmaps/reviews', authMiddleware, async (req, res) => {
 
 const { ApifyClient } = require('apify-client');
 
+const { ApifyClient } = require('apify-client');
+
 app.get('/v1/gmaps/search', authMiddleware, async (req, res) => {
     const { query, location, limit } = req.query;
 
@@ -9575,18 +9577,20 @@ app.get('/v1/gmaps/search', authMiddleware, async (req, res) => {
     }
 
     const cleanQuery = query.trim();
-    // Use location if provided, otherwise assume the query contains the location
     const targetLocation = location ? location.trim() : "";
+    
+    // Default to 50 if limit is not provided
     const resultLimit = parseInt(limit, 10) || 50; 
 
-    // Apify is significantly more expensive/slower than ScrapeCreators. 
-    // You may want to charge more credits for this endpoint.
-    const costToUser = 5; 
+    // --- PRE-FLIGHT CHECK ---
+    // Ensure the user has enough credits to cover the maximum possible results.
+    // Logic: 1 credit per 20 results (minimum 1 credit).
+    const maxPotentialCost = Math.max(1, Math.ceil(resultLimit / 20));
 
-    if (req.user.credits < costToUser) {
+    if (req.user.credits < maxPotentialCost) {
         return res.status(403).json({ 
             success: false, 
-            error: `403 Forbidden: Insufficient credits. This request requires ${costToUser} credits.` 
+            error: `403 Forbidden: Insufficient credits. A limit of ${resultLimit} requires at least ${maxPotentialCost} credits.` 
         });
     }
 
@@ -9607,33 +9611,25 @@ app.get('/v1/gmaps/search', authMiddleware, async (req, res) => {
         const apifyToken = process.env.APIFY_API_TOKEN;
         if (!apifyToken) throw new Error("Missing APIFY_API_TOKEN in environment variables");
 
-        // Initialize the Apify Client
         const client = new ApifyClient({ token: apifyToken });
 
-        // Prepare the Actor input exactly as Apify expects it
         const runInput = {
             searchStringsArray: [cleanQuery],
             locationQuery: targetLocation || undefined,
             maxCrawledPlacesPerSearch: resultLimit,
             language: "en",
-            maximumLeadsEnrichmentRecords: 0, // Set to > 0 if you want to pay Apify for email enrichment
-            maxImages: 0 // Set to > 0 if you want to extract photo URLs
+            maximumLeadsEnrichmentRecords: 0, 
+            maxImages: 0 
         };
 
-        // --- WARNING: Long-running task ---
-        // This command starts the actor and blocks until the run finishes or times out.
-        // Apify scrapers can take 30s to several minutes. 
-        // We set a 25-second wait timeout to ensure your Express server doesn't hit a 504 Gateway Timeout first.
+        // Enforce a strict 25-second wait to prevent Express 504 timeouts
         const run = await client.actor("compass/crawler-google-places").call(runInput, { waitSecs: 25 });
 
-        // If it didn't finish in 25 seconds, we have to abort to prevent hanging the client's connection
         if (run.status !== 'SUCCEEDED') {
-             // Optional: You could actually abort the run here via API to save Apify credits,
-             // or let it finish in the background and cache it for the next attempt.
              throw new Error("Apify Actor took too long to complete. Try reducing the limit parameter.");
         }
 
-        // Fetch the results from the Apify Dataset
+        // Fetch the JSON array from Apify's storage dataset
         const { items } = await client.dataset(run.defaultDatasetId).listItems();
 
         const responseData = {
@@ -9648,17 +9644,22 @@ app.get('/v1/gmaps/search', authMiddleware, async (req, res) => {
                 website: item.website,
                 rating: item.totalScore,
                 reviews_count: item.reviewsCount,
-                location: item.location // lat & lng
+                location: item.location 
             }))
         };
 
-        req.user.credits -= costToUser;
+        // --- POST-FETCH DEDUCTION ---
+        // Charge the user based on actual returned results, not the requested limit.
+        // Example: If limit=100 (max cost 5), but Apify only found 15 places, cost is 1.
+        const actualCost = Math.max(1, Math.ceil(items.length / 20));
+
+        req.user.credits -= actualCost;
         mockRedisCache[cacheKey] = responseData;
 
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
-            credits_charged: costToUser,
+            credits_charged: actualCost,
             provider: 'apify',
             ...responseData
         });
