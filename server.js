@@ -9601,7 +9601,6 @@ app.get('/v1/gmaps/search', authMiddleware, async (req, res) => {
                 success: true,
                 credits_remaining: req.user.credits,
                 credits_charged: 0,
-                provider: 'cache',
                 ...mockRedisCache[cacheKey]
             });
         }
