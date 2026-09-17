@@ -1754,9 +1754,44 @@ const {scrapeYouTubeChannelInfo,} = require('./src/scrapers/youtube');
 
 // --- 2. EXPRESS ROUTE ---
 app.get('/v1/youtube/channel', authMiddleware, async (req, res) => {
-    const query = req.query.channelId || req.query.handle || req.query.url || req.query.q;
+    // Check multiple query parameters for backward compatibility
+    const channelId = req.query.channelId;
+    const handle = req.query.handle;
+    const url = req.query.url;
+    const q = req.query.q; // Some consumers might use generic 'q'
+    const cacheMaxAge = req.query.cache_max_age || '7d';
 
-    if (!query) {
+    // Prioritize how we send the payload upstream based on what the user gave us
+    let targetParamKey = null;
+    let targetParamValue = null;
+
+    if (channelId) {
+        targetParamKey = 'channelId';
+        targetParamValue = channelId.trim();
+    } else if (handle) {
+        targetParamKey = 'handle';
+        // Ensure handle starts with @ if it's a handle (ScrapeCreators usually handles this, but it's safer)
+        targetParamValue = handle.trim().startsWith('@') ? handle.trim() : `@${handle.trim()}`;
+    } else if (url) {
+        targetParamKey = 'url';
+        targetParamValue = url.trim();
+    } else if (q) {
+        // Fallback for generic 'q' inputs: try to guess if it's an ID, handle, or URL
+        const rawQ = q.trim();
+        if (rawQ.startsWith('http')) {
+            targetParamKey = 'url';
+        } else if (rawQ.startsWith('@')) {
+            targetParamKey = 'handle';
+        } else if (rawQ.startsWith('UC') && rawQ.length === 24) {
+            targetParamKey = 'channelId';
+        } else {
+            // Default to handle if we can't figure it out
+            targetParamKey = 'handle';
+        }
+        targetParamValue = rawQ;
+    }
+
+    if (!targetParamValue) {
         return res.status(400).json({
             success: false,
             error: "400 Bad Request: Missing required parameter (channelId, handle, or url)"
@@ -1772,7 +1807,8 @@ app.get('/v1/youtube/channel', authMiddleware, async (req, res) => {
         });
     }
 
-    const cacheKey = `yt_channel_exact_${Buffer.from(query).toString('base64')}`;
+    // Cache key explicitly locks to the parsed value
+    const cacheKey = `yt_channel_exact_v1_${Buffer.from(targetParamValue).toString('base64')}`;
 
     try {
         if (mockRedisCache[cacheKey]) {
@@ -1780,40 +1816,65 @@ app.get('/v1/youtube/channel', authMiddleware, async (req, res) => {
                 success: true,
                 credits_remaining: req.user.credits,
                 credits_charged: 0,
-                // Spread cached data directly at root
+                provider: 'cache',
                 ...mockRedisCache[cacheKey] 
             });
         }
 
-        const channelData = await scrapeYouTubeChannelInfo(query);
+        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/youtube/channel');
+        targetUrl.searchParams.append(targetParamKey, targetParamValue);
+        targetUrl.searchParams.append('cache_max_age', cacheMaxAge);
+
+        const response = await fetch(targetUrl.toString(), {
+            method: 'GET',
+            headers: {
+                'x-api-key': upstreamApiKey,
+                'Content-Type': 'application/json'
+            },
+            signal: AbortSignal.timeout(15000)
+        });
+
+        const upstreamPayload = await response.json();
+
+        if (!response.ok || upstreamPayload.success === false) {
+            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch YouTube channel info'}`);
+        }
+
+        // Destructure to remove success/credits logic from upstream before spreading it to your consumers
+        const { success, credits_remaining, credits_charged, ...channelData } = upstreamPayload;
 
         req.user.credits -= costPerRequest;
         mockRedisCache[cacheKey] = channelData;
 
-        // Return flat JSON matching the requested schema exactly
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
             credits_charged: costPerRequest,
+            provider: 'scrapecreators',
             ...channelData 
         });
 
     } catch (error) {
-        const statusCode = error.statusCode || 500;
         const errorMessage = error.message || "Internal Server Error";
-        
         const isTimeout = error.name === 'TimeoutError';
-        const finalStatus = isTimeout ? 504 : statusCode;
-        const finalErrorMsg = isTimeout ? "504 Gateway Timeout: YouTube took too long to respond." : errorMessage;
+        const finalStatus = isTimeout ? 504 : (error.statusCode || 500);
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: Upstream provider took too long to respond." 
+            : errorMessage;
 
-        // Discord Alert
-        if (typeof notifyFailure === 'function') {
-            notifyFailure({
-                endpoint: '/v1/youtube/channel',
-                params: { query },
-                statusCode: finalStatus,
-                errorMsg: finalErrorMsg
-            });
+        // Discord Alert for tracking upstream stability
+        if (finalStatus >= 500 || finalStatus === 403 || finalStatus === 429) {
+            if (typeof notifyFailure === 'function') {
+                notifyFailure({
+                    endpoint: '/v1/youtube/channel',
+                    params: { [targetParamKey]: targetParamValue },
+                    statusCode: finalStatus,
+                    errorMsg: finalErrorMsg
+                });
+            }
         }
 
         return res.status(finalStatus).json({
@@ -9501,8 +9562,10 @@ app.get('/v1/gmaps/reviews', authMiddleware, async (req, res) => {
     }
 });
 
+const { ApifyClient } = require('apify-client');
+
 app.get('/v1/gmaps/search', authMiddleware, async (req, res) => {
-    const { query } = req.query;
+    const { query, location, limit } = req.query;
 
     if (!query || typeof query !== 'string' || query.trim() === '') {
         return res.status(400).json({ 
@@ -9512,34 +9575,81 @@ app.get('/v1/gmaps/search', authMiddleware, async (req, res) => {
     }
 
     const cleanQuery = query.trim();
-    const costToUser = 1;
+    // Use location if provided, otherwise assume the query contains the location
+    const targetLocation = location ? location.trim() : "";
+    const resultLimit = parseInt(limit, 10) || 50; 
+
+    // Apify is significantly more expensive/slower than ScrapeCreators. 
+    // You may want to charge more credits for this endpoint.
+    const costToUser = 5; 
 
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
             success: false, 
-            error: `403 Forbidden: Insufficient credits. This request requires ${costToUser} credit.` 
+            error: `403 Forbidden: Insufficient credits. This request requires ${costToUser} credits.` 
         });
     }
 
-    // Cache key no longer needs a cursor/page identifier
-    const cacheKey = `gmaps_search_native_all_${Buffer.from(cleanQuery).toString('base64')}`;
+    // Cache key incorporates location and limit
+    const cacheKey = `gmaps_apify_v1_${Buffer.from(cleanQuery).toString('base64')}_${Buffer.from(targetLocation).toString('base64')}_${resultLimit}`;
 
     try {
         if (mockRedisCache[cacheKey]) {
             return res.status(200).json({
                 success: true,
                 credits_remaining: req.user.credits,
-                credits_charged: 0, 
+                credits_charged: 0,
+                provider: 'cache',
                 ...mockRedisCache[cacheKey]
             });
         }
 
-        const listings = await scrapeGoogleMapsSearch(cleanQuery);
+        const apifyToken = process.env.APIFY_API_TOKEN;
+        if (!apifyToken) throw new Error("Missing APIFY_API_TOKEN in environment variables");
+
+        // Initialize the Apify Client
+        const client = new ApifyClient({ token: apifyToken });
+
+        // Prepare the Actor input exactly as Apify expects it
+        const runInput = {
+            searchStringsArray: [cleanQuery],
+            locationQuery: targetLocation || undefined,
+            maxCrawledPlacesPerSearch: resultLimit,
+            language: "en",
+            maximumLeadsEnrichmentRecords: 0, // Set to > 0 if you want to pay Apify for email enrichment
+            maxImages: 0 // Set to > 0 if you want to extract photo URLs
+        };
+
+        // --- WARNING: Long-running task ---
+        // This command starts the actor and blocks until the run finishes or times out.
+        // Apify scrapers can take 30s to several minutes. 
+        // We set a 25-second wait timeout to ensure your Express server doesn't hit a 504 Gateway Timeout first.
+        const run = await client.actor("compass/crawler-google-places").call(runInput, { waitSecs: 25 });
+
+        // If it didn't finish in 25 seconds, we have to abort to prevent hanging the client's connection
+        if (run.status !== 'SUCCEEDED') {
+             // Optional: You could actually abort the run here via API to save Apify credits,
+             // or let it finish in the background and cache it for the next attempt.
+             throw new Error("Apify Actor took too long to complete. Try reducing the limit parameter.");
+        }
+
+        // Fetch the results from the Apify Dataset
+        const { items } = await client.dataset(run.defaultDatasetId).listItems();
 
         const responseData = {
             query: cleanQuery,
-            total_results: listings.length,
-            listings: listings
+            location: targetLocation || null,
+            total_results: items.length,
+            listings: items.map(item => ({
+                title: item.title,
+                category: item.categoryName,
+                address: item.address,
+                phone: item.phoneUnformatted || item.phone,
+                website: item.website,
+                rating: item.totalScore,
+                reviews_count: item.reviewsCount,
+                location: item.location // lat & lng
+            }))
         };
 
         req.user.credits -= costToUser;
@@ -9549,22 +9659,22 @@ app.get('/v1/gmaps/search', authMiddleware, async (req, res) => {
             success: true,
             credits_remaining: req.user.credits,
             credits_charged: costToUser,
+            provider: 'apify',
             ...responseData
         });
 
     } catch (error) {
-        const isTimeout = error.message.includes('Timeout') || error.name === 'TimeoutError';
-        const isProxyError = error.message.includes('ERR_TUNNEL_CONNECTION_FAILED');
-        const statusCode = isTimeout || isProxyError ? 504 : 500;
+        const isTimeout = error.message.includes('too long to complete');
+        const statusCode = isTimeout ? 504 : 500;
         
-        let finalErrorMsg = error.message;
-        if (isTimeout) finalErrorMsg = "504 Gateway Timeout: The scraper took too long to fetch Google Maps results.";
-        if (isProxyError) finalErrorMsg = "504 Gateway Timeout: The proxy provider dropped the connection mid-scrape. Please retry.";
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The scraper took too long to fetch Google Maps results. Please retry with a smaller limit."
+            : error.message || "Internal Server Error";
 
         if (typeof notifyFailure === 'function') {
             notifyFailure({ 
                 endpoint: '/v1/gmaps/search', 
-                params: { query: cleanQuery }, 
+                params: { query: cleanQuery, location: targetLocation, limit: resultLimit }, 
                 statusCode: statusCode, 
                 errorMsg: finalErrorMsg 
             });

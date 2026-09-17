@@ -73,6 +73,7 @@ function fireAndForget(action, label) {
 function trackSuccessfulApiCall(user, req, statusCode, responseBody, supabase) {
     if (!req.path.startsWith('/v1/') || statusCode !== 200) return;
 
+    console.log(`SignalQub API success observed for ${user.email}: ${req.method} ${req.path}`);
     fireAndForget(() => trackAhaMoment(user, supabase), 'aha moment');
 }
 
@@ -85,6 +86,7 @@ async function trackAhaMoment(user, supabase) {
         .eq('user_id', user.id);
 
     if (error) throw error;
+    console.log(`SignalQub successful API calls for ${user.email}: ${count || 0}`);
     if ((count || 0) < 4) return;
 
     await request('/subscribers/events', {
@@ -96,6 +98,7 @@ async function trackAhaMoment(user, supabase) {
         },
         eventId: `api-aha-${user.id}`
     });
+    console.log(`Sequenzy Aha event accepted for ${user.email}`);
 
 }
 

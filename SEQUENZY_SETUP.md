@@ -50,7 +50,9 @@ Create and activate these sequences in the Sequenzy dashboard:
 
 3. **Aha moment**
    - Trigger: event `signalqub.api_aha`.
-   - The backend emits this event once, after the user reaches five successful API calls. Do not use a frequency trigger for this sequence.
+   - In Sequenzy, choose **Event received**, select **When received via API**, and enter `signalqub.api_aha` in the event name field.
+   - Leave **All filters must match** empty. The backend emits this event once, after the user reaches five successful API calls.
+   - If Sequenzy does not show an enrollment-mode option, leave its default settings unchanged.
    - Email subject: `nice pulls`
    - Explain that fallback routing is returning payloads and invite a production integration or higher rate-limit conversation.
 
