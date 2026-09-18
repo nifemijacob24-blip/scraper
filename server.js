@@ -431,7 +431,6 @@ app.get('/v1/reddit/subreddit/posts', authMiddleware, async (req, res) => {
                 success: true,
                 credits_remaining: req.user.credits,
                 credits_charged: 0,
-                provider: 'cache',
                 ...mockRedisCache[cacheKey]
             });
         }
@@ -466,7 +465,6 @@ app.get('/v1/reddit/subreddit/posts', authMiddleware, async (req, res) => {
             success: true,
             credits_remaining: req.user.credits,
             credits_charged: result.creditCost,
-            provider: result.provider,
             ...responsePayload
         });
 
@@ -536,7 +534,7 @@ app.get('/v1/reddit/subreddit/search', authMiddleware, async (req, res) => {
                 success: true,
                 credits_remaining: req.user.credits,
                 credits_charged: 0,
-                provider: 'cache',
+                cursor: mockRedisCache[cacheKey].cursor || null,
                 ...mockRedisCache[cacheKey]
             });
         }
@@ -585,7 +583,7 @@ app.get('/v1/reddit/subreddit/search', authMiddleware, async (req, res) => {
             success: true,
             credits_remaining: req.user.credits,
             credits_charged: costPerRequest,
-            provider: 'scrapecreators',
+            cursor: responseData.cursor,
             ...responseData // cursor renders right below provider
         });
 
@@ -666,7 +664,7 @@ app.get('/v1/reddit/post/comments', authMiddleware, async (req, res) => {
                 success: true,
                 credits_remaining: req.user.credits,
                 credits_charged: 0,
-                provider: 'cache',
+                cursor: mockRedisCache[cacheKey].cursor || null,
                 ...mockRedisCache[cacheKey]
             });
         }
@@ -713,7 +711,7 @@ app.get('/v1/reddit/post/comments', authMiddleware, async (req, res) => {
             success: true,
             credits_remaining: req.user.credits,
             credits_charged: costPerRequest,
-            provider: 'scrapecreators',
+            cursor: responseData.cursor,
             ...responseData // 'more' renders right below provider
         });
 
@@ -786,7 +784,6 @@ app.get('/v1/reddit/search', authMiddleware, async (req, res) => {
                 success: true,
                 credits_remaining: req.user.credits,
                 credits_charged: 0,
-                provider: 'cache',
                 ...mockRedisCache[cacheKey]
             });
         }
@@ -841,7 +838,6 @@ app.get('/v1/reddit/search', authMiddleware, async (req, res) => {
             success: true,
             credits_remaining: req.user.credits,
             credits_charged: costPerRequest,
-            provider: 'scrapecreators',
             ...responseData // cursor renders right below provider
         });
 
@@ -911,7 +907,7 @@ app.get('/v1/instagram/profile', authMiddleware, async (req, res) => {
                 success: true,
                 credits_remaining: req.user.credits,
                 credits_charged: 0,
-                provider: 'cache',
+                cursor: mockRedisCache[cacheKey].cursor || null,
                 ...mockRedisCache[cacheKey]
             });
         }
@@ -954,7 +950,7 @@ app.get('/v1/instagram/profile', authMiddleware, async (req, res) => {
             success: true,
             credits_remaining: req.user.credits,
             credits_charged: costPerRequest,
-            provider: 'scrapecreators',
+            cursor: mockRedisCache[cacheKey].cursor || null,
             ...responseData 
         });
 
@@ -1816,7 +1812,6 @@ app.get('/v1/youtube/channel', authMiddleware, async (req, res) => {
                 success: true,
                 credits_remaining: req.user.credits,
                 credits_charged: 0,
-                provider: 'cache',
                 ...mockRedisCache[cacheKey] 
             });
         }
@@ -1853,7 +1848,6 @@ app.get('/v1/youtube/channel', authMiddleware, async (req, res) => {
             success: true,
             credits_remaining: req.user.credits,
             credits_charged: costPerRequest,
-            provider: 'scrapecreators',
             ...channelData 
         });
 
@@ -9140,7 +9134,6 @@ app.get('/v1/trustpilot/reviews', authMiddleware, async (req, res) => {
                 success: true,
                 credits_remaining: req.user.credits,
                 credits_charged: 0, 
-                provider: 'cache',
                 ...mockRedisCache[cacheKey]
             });
         }
@@ -9178,7 +9171,6 @@ app.get('/v1/trustpilot/reviews', authMiddleware, async (req, res) => {
             success: true,
             credits_remaining: req.user.credits,
             credits_charged: result.creditCost,
-            provider: result.provider,
             ...responseData
         });
 
@@ -9237,7 +9229,6 @@ app.get('/v1/trustpilot/search', authMiddleware, async (req, res) => {
                 success: true,
                 credits_remaining: req.user.credits,
                 credits_charged: 0, 
-                provider: 'cache',
                 ...mockRedisCache[cacheKey]
             });
         }
@@ -9267,7 +9258,6 @@ app.get('/v1/trustpilot/search', authMiddleware, async (req, res) => {
             success: true,
             credits_remaining: req.user.credits,
             credits_charged: result.creditCost,
-            provider: result.provider,
             ...responseData
         });
 
@@ -9657,7 +9647,6 @@ app.get('/v1/gmaps/search', authMiddleware, async (req, res) => {
             success: true,
             credits_remaining: req.user.credits,
             credits_charged: actualCost,
-            provider: 'apify',
             ...responseData
         });
 
@@ -9724,7 +9713,6 @@ app.get('/v1/amazon/product', authMiddleware, async (req, res) => {
                 success: true,
                 credits_remaining: req.user.credits,
                 credits_charged: 0,
-                provider: 'cache',
                 data: mockRedisCache[cacheKey]
             });
         }
@@ -9752,7 +9740,6 @@ app.get('/v1/amazon/product', authMiddleware, async (req, res) => {
             success: true,
             credits_remaining: req.user.credits,
             credits_charged: result.creditCost,
-            provider: result.provider,
             data: result.data
         });
 
@@ -9822,7 +9809,6 @@ app.get('/v1/amazon/search', authMiddleware, async (req, res) => {
                 success: true,
                 credits_remaining: req.user.credits,
                 credits_charged: 0,
-                provider: 'cache',
                 ...mockRedisCache[cacheKey]
             });
         }
@@ -9859,7 +9845,6 @@ app.get('/v1/amazon/search', authMiddleware, async (req, res) => {
             success: true,
             credits_remaining: req.user.credits,
             credits_charged: result.creditCost,
-            provider: result.provider,
             ...responseData
         });
 
@@ -9926,7 +9911,6 @@ const cacheKey = `amazon_storefront_${urlHash}`;
                 success: true,
                 credits_remaining: req.user.credits,
                 credits_charged: 0, 
-                provider: 'cache',
                 ...mockRedisCache[cacheKey]
             });
         }
@@ -9956,7 +9940,6 @@ const cacheKey = `amazon_storefront_${urlHash}`;
             success: true,
             credits_remaining: req.user.credits,
             credits_charged: result.creditCost,
-            provider: result.provider,
             ...responseData
         });
 
