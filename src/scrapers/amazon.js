@@ -112,6 +112,7 @@ async function scrapeAmazonSearchAPI(keyword, marketplace = 'us', page = 1) {
         }
 
         // Extract Image
+        // Extract Image
         const image = $el.find('img.s-image').attr('src') || "";
 
         seenAsins.add(asin);
@@ -126,12 +127,8 @@ async function scrapeAmazonSearchAPI(keyword, marketplace = 'us', page = 1) {
         });
     });
 
-    return {
-        marketplace: code,
-        page: pageNum,
-        total_results: products.length,
-        products
-    };
+    // FIX: Return the raw array so the orchestrator's internal .length check succeeds
+    return products;
 }
 
 const cleanText = (str) => {
