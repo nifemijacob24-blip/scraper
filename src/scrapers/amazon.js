@@ -46,6 +46,7 @@ async function scrapeAmazonSearchAPI(keyword, marketplace = 'us', page = 1) {
 
     const $ = cheerio.load(response.data);
 
+    // FIX: Replaced \vert{}\vert{} with standard JavaScript ||
     if ($('title').text().includes('Robot Check') || $('title').text().includes('CAPTCHA')) {
         throw new Error("Amazon served a CAPTCHA to the proxy. Retry request.");
     }
@@ -55,7 +56,7 @@ async function scrapeAmazonSearchAPI(keyword, marketplace = 'us', page = 1) {
 
     // Target all search result card containers with a valid ASIN
     $('div[data-asin]:not([data-asin=""])').each((i, el) => {
-        const $el = $(el);
+        const $el =$(el);
         const asin = $el.attr('data-asin')?.trim();
 
         if (!asin || asin.length !== 10 || seenAsins.has(asin)) return;
@@ -125,7 +126,12 @@ async function scrapeAmazonSearchAPI(keyword, marketplace = 'us', page = 1) {
         });
     });
 
-    return products;
+    return {
+        marketplace: code,
+        page: pageNum,
+        total_results: products.length,
+        products
+    };
 }
 
 const cleanText = (str) => {
@@ -486,20 +492,28 @@ async function scrapeAmazonStorefront(storeUrl) {
                         const f = fraction.innerText.replace(/[^0-9]/g, '');
                         if (w) price = parseFloat(`${w}.${f}`);
                     } else {
-                        // Regex over the raw string block. Matches the FIRST valid price to prevent fusion.
                         const rawText = card.innerText.replace(/\s+/g, '');
                         const pMatch = rawText.match(/\$([\d,]+\.\d{2})/);
                         if (pMatch) price = parseFloat(pMatch[1].replace(/,/g, ''));
                     }
                 }
 
-                // 4. Rating Extraction
+                // 4. Rating Extraction (UPDATED)
                 let rating = null;
-                const ratingEl = card.querySelector('[aria-label*="out of 5"], .a-icon-alt');
+                const ratingEl = card.querySelector('[aria-label*="out of 5"], [title*="out of 5"], .a-icon-alt, i[class*="star"]');
+                
                 if (ratingEl) {
-                    const rText = ratingEl.getAttribute('aria-label') || ratingEl.innerText || "";
+                    const rText = ratingEl.getAttribute('aria-label') || 
+                                  ratingEl.getAttribute('title') || 
+                                  ratingEl.innerText || 
+                                  "";
                     const rMatch = rText.match(/([\d.]+)\s*out of/i);
                     if (rMatch) rating = parseFloat(rMatch[1]);
+                }
+
+                if (rating === null) {
+                    const rawMatch = (card.innerText || "").match(/([\d.]+)\s*out of\s*5/i);
+                    if (rawMatch) rating = parseFloat(rawMatch[1]);
                 }
 
                 // 5. Image Extraction

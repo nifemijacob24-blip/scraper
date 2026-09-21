@@ -9789,7 +9789,7 @@ app.get('/v1/amazon/search', authMiddleware, async (req, res) => {
     const cleanKeyword = keyword.trim();
     const pageNum = Math.max(1, parseInt(page, 10) || 1);
 
-    // 2. Pre-flight Credit Check (1 credit)
+    // 2. Pre-flight Credit Check
     const costToUser = 2;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
@@ -9813,7 +9813,7 @@ app.get('/v1/amazon/search', authMiddleware, async (req, res) => {
             });
         }
 
-        // 5. Try ScraperAPI first, then SocialCrawl
+        // 5. Try ScraperAPI first, then fallback
         const result = await amazonOrchestrator.executeSearch(
             () => scrapeAmazonSearchAPI(cleanKeyword, marketCode, pageNum),
             {
@@ -9834,10 +9834,19 @@ app.get('/v1/amazon/search', authMiddleware, async (req, res) => {
 
         const responseData = result.data;
 
+        // Safely extract products array whether responseData is a raw array or an object
+        const productsList = Array.isArray(responseData) 
+            ? responseData 
+            : (responseData?.products || responseData?.results || []);
+
+        const finalPayload = Array.isArray(responseData)
+            ? { products: productsList, total_results: productsList.length }
+            : responseData;
+
         // 6. Deduct Credit & Cache Non-Empty Responses
         req.user.credits -= result.creditCost;
-        if (responseData.products.length > 0) {
-            mockRedisCache[cacheKey] = responseData;
+        if (productsList.length > 0) {
+            mockRedisCache[cacheKey] = finalPayload;
         }
 
         // 7. Response
@@ -9845,7 +9854,7 @@ app.get('/v1/amazon/search', authMiddleware, async (req, res) => {
             success: true,
             credits_remaining: req.user.credits,
             credits_charged: result.creditCost,
-            ...responseData
+            ...finalPayload
         });
 
     } catch (error) {
