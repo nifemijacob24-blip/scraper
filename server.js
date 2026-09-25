@@ -5,6 +5,8 @@ const instagramOrchestrator = require('./src/services/instagram-orchestrator');
 const trustpilotOrchestrator = require('./src/services/trustpilot-orchestrator');
 const amazonOrchestrator = require('./src/services/amazon-orchestrator');
 const sequenzy = require('./src/services/sequenzy');
+const { universalCacheMiddleware } = require('./cacheMiddleware');
+
 
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
@@ -277,6 +279,8 @@ async function authMiddleware(req, res, next) {
         return res.status(500).json({ success: false, error: "Internal Server Error verifying API key." });
     }
 }
+// Apply the global cache middleware to all routes under '/v1'
+app.use('/v1', universalCacheMiddleware);
 
 // --- ENDPOINT 1: SUBREDDIT DETAILS (1 CREDIT) ---
 app.get('/v1/reddit/subreddit/details', authMiddleware, async (req, res) => {
@@ -300,7 +304,7 @@ app.get('/v1/reddit/subreddit/details', authMiddleware, async (req, res) => {
         cleanSubreddit = cleanSubreddit.replace(/^r\//, '');
     }
 
-    const costPerRequest = 1; // DaaS markup (adjust as needed)
+    const costPerRequest = 1; // DaaS markup
 
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({
@@ -309,19 +313,7 @@ app.get('/v1/reddit/subreddit/details', authMiddleware, async (req, res) => {
         });
     }
 
-    // Use lowercased key for local cache lookups to prevent duplicate hits across casing variations
-    const cacheKey = `reddit_sub_details_v1_${cleanSubreddit.toLowerCase()}`;
-
     try {
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0,
-                ...mockRedisCache[cacheKey]
-            });
-        }
-
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
         if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
 
@@ -361,8 +353,8 @@ app.get('/v1/reddit/subreddit/details', authMiddleware, async (req, res) => {
         };
 
         req.user.credits -= costPerRequest;
-        mockRedisCache[cacheKey] = responseData;
 
+        // The universalCacheMiddleware automatically captures this response and saves it to cache
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -422,19 +414,7 @@ app.get('/v1/reddit/subreddit/posts', authMiddleware, async (req, res) => {
         });
     }
 
-    // Cache key now includes limit and cursor
-    const cacheKey = `reddit_posts_${subreddit.toLowerCase()}_${sort}_${timeframe}_${cursor || 'start'}_${limit}_trim_${trim}`;
-
     try {
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0,
-                ...mockRedisCache[cacheKey]
-            });
-        }
-
         // --- NEW: Use fallback orchestrator ---
         const result = await redditOrchestrator.execute(
             () => scrapeSubredditPosts(subreddit, sort, timeframe, cursor, limit),
@@ -459,8 +439,7 @@ app.get('/v1/reddit/subreddit/posts', authMiddleware, async (req, res) => {
             next_cursor: result.data.next_cursor
         };
 
-        mockRedisCache[cacheKey] = responsePayload;
-
+        // The universalCacheMiddleware automatically captures this response and saves it to cache
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -473,12 +452,14 @@ app.get('/v1/reddit/subreddit/posts', authMiddleware, async (req, res) => {
         const errorMessage = error.message || "Internal Server Error";
 
         if (statusCode >= 500 || statusCode === 403 || statusCode === 429) {
-            notifyFailure({
-                endpoint: '/v1/reddit/subreddit/posts',
-                params: { subreddit, sort, timeframe, cursor, limit, trim },
-                statusCode,
-                errorMsg: errorMessage
-            });
+            if (typeof notifyFailure === 'function') {
+                notifyFailure({
+                    endpoint: '/v1/reddit/subreddit/posts',
+                    params: { subreddit, sort, timeframe, cursor, limit, trim },
+                    statusCode,
+                    errorMsg: errorMessage
+                });
+            }
         }
 
         return res.status(statusCode).json({
@@ -526,18 +507,9 @@ app.get('/v1/reddit/subreddit/search', authMiddleware, async (req, res) => {
     }
 
     // Cache key includes base64 query to safely handle special characters in search terms
-    const cacheKey = `reddit_search_v1_${cleanSubreddit.toLowerCase()}_${Buffer.from(query).toString('base64')}_${sort}_${timeframe}_${cursor || 'start'}`;
 
     try {
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0,
-                cursor: mockRedisCache[cacheKey].cursor || null,
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
         if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
@@ -577,7 +549,6 @@ app.get('/v1/reddit/subreddit/search', authMiddleware, async (req, res) => {
         };
         
         req.user.credits -= costPerRequest;
-        mockRedisCache[cacheKey] = responseData;
 
         return res.status(200).json({
             success: true,
@@ -656,18 +627,9 @@ app.get('/v1/reddit/post/comments', authMiddleware, async (req, res) => {
     const postId = urlParts.length > 1 ? urlParts[1].split('/')[0] : 'unknown';
     
     // Cache key incorporates the cursor and trim parameter
-    const cacheKey = `reddit_comments_v1_${postId}_${cursor || 'start'}_trim_${trim}`;
 
     try {
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0,
-                cursor: mockRedisCache[cacheKey].cursor || null,
-                ...mockRedisCache[cacheKey]
-            });
-        }
+ 
 
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
         if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
@@ -705,7 +667,6 @@ app.get('/v1/reddit/post/comments', authMiddleware, async (req, res) => {
         };
         
         req.user.credits -= costPerRequest;
-        mockRedisCache[cacheKey] = responseData;
 
         return res.status(200).json({
             success: true,
@@ -776,17 +737,8 @@ app.get('/v1/reddit/search', authMiddleware, async (req, res) => {
     }
 
     // Cache key uses base64 query to safely handle special characters (e.g., query="scrape API data")
-    const cacheKey = `reddit_global_search_v1_${Buffer.from(query).toString('base64')}_${filter}_${sort}_${timeframe}_${cursor || 'start'}_trim_${trim}`;
 
     try {
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0,
-                ...mockRedisCache[cacheKey]
-            });
-        }
 
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
         if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
@@ -832,7 +784,7 @@ app.get('/v1/reddit/search', authMiddleware, async (req, res) => {
         };
         
         req.user.credits -= costPerRequest;
-        mockRedisCache[cacheKey] = responseData;
+        // mockRedisCache[cacheKey] = responseData;
 
         return res.status(200).json({
             success: true,
@@ -898,25 +850,14 @@ app.get('/v1/instagram/profile', authMiddleware, async (req, res) => {
         });
     }
 
-    // Cache key explicitly locks to the cleaned handle and trim parameter
-    const cacheKey = `instagram_profile_v1_${cleanHandle}_trim_${trim}`;
-
     try {
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0,
-                cursor: mockRedisCache[cacheKey].cursor || null,
-                ...mockRedisCache[cacheKey]
-            });
-        }
-
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
         if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
 
         const targetUrl = new URL('https://api.scrapecreators.com/v1/instagram/profile');
         targetUrl.searchParams.append('handle', cleanHandle);
+        
+        // Still forward cache_max_age upstream to save costs if they cache it
         targetUrl.searchParams.append('cache_max_age', cacheMaxAge);
         
         if (trim) {
@@ -944,13 +885,13 @@ app.get('/v1/instagram/profile', authMiddleware, async (req, res) => {
         };
         
         req.user.credits -= costPerRequest;
-        mockRedisCache[cacheKey] = responseData;
 
+        // The universalCacheMiddleware automatically captures this response and saves it
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
             credits_charged: costPerRequest,
-            cursor: mockRedisCache[cacheKey].cursor || null,
+            cursor: upstreamPayload.cursor || null, // Fixed: pulled from upstream payload instead of the deleted local cache
             ...responseData 
         });
 
@@ -978,7 +919,7 @@ app.get('/v1/instagram/profile', authMiddleware, async (req, res) => {
             error: finalErrorMsg
         });
     }
-});
+}); 
 
 // In your main router file (e.g., app.js or routes.js)
 // --- EXPRESS ROUTE: INSTAGRAM USER FEED (ARBITRAGE) ---
@@ -1012,17 +953,9 @@ app.get('/v1/instagram/user/posts', authMiddleware, async (req, res) => {
     }
 
     // Cache key incorporates the trim parameter to avoid serving trimmed data to a non-trim request
-    const cacheKey = `ig_user_posts_v2_${cleanHandle}_${cursor || 'start'}_${trim}`;
 
     try {
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0,
-                ...mockRedisCache[cacheKey]
-            });
-        }
+       
 
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
         if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
@@ -1063,7 +996,6 @@ app.get('/v1/instagram/user/posts', authMiddleware, async (req, res) => {
         };
 
         req.user.credits -= costPerRequest;
-        mockRedisCache[cacheKey] = responseData;
 
         return res.status(200).json({
             success: true,
@@ -1124,19 +1056,8 @@ app.get('/v1/instagram/user/highlights', authMiddleware, async (req, res) => {
     }
 
     // Create a unique cache key depending on which parameter they used
-    const cacheKey = userId 
-        ? `ig_highlights_id_${userId}` 
-        : `ig_highlights_handle_${cleanHandle}`;
 
     try {
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0,
-                ...mockRedisCache[cacheKey]
-            });
-        }
 
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
         if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
@@ -1173,7 +1094,7 @@ app.get('/v1/instagram/user/highlights', authMiddleware, async (req, res) => {
         };
 
         req.user.credits -= costPerRequest;
-        mockRedisCache[cacheKey] = responseData;
+        // mockRedisCache[cacheKey] = responseData;
 
         return res.status(200).json({
             success: true,
@@ -1249,6 +1170,9 @@ app.get('/v1/instagram/post', authMiddleware, async (req, res) => {
     if (region) upstreamUrl.searchParams.append('region', region);
     if (trim) upstreamUrl.searchParams.append('trim', trim);
     if (download_media) upstreamUrl.searchParams.append('download_media', download_media);
+    
+    // Pass cache_max_age upstream to save costs there, but our global middleware 
+    // will intercept it first if we already have it in our local cache.
     if (cache_max_age) upstreamUrl.searchParams.append('cache_max_age', cache_max_age);
 
     try {
@@ -1258,21 +1182,20 @@ app.get('/v1/instagram/post', authMiddleware, async (req, res) => {
         const response = await fetch(upstreamUrl.toString(), {
             method: 'GET',
             headers: {
-                'x-api-key': process.env.SCRAPE_CREATORS_API_KEY, // Ensure this is set in DigitalOcean!
+                'x-api-key': process.env.SCRAPE_CREATORS_API_KEY, 
                 'Content-Type': 'application/json'
-            }
+            },
+            signal: AbortSignal.timeout(20000) // Added a timeout to match your other routes
         });
 
         const targetData = await response.json();
         
-        // 🚨 DIAGNOSTIC LOG: Prints the EXACT response to DigitalOcean logs so you can debug failures
         console.log(`[Upstream Response] Status: ${response.status}`, JSON.stringify(targetData).substring(0, 250));
 
         // 5. Intercept and Sanitize Errors (White-labeling)
         if (!response.ok || !targetData.success) {
             const statusCode = response.status === 200 ? 500 : response.status;
             
-            // Extract the real error message safely
             const rawError = targetData.detail || targetData.message || targetData.error || "Unknown extraction error occurred.";
             
             let cleanErrorMsg = "500 Internal Server Error: Extraction failed. The engineering team has been notified.";
@@ -1282,7 +1205,6 @@ app.get('/v1/instagram/post', authMiddleware, async (req, res) => {
             } else if (statusCode === 429) {
                 cleanErrorMsg = "429 Too Many Requests: Extraction rate limit exceeded. Please back off and retry.";
             } else if (statusCode === 400 || statusCode === 422 || statusCode === 401 || statusCode === 403) {
-                // Pass the specific error but sanitize upstream names to maintain the SignalQub brand
                 cleanErrorMsg = `${statusCode} Error: ${rawError.replace(/scrapecreators|upstream|provider/ig, 'SignalQub')}`;
             } else if (statusCode >= 500) {
                 cleanErrorMsg = "500 Internal Server Error: Instagram anti-bot protection triggered. Please try again in a few moments.";
@@ -1298,22 +1220,28 @@ app.get('/v1/instagram/post', authMiddleware, async (req, res) => {
         const actualCreditsCharged = targetData.credits_charged || 1;
         req.user.credits -= actualCreditsCharged;
 
-        // 7. Return the formatted success response
+        // 7. Return the formatted success response. 
+        // The universalCacheMiddleware automatically captures this and caches it.
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
             credits_charged: actualCreditsCharged,
             status: "success",
-            data: targetData.data // The raw xdt_shortcode_media object
+            data: targetData.data 
         });
 
     } catch (error) {
         console.error('[SignalQub] Extraction Error:', error);
         
-        // Catch network timeouts or fetch crashes
-        return res.status(504).json({ 
+        const isTimeout = error.name === 'TimeoutError' || error.message === 'TimeoutError';
+        const statusCode = isTimeout ? 504 : 500;
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction engine took too long to respond." 
+            : `500 Internal Server Error: The extraction failed. (${error.message})`;
+
+        return res.status(statusCode).json({ 
             success: false, 
-            error: `504 Gateway Timeout: The extraction engine took too long to respond or failed. (${error.message})` 
+            error: finalErrorMsg
         });
     }
 });
@@ -1360,7 +1288,9 @@ app.get('/v1/instagram/transcript', authMiddleware, async (req, res) => {
             headers: {
                 'x-api-key': process.env.SCRAPE_CREATORS_API_KEY,
                 'Content-Type': 'application/json'
-            }
+            },
+            // Added a 35s timeout specifically for the heavy AI transcription task
+            signal: AbortSignal.timeout(35000) 
         });
 
         const targetData = await response.json();
@@ -1392,17 +1322,17 @@ app.get('/v1/instagram/transcript', authMiddleware, async (req, res) => {
         }
 
         // 6. Map the upstream data to match your existing SignalQub schema
-        // The upstream returns "text", but your Apify Actor expects "transcript" and "type"
         const formattedTranscripts = (targetData.transcripts || []).map(t => ({
             id: t.id,
             type: 'video', 
-            transcript: t.text || null // Map "text" to "transcript"
+            transcript: t.text || null
         }));
 
         // 7. Deduct the credits
         req.user.credits -= costPerRequest;
 
         // 8. Return the final payload
+        // The universalCacheMiddleware automatically intercepts and caches this
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -1417,10 +1347,15 @@ app.get('/v1/instagram/transcript', authMiddleware, async (req, res) => {
     } catch (error) {
         console.error('[SignalQub] Transcript Error:', error);
         
-        // AI Transcriptions can take 10-30 seconds, making Gateway Timeouts more common here
-        return res.status(504).json({ 
+        const isTimeout = error.name === 'TimeoutError' || error.message === 'TimeoutError';
+        const statusCode = isTimeout ? 504 : 500;
+        const errorMsg = isTimeout 
+            ? "504 Gateway Timeout: The AI transcription engine took too long to respond. The video may be too long or the queue is full."
+            : `500 Internal Server Error: ${error.message}`;
+
+        return res.status(statusCode).json({ 
             success: false, 
-            error: "504 Gateway Timeout: The AI transcription engine took too long to respond. The video may be too long or the queue is full." 
+            error: errorMsg 
         });
     }
 });
@@ -1447,18 +1382,9 @@ app.get('/v1/instagram/search', authMiddleware, async (req, res) => {
         });
     }
 
-    const cacheKey = `ig_native_search_${Buffer.from(query).toString('base64')}`;
 
     try {
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                data: mockRedisCache[cacheKey]
-            });
-        }
-
+        
         // 1. Fetch from Upstream API (ScrapeCreators)
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
         if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
@@ -1488,7 +1414,7 @@ app.get('/v1/instagram/search', authMiddleware, async (req, res) => {
 
         // 3. Deduct Credits & Cache
         req.user.credits -= costPerRequest;
-        mockRedisCache[cacheKey] = scrapedContent;
+        // mockRedisCache[cacheKey] = scrapedContent;
 
         // 4. Return to Consumer
         return res.status(200).json({
@@ -1543,18 +1469,9 @@ app.get('/v1/instagram/user/tagged-posts', authMiddleware, async (req, res) => {
         });
     }
 
-    const cacheKey = `ig_tagged_posts_${userId}_${cursor || 'start'}`;
 
     try {
-        // 1. Cache Check
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, // Free if served from cache
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 2. Fetch from ScrapeCreators
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -1595,7 +1512,6 @@ app.get('/v1/instagram/user/tagged-posts', authMiddleware, async (req, res) => {
 
         // 4. Deduct Credits & Cache
         req.user.credits -= costPerRequest;
-        mockRedisCache[cacheKey] = responseData;
 
         // 5. Return to Consumer
         return res.status(200).json({
@@ -1654,18 +1570,10 @@ app.get('/v1/instagram/post/comments', authMiddleware, async (req, res) => {
     }
 
     // Cache key includes the include_replies flag to prevent serving base data to a replies request
-    const cacheKey = `ig_comments_${Buffer.from(postUrl).toString('base64')}_${cursor || 'start'}_${includeReplies}`;
 
     try {
         // 1. Cache Check
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+       
 
         // 2. Fetch from ScrapeCreators
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -1709,7 +1617,7 @@ app.get('/v1/instagram/post/comments', authMiddleware, async (req, res) => {
 
         // 5. Deduct Credits & Cache
         req.user.credits -= costPerRequest;
-        mockRedisCache[cacheKey] = responseData;
+        // mockRedisCache[cacheKey] = responseData;
 
         // 6. Return to Consumer
         return res.status(200).json({
@@ -1803,19 +1711,7 @@ app.get('/v1/youtube/channel', authMiddleware, async (req, res) => {
         });
     }
 
-    // Cache key explicitly locks to the parsed value
-    const cacheKey = `yt_channel_exact_v1_${Buffer.from(targetParamValue).toString('base64')}`;
-
     try {
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0,
-                ...mockRedisCache[cacheKey] 
-            });
-        }
-
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
         if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
 
@@ -1842,8 +1738,8 @@ app.get('/v1/youtube/channel', authMiddleware, async (req, res) => {
         const { success, credits_remaining, credits_charged, ...channelData } = upstreamPayload;
 
         req.user.credits -= costPerRequest;
-        mockRedisCache[cacheKey] = channelData;
 
+        // The universalCacheMiddleware automatically captures this response and saves it
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -1909,18 +1805,10 @@ app.get('/v1/youtube/channel/videos', authMiddleware, async (req, res) => {
 
     // Cache key includes all relevant parameters to prevent data bleed between different query states
     const identifier = channelId || handle;
-    const cacheKey = `yt_vids_${Buffer.from(identifier).toString('base64')}_${continuationToken || 'start'}_${sort || 'latest'}_${is_paid_promotions || 'false'}_${includeExtras || 'false'}`;
 
     try {
         // 1. Cache Check
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+       
 
         // 2. Fetch from ScrapeCreators
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -1964,7 +1852,6 @@ app.get('/v1/youtube/channel/videos', authMiddleware, async (req, res) => {
 
         // 5. Deduct Credits & Cache
         req.user.credits -= costPerRequest;
-        mockRedisCache[cacheKey] = responseData;
 
         // 6. Return to Consumer
         return res.status(200).json({
@@ -2031,18 +1918,10 @@ app.get('/v1/youtube/channel/playlists', authMiddleware, async (req, res) => {
 
     // Cache key includes the identifier and token
     const identifier = channelId || handle;
-    const cacheKey = `yt_playlists_${Buffer.from(identifier).toString('base64')}_${continuationToken || 'start'}`;
 
     try {
         // 1. Cache Check
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+   
 
         // 2. Fetch from ScrapeCreators
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -2083,7 +1962,7 @@ app.get('/v1/youtube/channel/playlists', authMiddleware, async (req, res) => {
 
         // 5. Deduct Credits & Cache
         req.user.credits -= costPerRequest;
-        mockRedisCache[cacheKey] = responseData;
+        // mockRedisCache[cacheKey] = responseData;
 
         // 6. Return to Consumer
         return res.status(200).json({
@@ -2145,18 +2024,9 @@ app.get('/v1/youtube/channel/lives', authMiddleware, async (req, res) => {
 
     // Cache key includes the identifier and token to protect your profit margins
     const identifier = channelId || handle;
-    const cacheKey = `yt_lives_${Buffer.from(identifier).toString('base64')}_${continuationToken || 'start'}`;
 
     try {
-        // 1. Cache Check (This is where your markup becomes 100% profit)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, // Or charge them depending on your billing model for cached data
-                ...mockRedisCache[cacheKey]
-            });
-        }
+     
 
         // 2. Fetch from ScrapeCreators
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -2199,7 +2069,6 @@ app.get('/v1/youtube/channel/lives', authMiddleware, async (req, res) => {
         req.user.credits -= costPerRequest;
         
         // Cache lives for a reasonable time (e.g., 5-15 mins) to maximize margin on popular channels
-        mockRedisCache[cacheKey] = responseData;
 
         // 6. Return to Consumer
         return res.status(200).json({
@@ -2261,18 +2130,11 @@ app.get('/v1/youtube/channel/community-posts', authMiddleware, async (req, res) 
 
     // Cache key explicitly flags community posts to prevent data bleed
     const identifier = channelId || handle;
-    const cacheKey = `yt_community_${Buffer.from(identifier).toString('base64')}_${continuationToken || 'start'}`;
+    // Encode the identifier to ensure it's safe for use in a cache key
 
     try {
         // 1. Cache Check - Your profit margin protector
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+       
 
         // 2. Fetch from ScrapeCreators
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -2315,7 +2177,6 @@ app.get('/v1/youtube/channel/community-posts', authMiddleware, async (req, res) 
         req.user.credits -= costPerRequest;
         
         // Cache community posts; they update less frequently than comments or live streams
-        mockRedisCache[cacheKey] = responseData;
 
         // 6. Return to Consumer
         return res.status(200).json({
@@ -2378,18 +2239,9 @@ app.get('/v1/youtube/channel/shorts', authMiddleware, async (req, res) => {
 
     // Cache key explicitly flags shorts and sorting to prevent data bleed
     const identifier = channelId || handle;
-    const cacheKey = `yt_shorts_${Buffer.from(identifier).toString('base64')}_${sort || 'newest'}_${continuationToken || 'start'}`;
 
     try {
-        // 1. Cache Check - Your profit margin protector
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 2. Fetch from ScrapeCreators
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -2433,7 +2285,6 @@ app.get('/v1/youtube/channel/shorts', authMiddleware, async (req, res) => {
         req.user.credits -= costPerRequest;
         
         // Cache shorts; they are highly requested, maximizing margin on popular creators
-        mockRedisCache[cacheKey] = responseData;
 
         // 6. Return to Consumer
         return res.status(200).json({
@@ -2480,7 +2331,6 @@ app.get('/v1/youtube/video', authMiddleware, async (req, res) => {
         });
     }
 
-    // Your pricing logic - 100% profit now!
     const costPerRequest = 1;
 
     if (req.user.credits < costPerRequest) {
@@ -2491,57 +2341,54 @@ app.get('/v1/youtube/video', authMiddleware, async (req, res) => {
     }
 
     try {
-        // 1. Build the Upstream Request URL
         const upstreamUrl = new URL('https://api.scrapecreators.com/v1/youtube/video');
         upstreamUrl.searchParams.append('url', url);
         
-        if (language) {
-            upstreamUrl.searchParams.append('language', language);
-        }
+        if (language) upstreamUrl.searchParams.append('language', language);
         
-        // Let ScrapeCreators handle the cache (defaults to 7 days to save your upstream credits)
-        upstreamUrl.searchParams.append('cache_max_age', cache_max_age || '7d');
+        // Forward to upstream if provided, but local middleware intercepts first if cached locally
+        if (cache_max_age) upstreamUrl.searchParams.append('cache_max_age', cache_max_age);
 
-        // 2. Fetch from ScrapeCreators
         const response = await fetch(upstreamUrl.toString(), {
             method: 'GET',
             headers: {
                 'x-api-key': process.env.SCRAPE_CREATORS_API_KEY,
                 'Accept': 'application/json'
-            }
+            },
+            signal: AbortSignal.timeout(20000) // Added timeout for stability
         });
 
         const data = await response.json();
 
-        // 3. Handle Upstream Errors (e.g. Age-Restricted 403s or Invalid URLs)
         if (!response.ok || !data.success) {
             const errorMessage = data.error || data.reason || "Upstream extraction failed.";
-            const statusCode = response.status === 200 ? 500 : response.status; // Fallback to 500 if success is false but status was 200
+            const statusCode = response.status === 200 ? 500 : response.status; 
             
             throw new Error(`${statusCode} API Error: ${errorMessage}`);
         }
 
-        // 4. Deduct User Credits
-        req.user.credits -= costPerRequest;
-        // await req.user.save(); // Don't forget to save the user's new credit balance to your DB!
+        // Destructure to prevent upstream credit balances or success flags from leaking
+        const { success, credits_remaining, credits_charged, ...videoData } = data;
 
-        // 5. Return the beautiful payload to the user
+        req.user.credits -= costPerRequest;
+
+        // The universalCacheMiddleware automatically captures this response and saves it
         return res.status(200).json({
-            ...data, // Spread the rich ScrapeCreators data first
             success: true,
-            // SECURITY OVERRIDE: Prevent leaking your master ScrapeCreators credit balance!
             credits_remaining: req.user.credits,
-            credits_charged: costPerRequest
+            credits_charged: costPerRequest,
+            ...videoData 
         });
 
     } catch (error) {
-        const errorMessage = error.message || "500 Internal Server Error";
+        const isTimeout = error.name === 'TimeoutError' || error.message === 'TimeoutError';
+        const errorMessage = isTimeout 
+            ? "504 Gateway Timeout: Upstream provider took too long to respond." 
+            : (error.message || "500 Internal Server Error");
         
-        // Extract status code from the custom error string if it exists, default to 500
         const statusCodeMatch = errorMessage.match(/^(\d{3})/);
-        const statusCode = statusCodeMatch ? parseInt(statusCodeMatch[1], 10) : 500;
+        const statusCode = isTimeout ? 504 : (statusCodeMatch ? parseInt(statusCodeMatch[1], 10) : 500);
 
-        // Discord Failure Alert
         if (typeof notifyFailure === 'function') {
             notifyFailure({
                 endpoint: '/v1/youtube/video',
@@ -2559,11 +2406,7 @@ app.get('/v1/youtube/video', authMiddleware, async (req, res) => {
 });
 
 app.get('/v1/youtube/transcript', authMiddleware, async (req, res) => {
-    const { 
-        url, 
-        language, 
-        cache_max_age 
-    } = req.query;
+    const { url, language, cache_max_age } = req.query;
 
     // 1. Validation
     if (!url) {
@@ -2583,20 +2426,7 @@ app.get('/v1/youtube/transcript', authMiddleware, async (req, res) => {
         });
     }
 
-    // Cache key includes language so we don't serve an English transcript to a Spanish request
-    const cacheKey = `yt_transcript_${Buffer.from(url).toString('base64')}_${language || 'default'}`;
-
     try {
-        // 1. Local Cache Check - Serves instantly at 100% margin (0 cost to you)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
-
         // 2. Fetch from ScrapeCreators
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
         if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
@@ -2605,6 +2435,9 @@ app.get('/v1/youtube/transcript', authMiddleware, async (req, res) => {
         targetUrl.searchParams.append('url', url);
         
         if (language) targetUrl.searchParams.append('language', language);
+        
+        // Forward cache_max_age upstream to save costs if they cache it, 
+        // but our local middleware will intercept it first if we already have it.
         if (cache_max_age) targetUrl.searchParams.append('cache_max_age', cache_max_age);
 
         // 35-second timeout safeguard (transcripts can be heavy for 3-hour podcasts)
@@ -2638,13 +2471,11 @@ app.get('/v1/youtube/transcript', authMiddleware, async (req, res) => {
         delete responseData.credits_remaining;
         delete responseData.credits_charged;
 
-        // 5. Deduct Credits & Cache locally
+        // 5. Deduct Credits
         req.user.credits -= costPerRequest;
-        
-        // Transcripts never change once published, so you can cache these for a very long time
-        mockRedisCache[cacheKey] = responseData;
 
         // 6. Return to Consumer
+        // The universalCacheMiddleware automatically intercepts and caches this response
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -2718,18 +2549,9 @@ app.get('/v1/youtube/search', authMiddleware, async (req, res) => {
         includeExtras || 'false',
         continuationToken || 'start'
     ];
-    const cacheKey = cacheKeyParts.join('_');
 
     try {
-        // 1. Cache Check - Secures 100% margin on trending/duplicate searches
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 2. Fetch from ScrapeCreators
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -2779,7 +2601,6 @@ app.get('/v1/youtube/search', authMiddleware, async (req, res) => {
         req.user.credits -= costPerRequest;
         
         // Cache lifetime can be tuned based on query velocity. Trending searches cache well.
-        mockRedisCache[cacheKey] = responseData;
 
         // 6. Return to Consumer
         return res.status(200).json({
@@ -2844,18 +2665,9 @@ app.get('/v1/youtube/video/comments', authMiddleware, async (req, res) => {
     }
 
     // Cache key explicitly flags URL, sorting order, and pagination token to prevent data bleed
-    const cacheKey = `yt_comments_${Buffer.from(url).toString('base64')}_${order || 'top'}_${continuationToken || 'start'}`;
 
     try {
-        // 1. Cache Check - Your profit margin protector on trending videos
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 2. Fetch from ScrapeCreators
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -2899,7 +2711,6 @@ app.get('/v1/youtube/video/comments', authMiddleware, async (req, res) => {
         req.user.credits -= costPerRequest;
         
         // Cache lifetime should be short (e.g. 5-10 mins) since comments update rapidly
-        mockRedisCache[cacheKey] = responseData;
 
         // 6. Return to Consumer
         return res.status(200).json({
@@ -2972,18 +2783,9 @@ app.get('/v1/google/search', authMiddleware, async (req, res) => {
     }
 
     // Cache key explicitly incorporates all filters
-    const cacheKey = `google_search_${Buffer.from(query).toString('base64')}_${region || 'global'}_${date_posted || 'any'}_${pageNum}`;
 
     try {
-        // 1. Cache Check - Google results cache extremely well for high-volume keywords
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 2. Fetch from ScrapeCreators
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -3023,7 +2825,6 @@ app.get('/v1/google/search', authMiddleware, async (req, res) => {
         req.user.credits -= costPerRequest;
         
         // Cache lifetime can be longer for generic searches, protecting your margin
-        mockRedisCache[cacheKey] = responseData;
 
         // 6. Return to Consumer
         return res.status(200).json({
@@ -3087,15 +2888,7 @@ app.get('/v1/tiktok/search/keyword', authMiddleware, async (req, res) => {
     const cacheKey = `tiktok_search_keyword_${identifier}_${safeDate}_${safeSort}_${safeCursor}`;
 
     try {
-        // 4. Cache Check - Return identical paginated searches for free
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -3170,7 +2963,6 @@ app.get('/v1/tiktok/search/keyword', authMiddleware, async (req, res) => {
 
         // 8. Strict Flat-Rate Billing & Caching
         req.user.credits -= costPerRequest;
-        mockRedisCache[cacheKey] = responseData;
 
         // 9. Return Response
         return res.status(200).json({
@@ -3225,18 +3017,8 @@ app.get('/v1/tiktok/search/users', authMiddleware, async (req, res) => {
     const identifier = encodeURIComponent(query.toLowerCase().trim());
     const safeCursor = cursor || '0';
     const safeTrim = trim === 'true' ? 'true' : 'false';
-    const cacheKey = `tiktok_search_users_${identifier}_${safeCursor}_${safeTrim}`;
 
     try {
-        // 4. Cache Check
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -3294,7 +3076,6 @@ app.get('/v1/tiktok/search/users', authMiddleware, async (req, res) => {
 
         // 8. Strict Flat-Rate Billing & Caching
         req.user.credits -= costPerRequest;
-        mockRedisCache[cacheKey] = responseData;
 
         // 9. Return Response
         return res.status(200).json({
@@ -3350,18 +3131,9 @@ app.get('/v1/tiktok/user/followers', authMiddleware, async (req, res) => {
     const identifier = handle ? handle.replace('@', '').toLowerCase().trim() : `uid_${user_id}`;
     const safeMinTime = min_time || '0';
     const safeTrim = trim === 'true' ? 'true' : 'false';
-    const cacheKey = `tiktok_followers_${identifier}_${safeMinTime}_${safeTrim}`;
 
     try {
-        // 4. Cache Check - 100% margin on repeat paginated queries (0 cost to you, 0 cost to them)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -3406,7 +3178,6 @@ app.get('/v1/tiktok/user/followers', authMiddleware, async (req, res) => {
         const finalCostToUser = upstreamCost * 2;
 
         req.user.credits -= finalCostToUser;
-        mockRedisCache[cacheKey] = responseData;
 
         // 10. Return Response to Consumer
         return res.status(200).json({
@@ -3463,18 +3234,9 @@ app.get('/v1/tiktok/user/following', authMiddleware, async (req, res) => {
     const identifier = handle.replace('@', '').toLowerCase().trim();
     const safeMinTime = min_time || '0';
     const safeTrim = trim === 'true' ? 'true' : 'false';
-    const cacheKey = `tiktok_following_${identifier}_${safeMinTime}_${safeTrim}`;
 
     try {
-        // 4. Cache Check - 100% margin on repeat paginated queries (0 cost to you, 0 cost to them)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -3518,7 +3280,6 @@ app.get('/v1/tiktok/user/following', authMiddleware, async (req, res) => {
         const finalCostToUser = upstreamCost * 2;
 
         req.user.credits -= finalCostToUser;
-        mockRedisCache[cacheKey] = responseData;
 
         // 10. Return Response to Consumer
         return res.status(200).json({
@@ -3574,18 +3335,10 @@ app.get('/v1/tiktok/video/comments', authMiddleware, async (req, res) => {
     // The cursor is critical here so we don't serve Page 1 data to a Page 2 request.
     const safeCursor = cursor || '0';
     const safeTrim = trim === 'true' ? 'true' : 'false';
-    const cacheKey = `tiktok_comments_${Buffer.from(url).toString('base64')}_${safeCursor}_${safeTrim}`;
 
     try {
         // 4. Cache Check - 100% margin on repeat paginated queries
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -3627,7 +3380,6 @@ app.get('/v1/tiktok/video/comments', authMiddleware, async (req, res) => {
         const actualCost = costPerRequest;
         req.user.credits -= actualCost;
         
-        mockRedisCache[cacheKey] = responseData;
 
         // 10. Return Response to Consumer
         return res.status(200).json({
@@ -3681,18 +3433,9 @@ app.get('/v1/tiktok/user/live', authMiddleware, async (req, res) => {
 
     // 3. Cache Key Construction
     const identifier = handle.replace('@', '').toLowerCase().trim();
-    const cacheKey = `tiktok_live_${identifier}`;
 
     try {
-        // 4. Cache Check - Free (0 credits charged) on repeat hits
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0,
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -3726,7 +3469,6 @@ app.get('/v1/tiktok/user/live', authMiddleware, async (req, res) => {
 
         // 9. Deduct Credits & Cache locally
         req.user.credits -= costPerRequest;
-        mockRedisCache[cacheKey] = responseData;
 
         // 10. Return Response to Consumer
         return res.status(200).json({
@@ -3780,18 +3522,9 @@ app.get('/v1/tiktok/video/transcript', authMiddleware, async (req, res) => {
     // 3. Cache Key Construction
     const safeLang = language || 'default';
     const safeAiFallback = use_ai_as_fallback === 'true' ? 'true' : 'false';
-    const cacheKey = `tiktok_transcript_${Buffer.from(url).toString('base64')}_${safeLang}_${safeAiFallback}`;
 
     try {
-        // 4. Cache Check - Return instantly for 0 credits on cache hit
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0,
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -3830,7 +3563,6 @@ app.get('/v1/tiktok/video/transcript', authMiddleware, async (req, res) => {
         const actualCost = upstreamPayload.credits_charged || maxPotentialCost; 
         req.user.credits -= actualCost;
 
-        mockRedisCache[cacheKey] = responseData;
 
         // 9. Return Response to Client
         return res.status(200).json({
@@ -3873,7 +3605,6 @@ app.get('/v1/tiktok/video', authMiddleware, async (req, res) => {
     }
 
     // 2. Pre-flight Credit Check
-    // download_media costs 10 credits upstream if successful, otherwise standard requests are 1 credit.
     const maxPotentialCost = download_media === 'true' ? 10 : 1;
     if (req.user.credits < maxPotentialCost) {
         return res.status(403).json({ 
@@ -3882,24 +3613,8 @@ app.get('/v1/tiktok/video', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-    const safeTrim = trim === 'true' ? 'true' : 'false';
-    const safeTranscript = get_transcript === 'true' ? 'true' : 'false';
-    const safeDownload = download_media === 'true' ? 'true' : 'false';
-    const cacheKey = `tiktok_vid_${Buffer.from(url).toString('base64')}_${safeTrim}_${safeTranscript}_${safeDownload}`;
-
     try {
-        // 4. Cache Check (100% margin on repeat requests)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
-
-        // 5. Build Upstream Request
+        // 3. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
         if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
 
@@ -3912,7 +3627,6 @@ app.get('/v1/tiktok/video', authMiddleware, async (req, res) => {
         if (download_media) targetUrl.searchParams.append('download_media', download_media);
         if (cache_max_age) targetUrl.searchParams.append('cache_max_age', cache_max_age);
 
-        // Fast timeout since the upstream API handles single videos quickly
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
@@ -3924,12 +3638,12 @@ app.get('/v1/tiktok/video', authMiddleware, async (req, res) => {
 
         const upstreamPayload = await response.json();
 
-        // 6. Handle Upstream Errors 
+        // 4. Handle Upstream Errors 
         if (!response.ok || !upstreamPayload.success) {
             throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch video data'}`);
         }
 
-        // 7. Extract data and sanitize
+        // 5. Extract data and sanitize
         const responseData = {
             status_code: upstreamPayload.status_code,
             status_msg: upstreamPayload.status_msg,
@@ -3939,14 +3653,11 @@ app.get('/v1/tiktok/video', authMiddleware, async (req, res) => {
             cached_at: upstreamPayload.cached_at || null
         };
 
-        // 8. Dynamic Credit Deduction
-        // We pass the exact cost (1 or 10) from the upstream provider down to the user
+        // 6. Dynamic Credit Deduction
         const actualCost = upstreamPayload.credits_charged || 1;
         req.user.credits -= actualCost;
         
-        mockRedisCache[cacheKey] = responseData;
-
-        // 9. Return to Consumer
+        // 7. Return to Consumer (Intercepted by cache middleware if successful)
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -4000,19 +3711,8 @@ app.get('/v1/tiktok/profile/videos', authMiddleware, async (req, res) => {
     const safeCursor = max_cursor || '0';
     const safeSort = sort_by || 'latest';
     const safeTrim = trim === 'true' ? 'true' : 'false';
-    const cacheKey = `tiktok_videos_${identifier}_${safeSort}_${safeCursor}_${safeTrim}`;
 
     try {
-        // 3. Cache Check - You still capture 100% margin on repeat trending requests
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
-
         // 4. Delegate entirely to ScrapeCreators v3
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
         if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
@@ -4055,7 +3755,6 @@ app.get('/v1/tiktok/profile/videos', authMiddleware, async (req, res) => {
 
         // 7. Deduct Credits & Cache locally
         req.user.credits -= costPerRequest;
-        mockRedisCache[cacheKey] = responseData;
 
         // 8. Return to Consumer
         return res.status(200).json({
@@ -4109,18 +3808,9 @@ app.get('/v1/tiktok/profile/region', authMiddleware, async (req, res) => {
     }
 
     const cleanHandle = handle.startsWith('@') ? handle.substring(1) : handle;
-    const cacheKey = `tiktok_region_${cleanHandle.toLowerCase()}`;
 
     try {
-        // 1. Cache Check - Region rarely changes, so you still capture 100% margin on repeat requests
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 2. Delegate to ScrapeCreators
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -4154,7 +3844,6 @@ app.get('/v1/tiktok/profile/region', authMiddleware, async (req, res) => {
 
         // 5. Deduct Credits & Cache locally
         req.user.credits -= costPerRequest;
-        mockRedisCache[cacheKey] = responseData;
 
         // 6. Return to Consumer
         return res.status(200).json({
@@ -4195,7 +3884,7 @@ app.get('/v1/tiktok/profile', authMiddleware, async (req, res) => {
         cache_max_age 
     } = req.query;
 
-    // 1. Validation - Allow EITHER handle OR user_id based on ScrapeCreators specs
+    // 1. Validation - Allow EITHER handle OR user_id
     if (!handle && !user_id) {
         return res.status(400).json({
             success: false,
@@ -4216,7 +3905,6 @@ app.get('/v1/tiktok/profile', authMiddleware, async (req, res) => {
     const targetUrl = new URL('https://api.scrapecreators.com/v1/tiktok/profile');
     
     if (handle) {
-        // Strip '@' if the user accidentally included it
         const cleanHandle = handle.startsWith('@') ? handle.substring(1) : handle;
         targetUrl.searchParams.append('handle', cleanHandle);
     }
@@ -4225,27 +3913,20 @@ app.get('/v1/tiktok/profile', authMiddleware, async (req, res) => {
         targetUrl.searchParams.append('user_id', user_id);
     }
 
-    // Allow cache options like '1d', '3d', '7d' as specified by ScrapeCreators
     if (cache_max_age) {
         targetUrl.searchParams.append('cache_max_age', cache_max_age);
     }
 
-    // Best Practice: Setup an AbortController so hanging upstream requests don't lock up your server
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 20000); // 20-second hard timeout
-
     try {
-        // 4. Call ScrapeCreators API
+        // 4. Call ScrapeCreators API with a native 20-second timeout
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: {
-                'x-api-key': process.env.SCRAPE_CREATORS_API_KEY, // Store in your .env file
+                'x-api-key': process.env.SCRAPE_CREATORS_API_KEY, 
                 'Content-Type': 'application/json'
             },
-            signal: controller.signal
+            signal: AbortSignal.timeout(20000)
         });
-
-        clearTimeout(timeoutId);
 
         let data;
         try {
@@ -4254,21 +3935,15 @@ app.get('/v1/tiktok/profile', authMiddleware, async (req, res) => {
             throw new Error(`Upstream returned invalid JSON. Status: ${response.status}`);
         }
 
-        // Handle upstream API failures (e.g., 404 Not Found, 403 Invalid API Key)
         if (!response.ok || !data.success) {
             const upStreamError = data.error || data.message || `Upstream error: ${response.statusText}`;
             throw new Error(`[${response.status}] ${upStreamError}`);
         }
 
         // 5. Deduct Credits
-        // Note: You can also choose to read `data.credits_charged` from ScrapeCreators
-        // if you want to mirror their 0-credit cached response logic to your users.
         req.user.credits -= costPerRequest;
-        
-        // Save the updated user credits to your database here if applicable
-        // await req.user.save();
 
-        // 6. Return Payload to Your User
+        // 6. Return Payload to Your User (Intercepted by global cache middleware)
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -4280,9 +3955,7 @@ app.get('/v1/tiktok/profile', authMiddleware, async (req, res) => {
         });
 
     } catch (error) {
-        clearTimeout(timeoutId);
-        
-        const isTimeout = error.name === 'AbortError';
+        const isTimeout = error.name === 'TimeoutError';
         const isNotFound = error.message.includes('[404]');
         
         const statusCode = isNotFound ? 404 : (isTimeout ? 504 : 500);
@@ -4294,8 +3967,8 @@ app.get('/v1/tiktok/profile', authMiddleware, async (req, res) => {
             finalErrorMsg = "404 Not Found: The requested TikTok profile does not exist or is banned.";
         }
 
-        // 7. Discord Failure Alert (Tracks upstream health/outages)
-        if (typeof notifyFailure === 'function' && !isNotFound) { // Ignore 404s to reduce spam
+        // 7. Discord Failure Alert 
+        if (typeof notifyFailure === 'function' && !isNotFound) {
             notifyFailure({
                 endpoint: '/v1/tiktok/profile',
                 params: { handle, user_id },
@@ -4333,18 +4006,9 @@ app.get('/v1/tiktok/collection/videos', authMiddleware, async (req, res) => {
     }
 
     // Cache key explicitly flags URL and the pagination cursor to prevent data bleed
-    const cacheKey = `tiktok_collection_${Buffer.from(url).toString('base64')}_${cursor || 'start'}`;
 
     try {
-        // 1. Cache Check - Secures 100% margin on trending/duplicate requests
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 2. Fetch from ScrapeCreators
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -4383,7 +4047,6 @@ app.get('/v1/tiktok/collection/videos', authMiddleware, async (req, res) => {
 
         // 5. Deduct Credits & Cache locally
         req.user.credits -= costPerRequest;
-        mockRedisCache[cacheKey] = responseData;
 
         // 6. Return to Consumer
         return res.status(200).json({
@@ -4460,18 +4123,9 @@ app.get('/v1/linkedin/profile', authMiddleware, async (req, res) => {
     }
 
     // 3. Cache Key Construction
-    const cacheKey = `linkedin_profile_${Buffer.from(targetLinkedInUrl).toString('base64')}`;
 
     try {
-        // 4. Cache Check (100% margin on repeat requests)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -4556,7 +4210,6 @@ app.get('/v1/linkedin/profile', authMiddleware, async (req, res) => {
 
         // 9. Billing Deduction & Local Caching
         req.user.credits -= costToUser;
-        mockRedisCache[cacheKey] = trimmedProfile;
 
         // 10. Return Sanitized Payload
         return res.status(200).json({
@@ -4633,18 +4286,9 @@ app.get('/v1/linkedin/company', authMiddleware, async (req, res) => {
     }
 
     // 3. Cache Key Construction
-    const cacheKey = `linkedin_company_${Buffer.from(targetCompanyUrl).toString('base64')}`;
 
     try {
-        // 4. Cache Check (Free on repeat requests)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -4732,7 +4376,6 @@ app.get('/v1/linkedin/company', authMiddleware, async (req, res) => {
 
         // 9. Billing Deduction & Local Caching
         req.user.credits -= costToUser;
-        mockRedisCache[cacheKey] = trimmedCompany;
 
         // 10. Return Response
         return res.status(200).json({
@@ -4816,18 +4459,9 @@ app.get('/v1/linkedin/company/posts', authMiddleware, async (req, res) => {
     }
 
     // 3. Cache Key Construction
-    const cacheKey = `linkedin_company_posts_${Buffer.from(targetCompanyUrl).toString('base64')}_${pageNum}`;
 
     try {
-        // 4. Cache Check (Free 100% margin on repeat paginated queries)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -4872,7 +4506,6 @@ app.get('/v1/linkedin/company/posts', authMiddleware, async (req, res) => {
 
         // 9. Billing Deduction & Local Caching
         req.user.credits -= costToUser;
-        mockRedisCache[cacheKey] = responseData;
 
         // 10. Return Response
         return res.status(200).json({
@@ -4940,18 +4573,9 @@ app.get('/v1/linkedin/search/posts', authMiddleware, async (req, res) => {
     const safeDate = date_posted || 'all-time';
     const safeCursor = cursor || '0';
     const safeTrim = trim === 'true' ? 'true' : 'false';
-    const cacheKey = `linkedin_search_posts_${identifier}_${safeDate}_${safeCursor}_${safeTrim}`;
 
     try {
-        // 4. Cache Check (Free 100% margin on repeat requests)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -5021,7 +4645,6 @@ app.get('/v1/linkedin/search/posts', authMiddleware, async (req, res) => {
 
         // 9. Billing Deduction & Local Caching
         req.user.credits -= costToUser;
-        mockRedisCache[cacheKey] = responseData;
 
         // 10. Return Response
         return res.status(200).json({
@@ -5088,18 +4711,8 @@ app.get('/v1/linkedin/post', authMiddleware, async (req, res) => {
     }
 
     // 4. Cache Key Construction
-    const cacheKey = `linkedin_post_${Buffer.from(targetPostUrl).toString('base64')}`;
 
     try {
-        // 5. Cache Check (Free on repeat lookups)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
 
         // 6. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -5167,7 +4780,6 @@ app.get('/v1/linkedin/post', authMiddleware, async (req, res) => {
 
         // 10. Strict Flat-Rate Billing & Caching
         req.user.credits -= costPerRequest;
-        mockRedisCache[cacheKey] = trimmedPost;
 
         // 11. Return Response
         return res.status(200).json({
@@ -5235,18 +4847,9 @@ app.get('/v1/facebook/group', authMiddleware, async (req, res) => {
         cacheIdentifier = `url_${Buffer.from(cleanUrl).toString('base64')}`;
     }
 
-    const cacheKey = `fb_group_${cacheIdentifier}`;
 
     try {
-        // 4. Local Cache Check 
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -5332,7 +4935,6 @@ app.get('/v1/facebook/group', authMiddleware, async (req, res) => {
 
         // 9. Billing Deduction & Local Caching
         req.user.credits -= costToUser;
-        mockRedisCache[cacheKey] = responseData;
 
         // 10. Return Response
         return res.status(200).json({
@@ -5404,18 +5006,9 @@ app.get('/v1/facebook/group/posts', authMiddleware, async (req, res) => {
     if (cursor) upstreamUrl.searchParams.append('cursor', cursor);
 
     const safeCursor = cursor ? Buffer.from(cursor).toString('base64').substring(0, 15) : '0';
-    const cacheKey = `fb_group_posts_${cacheIdentifier}_${safeSortBy}_${safeCursor}`;
 
     try {
-        // 4. Local Cache Check (Free 100% margin on repeat paginated queries)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -5490,7 +5083,6 @@ app.get('/v1/facebook/group/posts', authMiddleware, async (req, res) => {
 
         // 9. Billing Deduction & Local Caching
         req.user.credits -= costToUser;
-        mockRedisCache[cacheKey] = responseData;
 
         // 10. Return Response
         return res.status(200).json({
@@ -5559,18 +5151,9 @@ app.get('/v1/facebook/post/comments', authMiddleware, async (req, res) => {
     if (cursor) upstreamUrl.searchParams.append('cursor', cursor);
     
     const safeCursor = cursor ? Buffer.from(cursor).toString('base64').substring(0, 15) : '0';
-    const cacheKey = `fb_comments_${cacheIdentifier}_${safeCursor}`;
 
     try {
-        // 4. Local Cache Check (Free 100% margin on repeat paginated queries)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -5630,7 +5213,6 @@ app.get('/v1/facebook/post/comments', authMiddleware, async (req, res) => {
 
         // 9. Billing Deduction & Local Caching
         req.user.credits -= costToUser;
-        mockRedisCache[cacheKey] = responseData;
 
         // 10. Return Response
         return res.status(200).json({
@@ -5684,20 +5266,7 @@ app.get('/v1/facebook/post', authMiddleware, async (req, res) => {
         });
     }
 
-    const safeMaxAge = cache_max_age || '0';
-    const cacheKey = `fb_post_sc_${Buffer.from(cleanUrl).toString('base64')}_${safeMaxAge}`;
-
     try {
-        // Local Cache Check
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
-
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
         if (!upstreamApiKey) {
             throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
@@ -5705,6 +5274,8 @@ app.get('/v1/facebook/post', authMiddleware, async (req, res) => {
 
         const upstreamUrl = new URL('https://api.scrapecreators.com/v1/facebook/post');
         upstreamUrl.searchParams.append('url', cleanUrl);
+        
+        // Forward cache_max_age upstream to save costs there; local middleware intercepts first if cached locally
         if (cache_max_age) upstreamUrl.searchParams.append('cache_max_age', cache_max_age);
 
         // Execute Request (25s timeout)
@@ -5765,9 +5336,8 @@ app.get('/v1/facebook/post', authMiddleware, async (req, res) => {
         // Dynamic Billing Deduction
         const actualCost = upstreamPayload.credits_charged === 0 ? 0 : baseCostToUser;
         req.user.credits -= actualCost;
-        
-        mockRedisCache[cacheKey] = responseData;
 
+        // Return to Consumer (Intercepted by cache middleware if successful)
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -5845,18 +5415,9 @@ app.get('/v1/facebook/profile/reels', authMiddleware, async (req, res) => {
     // 3. Cache Key Construction
     const safeCursor = cursor ? Buffer.from(cursor).toString('base64').substring(0, 15) : '0';
     const safePageId = next_page_id ? Buffer.from(next_page_id).toString('base64').substring(0, 15) : '0';
-    const cacheKey = `fb_reels_sc_${Buffer.from(targetPageUrl).toString('base64')}_${safeCursor}_${safePageId}`;
 
     try {
-        // 4. Local Cache Check (Free 100% margin on repeat requests)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+ 
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -5932,7 +5493,6 @@ app.get('/v1/facebook/profile/reels', authMiddleware, async (req, res) => {
 
         // 9. Billing Deduction & Local Caching
         req.user.credits -= costToUser;
-        mockRedisCache[cacheKey] = responseData;
 
         // 10. Return Sanitized Payload
         return res.status(200).json({
@@ -6012,18 +5572,9 @@ app.get('/v1/facebook/profile/photos', authMiddleware, async (req, res) => {
     // 3. Cache Key Construction
     const safeCursor = cursor ? Buffer.from(cursor).toString('base64').substring(0, 15) : '0';
     const safePageId = next_page_id ? Buffer.from(next_page_id).toString('base64').substring(0, 15) : '0';
-    const cacheKey = `fb_photos_${Buffer.from(targetPageUrl).toString('base64')}_${safeCursor}_${safePageId}`;
 
     try {
-        // 4. Local Cache Check (Free 100% margin on repeat paginated queries)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -6083,7 +5634,6 @@ app.get('/v1/facebook/profile/photos', authMiddleware, async (req, res) => {
 
         // 9. Billing Deduction & Local Caching
         req.user.credits -= costToUser;
-        mockRedisCache[cacheKey] = responseData;
 
         // 10. Return Response
         return res.status(200).json({
@@ -6174,18 +5724,9 @@ app.get('/v1/facebook/profile/posts', authMiddleware, async (req, res) => {
 
     if (cursor) upstreamUrl.searchParams.append('cursor', cursor);
     const safeCursor = cursor ? Buffer.from(cursor).toString('base64').substring(0, 15) : '0';
-    const cacheKey = `fb_posts_${cacheIdentifier}_${safeCursor}`;
 
     try {
-        // 4. Local Cache Check (Free 100% margin on repeat paginated queries)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -6258,7 +5799,6 @@ app.get('/v1/facebook/profile/posts', authMiddleware, async (req, res) => {
 
         // 9. Billing Deduction & Local Caching
         req.user.credits -= costToUser;
-        mockRedisCache[cacheKey] = responseData;
 
         // 10. Return Response
         return res.status(200).json({
@@ -6337,18 +5877,9 @@ app.get('/v1/facebook/profile/events', authMiddleware, async (req, res) => {
 
     // 3. Cache Key Construction
     const safeCursor = cursor ? Buffer.from(cursor).toString('base64').substring(0, 15) : '0';
-    const cacheKey = `fb_events_${Buffer.from(targetPageUrl).toString('base64')}_${safeCursor}`;
 
     try {
-        // 4. Local Cache Check (Free 100% margin on repeat requests)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -6426,7 +5957,6 @@ app.get('/v1/facebook/profile/events', authMiddleware, async (req, res) => {
 
         // 9. Billing Deduction & Local Caching
         req.user.credits -= costToUser;
-        mockRedisCache[cacheKey] = responseData;
 
         // 10. Return Response
         return res.status(200).json({
@@ -6481,22 +6011,8 @@ app.get('/v1/facebook/post/transcript', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-    const safeMaxAge = cache_max_age || '0';
-    const cacheKey = `fb_transcript_${Buffer.from(targetUrl).toString('base64')}_${safeMaxAge}`;
-
     try {
-        // 4. Local Cache Check (100% margin on repeat requests)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
-
-        // 5. Build Upstream Request
+        // 3. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
         if (!upstreamApiKey) {
             throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
@@ -6505,9 +6021,10 @@ app.get('/v1/facebook/post/transcript', authMiddleware, async (req, res) => {
         const upstreamUrl = new URL('https://api.scrapecreators.com/v1/facebook/post/transcript');
         upstreamUrl.searchParams.append('url', targetUrl);
         
+        // Pass to upstream to save costs there; local middleware intercepts first if cached locally
         if (cache_max_age) upstreamUrl.searchParams.append('cache_max_age', cache_max_age);
 
-        // 6. Execute Request (25s timeout for video transcription rendering)
+        // 4. Execute Request (25s timeout for video transcription rendering)
         const response = await fetch(upstreamUrl.toString(), {
             method: 'GET',
             headers: { 
@@ -6519,7 +6036,7 @@ app.get('/v1/facebook/post/transcript', authMiddleware, async (req, res) => {
 
         const upstreamPayload = await response.json();
 
-        // 7. Handle Upstream Errors 
+        // 5. Handle Upstream Errors 
         if (!response.ok || !upstreamPayload.success) {
             // Note: ScrapeCreators returns a specific error if the video is > 2 minutes
             throw new Error(
@@ -6527,7 +6044,7 @@ app.get('/v1/facebook/post/transcript', authMiddleware, async (req, res) => {
             );
         }
 
-        // 8. Sanitize Payload
+        // 6. Sanitize Payload
         const responseData = {
             url: targetUrl,
             transcript: upstreamPayload.transcript || null,
@@ -6535,15 +6052,13 @@ app.get('/v1/facebook/post/transcript', authMiddleware, async (req, res) => {
             cached_at: upstreamPayload.cached_at || null
         };
 
-        // 9. Dynamic Billing Deduction
-        // If upstream utilized their cache, they charged 0. We mirror that 0. 
-        // Otherwise, we charge the 2-credit base cost.
+        // 7. Dynamic Billing Deduction
         const actualCost = upstreamPayload.credits_charged === 0 ? 0 : baseCostToUser;
         
         req.user.credits -= actualCost;
-        mockRedisCache[cacheKey] = responseData;
 
-        // 10. Return Response
+        // 8. Return Response
+        // The universalCacheMiddleware automatically captures this response and saves it
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -6594,25 +6109,15 @@ app.get('/v1/facebook/profile', authMiddleware, async (req, res) => {
     }
 
     const cleanInput = input.trim().replace(/^@/, '');
-    const cacheKey = `fb_native_${Buffer.from(cleanInput).toString('base64')}`;
 
     try {
-        // Cache Check
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // Execute Native Scraper
         const scraperResult = await scrapeFacebookProfileNative(cleanInput);
 
         // Deduct 1 credit & Cache
         req.user.credits -= costPerRequest;
-        mockRedisCache[cacheKey] = scraperResult.data;
 
         return res.status(200).json({
             success: true,
@@ -6662,22 +6167,8 @@ app.get('/v1/twitter/tweet/transcript', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-    const safeMaxAge = cache_max_age || '0';
-    const cacheKey = `tw_transcript_sc_${Buffer.from(cleanUrl).toString('base64')}_${safeMaxAge}`;
-
     try {
-        // 4. Local Cache Check (Free 100% margin on repeat queries)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
-
-        // 5. Build Upstream Request
+        // 3. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
         if (!upstreamApiKey) {
             throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
@@ -6685,9 +6176,11 @@ app.get('/v1/twitter/tweet/transcript', authMiddleware, async (req, res) => {
 
         const upstreamUrl = new URL('https://api.scrapecreators.com/v1/twitter/tweet/transcript');
         upstreamUrl.searchParams.append('url', cleanUrl);
+        
+        // Pass cache instruction upstream; our local middleware intercepts first if cached locally
         if (cache_max_age) upstreamUrl.searchParams.append('cache_max_age', cache_max_age);
 
-        // 6. Execute Request (60s timeout - extended because AI transcription is slow)
+        // 4. Execute Request (60s timeout - extended because AI transcription is slow)
         const response = await fetch(upstreamUrl.toString(), {
             method: 'GET',
             headers: { 
@@ -6699,14 +6192,14 @@ app.get('/v1/twitter/tweet/transcript', authMiddleware, async (req, res) => {
 
         const upstreamPayload = await response.json();
 
-        // 7. Handle Upstream Errors 
+        // 5. Handle Upstream Errors 
         if (!response.ok || !upstreamPayload.success) {
             throw new Error(
                 `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to generate tweet transcript'}`
             );
         }
 
-        // 8. Payload Construction
+        // 6. Payload Construction
         const responseData = {
             url: cleanUrl,
             transcript: upstreamPayload.transcript || null,
@@ -6714,15 +6207,14 @@ app.get('/v1/twitter/tweet/transcript', authMiddleware, async (req, res) => {
             cached_at: upstreamPayload.cached_at || null
         };
 
-        // 9. Dynamic Billing Deduction
+        // 7. Dynamic Billing Deduction
         // If upstream served from cache, they charged 0. We pass that savings to the user (and charge 0). 
         // Otherwise, we charge our base cost of 2 credits.
         const actualCost = upstreamPayload.credits_charged === 0 ? 0 : baseCostToUser;
         
         req.user.credits -= actualCost;
-        mockRedisCache[cacheKey] = responseData;
 
-        // 10. Return Response
+        // 8. Return Response (Intercepted and cached automatically by universalCacheMiddleware)
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -6776,18 +6268,9 @@ app.get('/v1/twitter/community', authMiddleware, async (req, res) => {
     }
 
     // 3. Cache Key Construction
-    const cacheKey = `tw_community_sc_${Buffer.from(cleanUrl).toString('base64')}`;
 
     try {
-        // 4. Local Cache Check (Free 100% margin on repeat queries)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -6827,7 +6310,6 @@ app.get('/v1/twitter/community', authMiddleware, async (req, res) => {
 
         // 9. Billing Deduction & Local Caching
         req.user.credits -= costToUser;
-        mockRedisCache[cacheKey] = responseData;
 
         // 10. Return Response
         return res.status(200).json({
@@ -6859,11 +6341,9 @@ app.get('/v1/twitter/community', authMiddleware, async (req, res) => {
         });
     }
 });
-
 app.get('/v1/twitter/community/tweets', authMiddleware, async (req, res) => {
     const { url } = req.query;
 
-    // 1. Parameter Validation
     if (!url || typeof url !== 'string' || url.trim() === '') {
         return res.status(400).json({ 
             success: false, 
@@ -6871,9 +6351,8 @@ app.get('/v1/twitter/community/tweets', authMiddleware, async (req, res) => {
         });
     }
 
-    const cleanUrl = url.trim().split('?')[0]; // Strip tracking parameters
+    const cleanUrl = url.trim().split('?')[0];
 
-    // 2. Pre-flight Credit Check
     const costToUser = 1;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
@@ -6882,21 +6361,7 @@ app.get('/v1/twitter/community/tweets', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-    const cacheKey = `tw_community_tweets_trimmed_${Buffer.from(cleanUrl).toString('base64')}`;
-
     try {
-        // 4. Local Cache Check
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
-
-        // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
         if (!upstreamApiKey) {
             throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
@@ -6905,7 +6370,6 @@ app.get('/v1/twitter/community/tweets', authMiddleware, async (req, res) => {
         const upstreamUrl = new URL('https://api.scrapecreators.com/v1/twitter/community/tweets');
         upstreamUrl.searchParams.append('url', cleanUrl);
 
-        // 6. Execute Request (25s timeout for feed fetching)
         const response = await fetch(upstreamUrl.toString(), {
             method: 'GET',
             headers: { 
@@ -6917,15 +6381,10 @@ app.get('/v1/twitter/community/tweets', authMiddleware, async (req, res) => {
 
         const upstreamPayload = await response.json();
 
-        // 7. Handle Upstream Errors 
         if (!response.ok || !upstreamPayload.success) {
-            throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch Twitter community tweets'}`
-            );
+            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch Twitter community tweets'}`);
         }
 
-        // 8. Trim & Sanitize Payload
-        // Strips out all the heavy GraphQL metadata and returns a clean, developer-friendly schema
         const trimmedTweets = Array.isArray(upstreamPayload.tweets) 
             ? upstreamPayload.tweets.map(tweet => ({
                 id: tweet.id_str || tweet.id || "",
@@ -6957,11 +6416,8 @@ app.get('/v1/twitter/community/tweets', authMiddleware, async (req, res) => {
             tweets: trimmedTweets
         };
 
-        // 9. Billing Deduction & Local Caching
         req.user.credits -= costToUser;
-        mockRedisCache[cacheKey] = responseData;
 
-        // 10. Return Response
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -6990,7 +6446,8 @@ app.get('/v1/twitter/community/tweets', authMiddleware, async (req, res) => {
             error: finalErrorMsg 
         });
     }
-});
+}); 
+
 app.get('/v1/twitter/tweet', authMiddleware, async (req, res) => {
     const { url, trim, cache_max_age } = req.query;
 
@@ -7111,7 +6568,6 @@ app.get('/v1/twitter/tweet', authMiddleware, async (req, res) => {
 app.get('/v1/twitter/profile/tweets', authMiddleware, async (req, res) => {
     const { handle, trim } = req.query;
 
-    // 1. Parameter Validation
     if (!handle || typeof handle !== 'string' || handle.trim() === '') {
         return res.status(400).json({ 
             success: false, 
@@ -7121,7 +6577,6 @@ app.get('/v1/twitter/profile/tweets', authMiddleware, async (req, res) => {
 
     const cleanHandle = handle.trim().replace(/^@/, '').split('?')[0];
 
-    // 2. Pre-flight Credit Check (Charge 2 credits to maintain 50% margin)
     const baseCostToUser = 2;
     if (req.user.credits < baseCostToUser) {
         return res.status(403).json({ 
@@ -7130,22 +6585,7 @@ app.get('/v1/twitter/profile/tweets', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-    const safeTrim = trim === 'true' ? 'true' : 'false';
-    const cacheKey = `tw_tweets_sc_${Buffer.from(cleanHandle).toString('base64')}_${safeTrim}`;
-
     try {
-        // 4. Local Cache Check (Free 100% margin on repeat queries)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
-
-        // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
         if (!upstreamApiKey) {
             throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
@@ -7155,7 +6595,6 @@ app.get('/v1/twitter/profile/tweets', authMiddleware, async (req, res) => {
         upstreamUrl.searchParams.append('handle', cleanHandle);
         if (trim) upstreamUrl.searchParams.append('trim', trim);
 
-        // 6. Execute Request (20s timeout)
         const response = await fetch(upstreamUrl.toString(), {
             method: 'GET',
             headers: { 
@@ -7167,26 +6606,18 @@ app.get('/v1/twitter/profile/tweets', authMiddleware, async (req, res) => {
 
         const upstreamPayload = await response.json();
 
-        // 7. Handle Upstream Errors 
         if (!response.ok || !upstreamPayload.success) {
-            throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch Twitter user tweets'}`
-            );
+            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch Twitter user tweets'}`);
         }
 
-        // 8. Payload Construction
-        // We extract the tweets array and structure the final payload cleanly
         const responseData = {
             handle: cleanHandle,
             total_returned: Array.isArray(upstreamPayload.tweets) ? upstreamPayload.tweets.length : 0,
             tweets: upstreamPayload.tweets || []
         };
 
-        // 9. Billing Deduction & Local Caching
         req.user.credits -= baseCostToUser;
-        mockRedisCache[cacheKey] = responseData;
 
-        // 10. Return Response
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -7220,7 +6651,6 @@ app.get('/v1/twitter/profile/tweets', authMiddleware, async (req, res) => {
 app.get('/v1/twitter/profile', authMiddleware, async (req, res) => {
     const { handle, cache_max_age } = req.query;
 
-    // 1. Parameter Validation
     if (!handle || typeof handle !== 'string' || handle.trim() === '') {
         return res.status(400).json({ 
             success: false, 
@@ -7230,7 +6660,6 @@ app.get('/v1/twitter/profile', authMiddleware, async (req, res) => {
 
     const cleanHandle = handle.trim().replace(/^@/, '').split('?')[0];
 
-    // 2. Pre-flight Credit Check (Charge 2 credits to maintain 50% margin)
     const baseCostToUser = 1;
     if (req.user.credits < baseCostToUser) {
         return res.status(403).json({ 
@@ -7239,22 +6668,7 @@ app.get('/v1/twitter/profile', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-    const safeMaxAge = cache_max_age || '0';
-    const cacheKey = `tw_profile_sc_${Buffer.from(cleanHandle).toString('base64')}_${safeMaxAge}`;
-
     try {
-        // 4. Local Cache Check (100% margin on repeat requests)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
-
-        // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
         if (!upstreamApiKey) {
             throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
@@ -7264,7 +6678,6 @@ app.get('/v1/twitter/profile', authMiddleware, async (req, res) => {
         upstreamUrl.searchParams.append('handle', cleanHandle);
         if (cache_max_age) upstreamUrl.searchParams.append('cache_max_age', cache_max_age);
 
-        // 6. Execute Request (20s timeout)
         const response = await fetch(upstreamUrl.toString(), {
             method: 'GET',
             headers: { 
@@ -7276,33 +6689,22 @@ app.get('/v1/twitter/profile', authMiddleware, async (req, res) => {
 
         const upstreamPayload = await response.json();
 
-        // 7. Handle Upstream Errors 
         if (!response.ok || !upstreamPayload.success) {
-            throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch Twitter profile'}`
-            );
+            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch Twitter profile'}`);
         }
 
-        // 8. Payload Construction
-        // ScrapeCreators returns the raw GraphQL JSON object from X.
-        // We extract the base meta fields and spread the rest of the raw GraphQL data.
         const { success, credits_remaining, credits_charged, cached, cached_at, ...twitterData } = upstreamPayload;
         
         const responseData = {
             cached: cached || false,
             cached_at: cached_at || null,
-            ...twitterData // Spreads the raw __typename, legacy, verification_info, etc.
+            ...twitterData
         };
 
-        // 9. Dynamic Billing Deduction
-        // If upstream utilized their cache, they charged 0. We pass that savings (and charge 0). 
-        // Otherwise, we charge the 2-credit base cost.
         const actualCost = credits_charged === 0 ? 0 : baseCostToUser;
         
         req.user.credits -= actualCost;
-        mockRedisCache[cacheKey] = responseData;
 
-        // 10. Return Response
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -7357,18 +6759,10 @@ app.get('/v1/tiktok/product', authMiddleware, async (req, res) => {
     }
 
     // 3. Cache Key Construction
-    const cacheKey = `tk_product_sc_fixed_${Buffer.from(cleanUrl).toString('base64')}_${safeRegion}`;
 
     try {
         // 4. Local Cache Check (Free 100% margin on repeat requests)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -7455,7 +6849,6 @@ app.get('/v1/tiktok/product', authMiddleware, async (req, res) => {
         // 9. Billing Deduction & Caching
         const actualCost = upstreamPayload.credits_charged === 0 ? 0 : costToUser;
         req.user.credits -= actualCost;
-        mockRedisCache[cacheKey] = responseData;
 
         // 10. Return Response
         return res.status(200).json({
@@ -7515,18 +6908,9 @@ app.get('/v1/tiktok/shop/product/reviews', authMiddleware, async (req, res) => {
 
     // 3. Cache Key Construction
     const identifier = safeProductId ? `id_${safeProductId}` : `url_${Buffer.from(cleanUrl).toString('base64')}`;
-    const cacheKey = `tk_reviews_sc_trimmed_${identifier}_${safeRegion}_${safePage}`;
 
     try {
-        // 4. Local Cache Check (Free 100% margin on repeat paginated queries)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -7582,7 +6966,6 @@ app.get('/v1/tiktok/shop/product/reviews', authMiddleware, async (req, res) => {
         // 9. Billing Deduction & Caching
         const actualCost = upstreamPayload.credits_charged === 0 ? 0 : costToUser;
         req.user.credits -= actualCost;
-        mockRedisCache[cacheKey] = responseData;
 
         // 10. Return Response
         return res.status(200).json({
@@ -7641,18 +7024,9 @@ app.get('/v1/tiktok/shop/products', authMiddleware, async (req, res) => {
 
     // 3. Cache Key Construction
     const safeCursor = cursor ? Buffer.from(cursor).toString('base64').substring(0, 15) : '0';
-    const cacheKey = `tk_shop_products_sc_${Buffer.from(cleanUrl).toString('base64')}_${safeSortBy}_${safeRegion}_${safeCursor}`;
 
     try {
-        // 4. Local Cache Check (Free 100% margin on repeat/paginated queries)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -7735,7 +7109,6 @@ app.get('/v1/tiktok/shop/products', authMiddleware, async (req, res) => {
         const actualCost = upstreamPayload.credits_charged === 0 ? 0 : baseCostToUser;
         
         req.user.credits -= actualCost;
-        mockRedisCache[cacheKey] = responseData;
 
         // 10. Return Response
         return res.status(200).json({
@@ -7793,18 +7166,9 @@ app.get('/v1/tiktok/shop/search', authMiddleware, async (req, res) => {
     }
 
     // 3. Cache Key Construction
-    const cacheKey = `tk_shop_search_sc_${Buffer.from(cleanQuery).toString('base64')}_${safeRegion}_${safePage}`;
 
     try {
-        // 4. Local Cache Check (Free 100% margin on repeat queries)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -7848,7 +7212,6 @@ app.get('/v1/tiktok/shop/search', authMiddleware, async (req, res) => {
         const actualCost = credits_charged === 0 ? 0 : baseCostToUser;
         
         req.user.credits -= actualCost;
-        mockRedisCache[cacheKey] = responseData;
 
         // 10. Return Response
         return res.status(200).json({
@@ -7907,18 +7270,9 @@ app.get('/v1/linkedin/ads/search', authMiddleware, async (req, res) => {
         .filter(Boolean)
         .map(param => Buffer.from(param.trim()).toString('base64').substring(0, 10))
         .join('_');
-    const cacheKey = `li_ads_search_sc_trimmed_${cacheParams}_${safePagination}`;
 
     try {
-        // 4. Local Cache Check (Free 100% margin on repeat requests)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -7996,7 +7350,6 @@ app.get('/v1/linkedin/ads/search', authMiddleware, async (req, res) => {
         // 9. Billing Deduction & Caching
         const actualCost = upstreamPayload.credits_charged === 0 ? 0 : costToUser;
         req.user.credits -= actualCost;
-        mockRedisCache[cacheKey] = responseData;
 
         // 10. Return Response
         return res.status(200).json({
@@ -8041,11 +7394,10 @@ app.get('/v1/facebook/adLibrary/ad', authMiddleware, async (req, res) => {
     }
 
     const safeId = id ? id.trim() : null;
-    const cleanUrl = url ? url.trim().split('?')[0] : null; // Strip tracking parameters
+    const cleanUrl = url ? url.trim().split('?')[0] : null; 
     const safeTrim = trim === 'true' ? 'true' : 'false';
-    const safeMaxAge = cache_max_age || '0';
 
-    // 2. Pre-flight Credit Check (Charge exactly 1 credit)
+    // 2. Pre-flight Credit Check
     const baseCostToUser = 2;
     if (req.user.credits < baseCostToUser) {
         return res.status(403).json({ 
@@ -8054,22 +7406,8 @@ app.get('/v1/facebook/adLibrary/ad', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-    const identifier = safeId ? `id_${safeId}` : `url_${Buffer.from(cleanUrl).toString('base64')}`;
-    const cacheKey = `fb_ad_sc_trimmed_${identifier}_${safeTrim}_${safeMaxAge}`;
-
     try {
-        // 4. Local Cache Check (Free 100% margin on repeat requests)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
-
-        // 5. Build Upstream Request
+        // 3. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
         if (!upstreamApiKey) {
             throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
@@ -8079,9 +7417,9 @@ app.get('/v1/facebook/adLibrary/ad', authMiddleware, async (req, res) => {
         if (safeId) upstreamUrl.searchParams.append('id', safeId);
         if (cleanUrl) upstreamUrl.searchParams.append('url', cleanUrl);
         if (trim) upstreamUrl.searchParams.append('trim', safeTrim);
-        if (cache_max_age) upstreamUrl.searchParams.append('cache_max_age', safeMaxAge);
+        if (cache_max_age) upstreamUrl.searchParams.append('cache_max_age', cache_max_age);
 
-        // 6. Execute Upstream Request (20s timeout)
+        // 4. Execute Upstream Request (20s timeout)
         const response = await fetch(upstreamUrl.toString(), {
             method: 'GET',
             headers: { 
@@ -8093,14 +7431,14 @@ app.get('/v1/facebook/adLibrary/ad', authMiddleware, async (req, res) => {
 
         const upstreamPayload = await response.json();
 
-        // 7. Handle Upstream Errors 
+        // 5. Handle Upstream Errors 
         if (!response.ok || !upstreamPayload.success) {
             throw new Error(
                 `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch Facebook Ad details'}`
             );
         }
 
-        // 8. Payload Construction & Strict Mapping
+        // 6. Payload Construction & Strict Mapping
         const snap = upstreamPayload.snapshot || {};
         
         // Handle Multi-Version/Carousel Ads securely
@@ -8109,7 +7447,6 @@ app.get('/v1/facebook/adLibrary/ad', authMiddleware, async (req, res) => {
         let adLink = typeof snap.link_url === 'string' ? snap.link_url : "";
 
         if (Array.isArray(snap.cards) && snap.cards.length > 0) {
-            // If it's a carousel, map titles and images from the cards array safely
             const cardTitles = snap.cards.map(c => typeof c.title === 'string' ? c.title : "").filter(Boolean);
             if (cardTitles.length > 0) adTitle = cardTitles.join(" | ");
             
@@ -8124,7 +7461,6 @@ app.get('/v1/facebook/adLibrary/ad', authMiddleware, async (req, res) => {
         if (typeof snap.body === 'string') {
             safeBodyText = snap.body.replace(/<br\s*\/?>/gi, '\n');
         } else if (snap.body && typeof snap.body.markup === 'string') {
-            // Sometimes Facebook buries the text in a markup object
             safeBodyText = snap.body.markup.replace(/<br\s*\/?>/gi, '\n');
         }
 
@@ -8164,12 +7500,11 @@ app.get('/v1/facebook/adLibrary/ad', authMiddleware, async (req, res) => {
             } : null
         };
 
-        // 9. Billing Deduction & Caching
+        // 7. Dynamic Billing Deduction
         const actualCost = upstreamPayload.credits_charged === 0 ? 0 : baseCostToUser;
         req.user.credits -= actualCost;
-        mockRedisCache[cacheKey] = responseData;
 
-        // 10. Return Response
+        // 8. Return Response
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -8187,7 +7522,7 @@ app.get('/v1/facebook/adLibrary/ad', authMiddleware, async (req, res) => {
         if (typeof notifyFailure === 'function') {
             notifyFailure({ 
                 endpoint: '/v1/facebook/adLibrary/ad', 
-                params: { id: safeId, url: cleanUrl, trim: safeTrim, cache_max_age: safeMaxAge }, 
+                params: { id: safeId, url: cleanUrl, trim: safeTrim, cache_max_age }, 
                 statusCode: statusCode, 
                 errorMsg: finalErrorMsg 
             });
@@ -8212,11 +7547,9 @@ app.get('/v1/facebook/adLibrary/ad/transcript', authMiddleware, async (req, res)
     }
 
     const safeId = id ? id.trim() : null;
-    const cleanUrl = url ? url.trim().split('?')[0] : null; // Strip tracking parameters
-    const safeMaxAge = cache_max_age || '0';
+    const cleanUrl = url ? url.trim().split('?')[0] : null;
 
     // 2. Pre-flight Credit Check
-    // We check for 5 credits here assuming the upstream will charge a max of 1 credit.
     const expectedMaxCost = 5;
     if (req.user.credits < expectedMaxCost) {
         return res.status(403).json({ 
@@ -8225,22 +7558,8 @@ app.get('/v1/facebook/adLibrary/ad/transcript', authMiddleware, async (req, res)
         });
     }
 
-    // 3. Cache Key Construction
-    const identifier = safeId ? `id_${safeId}` : `url_${Buffer.from(cleanUrl).toString('base64')}`;
-    const cacheKey = `fb_ad_transcript_sc_root_${identifier}_${safeMaxAge}`;
-
     try {
-        // 4. Local Cache Check (Free 100% margin on repeat requests)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
-
-        // 5. Build Upstream Request
+        // 3. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
         if (!upstreamApiKey) {
             throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
@@ -8249,9 +7568,9 @@ app.get('/v1/facebook/adLibrary/ad/transcript', authMiddleware, async (req, res)
         const upstreamUrl = new URL('https://api.scrapecreators.com/v1/facebook/adLibrary/ad/transcript');
         if (safeId) upstreamUrl.searchParams.append('id', safeId);
         if (cleanUrl) upstreamUrl.searchParams.append('url', cleanUrl);
-        if (cache_max_age) upstreamUrl.searchParams.append('cache_max_age', safeMaxAge);
+        if (cache_max_age) upstreamUrl.searchParams.append('cache_max_age', cache_max_age);
 
-        // 6. Execute Upstream Request (30s timeout for video parsing/transcription)
+        // 4. Execute Upstream Request (30s timeout for video parsing/transcription)
         const response = await fetch(upstreamUrl.toString(), {
             method: 'GET',
             headers: { 
@@ -8263,15 +7582,14 @@ app.get('/v1/facebook/adLibrary/ad/transcript', authMiddleware, async (req, res)
 
         const upstreamPayload = await response.json();
 
-        // 7. Handle Upstream Errors 
+        // 5. Handle Upstream Errors 
         if (!response.ok || !upstreamPayload.success) {
             throw new Error(
                 `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch Facebook Ad transcript'}`
             );
         }
 
-        // 8. Payload Construction & Strict Mapping
-        // Fixed: Read directly from the root of the payload, not inside a nested "data" object
+        // 6. Payload Construction & Strict Mapping
         const responseData = {
             ad_id: upstreamPayload.ad_id || safeId || "",
             url: upstreamPayload.url || cleanUrl || "",
@@ -8279,14 +7597,12 @@ app.get('/v1/facebook/adLibrary/ad/transcript', authMiddleware, async (req, res)
             transcript: upstreamPayload.transcript || null
         };
 
-        // 9. Dynamic Billing Deduction & Caching
-        // Multiply the exact upstream charge by 5. 
+        // 7. Dynamic Billing Deduction
         const actualCost = (upstreamPayload.credits_charged || 0) * 5;
         
         req.user.credits -= actualCost;
-        mockRedisCache[cacheKey] = responseData;
 
-        // 10. Return Response
+        // 8. Return Response
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -8304,7 +7620,7 @@ app.get('/v1/facebook/adLibrary/ad/transcript', authMiddleware, async (req, res)
         if (typeof notifyFailure === 'function') {
             notifyFailure({ 
                 endpoint: '/v1/facebook/adLibrary/ad/transcript', 
-                params: { id: safeId, url: cleanUrl, cache_max_age: safeMaxAge }, 
+                params: { id: safeId, url: cleanUrl, cache_max_age }, 
                 statusCode: statusCode, 
                 errorMsg: finalErrorMsg 
             });
@@ -8356,18 +7672,9 @@ app.all('/v1/facebook/adLibrary/search/ads', authMiddleware, async (req, res) =>
         status, media_type, start_date, end_date
     ].filter(Boolean).map(p => Buffer.from(p.trim()).toString('base64').substring(0, 8)).join('_');
     
-    const cacheKey = `fb_ads_search_sc_trimmed_${cacheParams}_${cacheCursor}`;
 
     try {
-        // 4. Local Cache Check (Free 100% margin on repeat paginated queries)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -8468,7 +7775,6 @@ app.all('/v1/facebook/adLibrary/search/ads', authMiddleware, async (req, res) =>
         // 9. Billing Deduction & Caching
         const actualCost = upstreamPayload.credits_charged === 0 ? 0 : costToUser;
         req.user.credits -= actualCost;
-        mockRedisCache[cacheKey] = responseData;
 
         // 10. Return Response
         return res.status(200).json({
@@ -8541,18 +7847,9 @@ app.all('/v1/facebook/adLibrary/company/ads', authMiddleware, async (req, res) =
         language, sort_by, start_date, end_date
     ].filter(Boolean).map(p => Buffer.from(p.trim()).toString('base64').substring(0, 8)).join('_');
     
-    const cacheKey = `fb_company_ads_sc_trimmed_${cacheParams}_${cacheCursor}`;
 
     try {
-        // 4. Local Cache Check (Free margin on repeat paginated queries)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -8652,7 +7949,6 @@ app.all('/v1/facebook/adLibrary/company/ads', authMiddleware, async (req, res) =
         // 9. Billing Deduction & Caching
         const actualCost = upstreamPayload.credits_charged *2 === 0 ? 0 : costToUser * 2;
         req.user.credits -= actualCost;
-        mockRedisCache[cacheKey] = responseData;
 
         // 10. Return Response
         return res.status(200).json({
@@ -8708,18 +8004,10 @@ app.get('/v1/facebook/marketplace/location/search', authMiddleware, async (req, 
     }
 
     // 3. Cache Key Construction
-    const cacheKey = `fb_mkt_loc_search_sc_trimmed_${Buffer.from(cleanQuery).toString('base64')}`;
 
     try {
         // 4. Local Cache Check (Free 100% margin on repeat queries)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -8767,7 +8055,6 @@ app.get('/v1/facebook/marketplace/location/search', authMiddleware, async (req, 
         // 9. Billing Deduction & Caching
         const actualCost = upstreamPayload.credits_charged === 0 ? 0 : costToUser;
         req.user.credits -= actualCost;
-        mockRedisCache[cacheKey] = responseData;
 
         // 10. Return Response
         return res.status(200).json({
@@ -8834,18 +8121,9 @@ app.get('/v1/facebook/marketplace/search', authMiddleware, async (req, res) => {
     ].filter(Boolean).map(p => Buffer.from(String(p).trim()).toString('base64').substring(0, 6)).join('_');
     
     const safeCursor = cursor ? Buffer.from(cursor.trim()).toString('base64').substring(0, 15) : '0';
-    const cacheKey = `fb_mkt_search_sc_trimmed_${cacheParams}_${safeCursor}`;
 
     try {
-        // 4. Local Cache Check (Free 100% margin on repeat paginated queries)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -8916,7 +8194,6 @@ app.get('/v1/facebook/marketplace/search', authMiddleware, async (req, res) => {
         // 9. Billing Deduction & Caching
         const actualCost = upstreamPayload.credits_charged === 0 ? 0 : costToUser;
         req.user.credits -= actualCost;
-        mockRedisCache[cacheKey] = responseData;
 
         // 10. Return Response
         return res.status(200).json({
@@ -8974,18 +8251,10 @@ app.get('/v1/facebook/marketplace/item', authMiddleware, async (req, res) => {
 
     // 3. Cache Key Construction
     const identifier = safeId ? `id_${safeId}` : `url_${Buffer.from(cleanUrl).toString('base64')}`;
-    const cacheKey = `fb_mkt_item_sc_trimmed_${identifier}`;
 
     try {
         // 4. Local Cache Check (Free 100% margin on repeat requests)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Build Upstream Request
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
@@ -9065,7 +8334,6 @@ app.get('/v1/facebook/marketplace/item', authMiddleware, async (req, res) => {
         // 9. Billing Deduction & Caching
         const actualCost = upstreamPayload.credits_charged === 0 ? 0 : costToUser;
         req.user.credits -= actualCost;
-        mockRedisCache[cacheKey] = responseData;
 
         // 10. Return Response
         return res.status(200).json({
@@ -9125,18 +8393,9 @@ app.get('/v1/trustpilot/reviews', authMiddleware, async (req, res) => {
     }
 
     // 3. Cache Key Construction
-    const cacheKey = `tp_reviews_native_${Buffer.from(cleanDomain).toString('base64')}_${safePage}_${safeSort}_${safeStars}`;
 
     try {
-        // 4. Local Cache Check (Free 100% margin on repeat requests)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Try Playwright first, then SocialCrawl when its parameters are supported
         const result = await trustpilotOrchestrator.executeReviews(
@@ -9164,7 +8423,6 @@ app.get('/v1/trustpilot/reviews', authMiddleware, async (req, res) => {
 
         // 6. Deduct Credit & Store in Cache
         req.user.credits -= result.creditCost;
-        mockRedisCache[cacheKey] = responseData;
 
         // 7. Return Response
         return res.status(200).json({
@@ -9220,18 +8478,9 @@ app.get('/v1/trustpilot/search', authMiddleware, async (req, res) => {
     }
 
     // 3. Cache Key Construction
-    const cacheKey = `tp_search_native_${Buffer.from(cleanQuery).toString('base64')}`;
 
     try {
-        // 4. Local Cache Check
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Try Playwright first, then SocialCrawl
         const result = await trustpilotOrchestrator.executeSearch(
@@ -9251,7 +8500,6 @@ app.get('/v1/trustpilot/search', authMiddleware, async (req, res) => {
 
         // 6. Deduct Credit & Store in Cache
         req.user.credits -= result.creditCost;
-        mockRedisCache[cacheKey] = responseData;
 
         // 7. Return Response
         return res.status(200).json({
@@ -9311,18 +8559,9 @@ app.get('/v1/yellowpages/search', authMiddleware, async (req, res) => {
     }
 
     // 3. Cache Key Construction
-    const cacheKey = `yp_search_api_${Buffer.from(cleanTerm).toString('base64')}_${Buffer.from(cleanLocation).toString('base64')}_${safePage}`;
 
     try {
-        // 4. Local Cache Check
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Execute ScraperAPI Module
         const businesses = await scrapeYellowpagesAPI(cleanTerm, cleanLocation, safePage);
@@ -9340,7 +8579,6 @@ app.get('/v1/yellowpages/search', authMiddleware, async (req, res) => {
         // 6. Deduct Credit & Store in Cache (Only non-empty responses)
         req.user.credits -= costToUser;
         if (businesses.length > 0) {
-            mockRedisCache[cacheKey] = responseData;
         }
 
         // 7. Return Response
@@ -9392,15 +8630,8 @@ app.get('/v1/zillow/search', authMiddleware, async (req, res) => {
         return res.status(403).json({ success: false, error: `403 Forbidden: Insufficient credits.` });
     }
 
-    const cacheKey = `zillow_search_api_${Buffer.from(cleanLocation).toString('base64')}_${safePage}`;
 
     try {
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true, credits_remaining: req.user.credits, credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
 
         const listings = await scrapeZillowSearchAPI(cleanLocation, safePage);
 
@@ -9411,7 +8642,6 @@ app.get('/v1/zillow/search', authMiddleware, async (req, res) => {
         };
 
         req.user.credits -= costToUser;
-        mockRedisCache[cacheKey] = responseData;
 
         return res.status(200).json({
             success: true, credits_remaining: req.user.credits, credits_charged: costToUser,
@@ -9441,15 +8671,9 @@ app.get('/v1/zillow/item', authMiddleware, async (req, res) => {
     }
 
     const identifier = safeZpid ? `zpid_${safeZpid}` : `url_${Buffer.from(cleanUrl).toString('base64').substring(0, 20)}`;
-    const cacheKey = `zillow_detail_api_${identifier}`;
 
     try {
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true, credits_remaining: req.user.credits, credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         const propertyData = await scrapeZillowDetailAPI(safeZpid, cleanUrl);
 
@@ -9458,7 +8682,6 @@ app.get('/v1/zillow/item', authMiddleware, async (req, res) => {
         }
 
         req.user.credits -= costToUser;
-        mockRedisCache[cacheKey] = propertyData;
 
         return res.status(200).json({
             success: true, credits_remaining: req.user.credits, credits_charged: costToUser,
@@ -9498,18 +8721,9 @@ app.get('/v1/gmaps/reviews', authMiddleware, async (req, res) => {
 
     // 3. Collision-Proof Cache Key
     const queryHash = crypto.createHash('md5').update(`${cleanUrl}_${parsedLimit}_${sortParam}`).digest('hex');
-    const cacheKey = `gmaps_reviews_apify_${queryHash}`;
 
     try {
-        // 4. Cache Check
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0,
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Execute Apify Scraper
         const reviews = await scrapeGoogleMapsReviews(cleanUrl, parsedLimit, sortParam);
@@ -9524,7 +8738,6 @@ app.get('/v1/gmaps/reviews', authMiddleware, async (req, res) => {
         // 6. Deduct Credit & Store in Cache (Only if we got data!)
         req.user.credits -= costToUser;
         if (reviews.length > 0) {
-            mockRedisCache[cacheKey] = responseData;
         }
 
         // 7. Success Response
@@ -9583,17 +8796,9 @@ app.get('/v1/gmaps/search', authMiddleware, async (req, res) => {
     }
 
     // Cache key incorporates location and limit
-    const cacheKey = `gmaps_apify_v1_${Buffer.from(cleanQuery).toString('base64')}_${Buffer.from(targetLocation).toString('base64')}_${resultLimit}`;
 
     try {
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0,
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         const apifyToken = process.env.APIFY_API_TOKEN;
         if (!apifyToken) throw new Error("Missing APIFY_API_TOKEN in environment variables");
@@ -9641,7 +8846,6 @@ app.get('/v1/gmaps/search', authMiddleware, async (req, res) => {
         const actualCost = Math.max(1, Math.ceil(items.length / 20));
 
         req.user.credits -= actualCost;
-        mockRedisCache[cacheKey] = responseData;
 
         return res.status(200).json({
             success: true,
@@ -9704,18 +8908,9 @@ app.get('/v1/amazon/product', authMiddleware, async (req, res) => {
     }
 
     // 3. Collision-Proof Cache Key
-    const cacheKey = `amazon_product_${marketCode}_${cleanAsin}`;
 
     try {
-        // 4. Cache Check
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0,
-                data: mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Try Playwright/ScraperAPI first, then SocialCrawl
         const result = await amazonOrchestrator.executeProduct(
@@ -9733,7 +8928,6 @@ app.get('/v1/amazon/product', authMiddleware, async (req, res) => {
 
         // 6. Deduct Credit & Store in Cache
         req.user.credits -= result.creditCost;
-        mockRedisCache[cacheKey] = result.data;
 
         // 7. Response
         return res.status(200).json({
@@ -9800,18 +8994,9 @@ app.get('/v1/amazon/search', authMiddleware, async (req, res) => {
 
     // 3. Collision-Proof Cache Key
     const queryHash = crypto.createHash('md5').update(`${marketCode}:${pageNum}:${cleanKeyword.toLowerCase()}`).digest('hex');
-    const cacheKey = `amazon_search_${queryHash}`;
 
     try {
-        // 4. Cache Check
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0,
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Try ScraperAPI first, then fallback
         const result = await amazonOrchestrator.executeSearch(
@@ -9846,7 +9031,6 @@ app.get('/v1/amazon/search', authMiddleware, async (req, res) => {
         // 6. Deduct Credit & Cache Non-Empty Responses
         req.user.credits -= result.creditCost;
         if (productsList.length > 0) {
-            mockRedisCache[cacheKey] = finalPayload;
         }
 
         // 7. Response
@@ -9912,17 +9096,9 @@ app.get('/v1/amazon/storefront', authMiddleware, async (req, res) => {
 
 // Create a unique hash of the ENTIRE URL to prevent collisions
 const urlHash = crypto.createHash('md5').update(cleanUrl).digest('hex');
-const cacheKey = `amazon_storefront_${urlHash}`;
     try {
         // 4. Local Cache Check
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
-        }
+
 
         // 5. Try Playwright first, then SocialCrawl
         const result = await amazonOrchestrator.executeStorefront(
@@ -9942,7 +9118,6 @@ const cacheKey = `amazon_storefront_${urlHash}`;
 
         // 6. Deduct Credit & Store in Cache
         req.user.credits -= result.creditCost;
-        mockRedisCache[cacheKey] = responseData;
 
         // 7. Return Response
         return res.status(200).json({
