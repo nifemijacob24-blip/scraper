@@ -279,8 +279,11 @@ async function authMiddleware(req, res, next) {
         return res.status(500).json({ success: false, error: "Internal Server Error verifying API key." });
     }
 }
+
+app.use('/v1', authMiddleware);
 // Apply the global cache middleware to all routes under '/v1'
 app.use('/v1', universalCacheMiddleware);
+
 
 // --- ENDPOINT 1: SUBREDDIT DETAILS (1 CREDIT) ---
 app.get('/v1/reddit/subreddit/details', authMiddleware, async (req, res) => {
