@@ -287,10 +287,7 @@ app.use('/v1', authMiddleware);
 // Apply the global cache middleware to all routes under '/v1'
 app.use('/v1', universalCacheMiddleware);
 
-
-// --- ENDPOINT 1: SUBREDDIT DETAILS (1 CREDIT) ---
 app.get('/v1/reddit/subreddit/details', authMiddleware, async (req, res) => {
-    // Support both 'subreddit' and 'name' query params
     const rawInput = req.query.subreddit || req.query.name;
     const cacheMaxAge = req.query.cache_max_age || '7d';
 
@@ -301,8 +298,6 @@ app.get('/v1/reddit/subreddit/details', authMiddleware, async (req, res) => {
         });
     }
 
-    // Clean up handle/name in case consumers pass full URLs, 'r/', or trailing slashes
-    // Note: preserve exact casing for ScrapeCreators API compliance
     let cleanSubreddit = rawInput.trim().split('?')[0].replace(/\/$/, '');
     if (cleanSubreddit.includes('reddit.com/r/')) {
         cleanSubreddit = cleanSubreddit.split('reddit.com/r/')[1].split('/')[0];
@@ -310,7 +305,7 @@ app.get('/v1/reddit/subreddit/details', authMiddleware, async (req, res) => {
         cleanSubreddit = cleanSubreddit.replace(/^r\//, '');
     }
 
-    const costPerRequest = 1; // DaaS markup
+    const costPerRequest = 1;
 
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({
@@ -319,160 +314,292 @@ app.get('/v1/reddit/subreddit/details', authMiddleware, async (req, res) => {
         });
     }
 
+    let upstreamPayload = null;
+    let primaryErrorMsg = "";
+
     try {
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+        // --- PRIMARY ATTEMPT ---
+        const getAnyApiKey = process.env.GETANYAPI_KEY;
+        if (!getAnyApiKey) throw new Error("Missing primary API key");
 
-        const targetUrl = new URL('https://api.scrapecreators.com/v1/reddit/subreddit/details');
-        targetUrl.searchParams.append('subreddit', cleanSubreddit);
-        targetUrl.searchParams.append('cache_max_age', cacheMaxAge);
-
-        const response = await fetch(targetUrl.toString(), {
-            method: 'GET',
+        const primaryResponse = await fetch('https://api.getanyapi.com/v1/run/reddit.subreddit_details', {
+            method: 'POST',
             headers: {
-                'x-api-key': upstreamApiKey,
+                'Authorization': `Bearer ${getAnyApiKey}`,
                 'Content-Type': 'application/json'
             },
-            signal: AbortSignal.timeout(15000)
+            body: JSON.stringify({ subreddit: cleanSubreddit }),
+            signal: AbortSignal.timeout(8000)
         });
 
-        const upstreamPayload = await response.json();
-
-        if (!response.ok || upstreamPayload.success === false) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch subreddit details'}`);
+        if (!primaryResponse.ok) {
+            throw new Error(`HTTP ${primaryResponse.status}`);
         }
 
-        // Standardize output payload for your consumers
-        const responseData = {
-            subreddit_id: upstreamPayload.subreddit_id || null,
-            display_name: upstreamPayload.display_name || cleanSubreddit,
-            subscribers: upstreamPayload.subscribers || 0,
-            weekly_active_users: upstreamPayload.weekly_active_users || 0,
-            weekly_contributions: upstreamPayload.weekly_contributions || 0,
-            description: upstreamPayload.description || "",
-            rules: upstreamPayload.rules || "",
-            icon_img: upstreamPayload.icon_img || null,
-            header_img: upstreamPayload.header_img || null,
-            advertiser_category: upstreamPayload.advertiser_category || "",
-            created_at: upstreamPayload.created_at || null,
-            submit_text: upstreamPayload.submit_text || ""
-        };
+        const primaryData = await primaryResponse.json();
 
-        req.user.credits -= costPerRequest;
+        if (primaryData.output && primaryData.output.found) {
+            const data = primaryData.output.data;
+            upstreamPayload = {
+                success: true,
+                subreddit_id: data.id,
+                display_name: data.name,
+                weekly_active_users: data.weeklyActiveUsers,
+                description: data.description,
+                icon_img: data.iconUrl,
+                advertiser_category: data.advertiserCategory,
+                created_at: data.createdUtc
+            };
+        } else {
+            throw new Error("404 Not Found");
+        }
+    } catch (primaryError) {
+        primaryErrorMsg = primaryError.message;
+        
+        // --- FALLBACK ATTEMPT ---
+        try {
+            const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
+            if (!upstreamApiKey) throw new Error("Missing fallback API key");
 
-        // The universalCacheMiddleware automatically captures this response and saves it to cache
-        return res.status(200).json({
-            success: true,
-            credits_remaining: req.user.credits,
-            credits_charged: costPerRequest,
-            ...responseData
-        });
+            const targetUrl = new URL('https://api.scrapecreators.com/v1/reddit/subreddit/details');
+            targetUrl.searchParams.append('subreddit', cleanSubreddit);
+            targetUrl.searchParams.append('cache_max_age', cacheMaxAge);
 
-    } catch (error) {
-        const errorMessage = error.message || "Internal Server Error";
-        const isTimeout = error.name === 'TimeoutError';
-        const statusCode = isTimeout ? 504 : 500;
-        const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to respond." 
-            : errorMessage;
+            const fallbackResponse = await fetch(targetUrl.toString(), {
+                method: 'GET',
+                headers: {
+                    'x-api-key': upstreamApiKey,
+                    'Content-Type': 'application/json'
+                },
+                signal: AbortSignal.timeout(10000)
+            });
 
-        // Discord Failure Alert
-        if (typeof notifyFailure === 'function') {
-            notifyFailure({
-                endpoint: '/v1/reddit/subreddit/details',
-                params: { subreddit: cleanSubreddit, cache_max_age: cacheMaxAge },
-                statusCode: statusCode,
-                errorMsg: finalErrorMsg
+            upstreamPayload = await fallbackResponse.json();
+
+            if (!fallbackResponse.ok || upstreamPayload.success === false) {
+                const apiErr = upstreamPayload.error ? upstreamPayload.error.toLowerCase() : "";
+                if (fallbackResponse.status === 404 || apiErr.includes('not found')) {
+                    throw new Error("404 Not Found");
+                }
+                throw new Error(upstreamPayload.error || `HTTP ${fallbackResponse.status}`);
+            }
+
+        } catch (fallbackError) {
+            // Determine clean, white-labeled error for the customer
+            const isTimeout = fallbackError.name === 'TimeoutError' || primaryError.name === 'TimeoutError';
+            const isNotFound = fallbackError.message.includes('404') || primaryErrorMsg.includes('404');
+            
+            let statusCode = 500;
+            let clientErrorMsg = "Internal Server Error: Failed to extract subreddit data at this time.";
+
+            if (isNotFound) {
+                statusCode = 404;
+                clientErrorMsg = "404 Not Found: The requested subreddit does not exist, is banned, or is private.";
+            } else if (isTimeout) {
+                statusCode = 504;
+                clientErrorMsg = "504 Gateway Timeout: Data extraction took too long to complete. Please try again.";
+            }
+
+            // Send detailed internal logs to Discord only
+            if (typeof notifyFailure === 'function') {
+                notifyFailure({
+                    endpoint: '/v1/reddit/subreddit/details',
+                    params: { subreddit: cleanSubreddit },
+                    statusCode: statusCode,
+                    errorMsg: `Primary: ${primaryErrorMsg} | Fallback: ${fallbackError.message}`
+                });
+            }
+
+            return res.status(statusCode).json({
+                success: false,
+                error: clientErrorMsg
             });
         }
-
-        return res.status(statusCode).json({
-            success: false,
-            error: finalErrorMsg
-        });
     }
+
+    const responseData = {
+        subreddit_id: upstreamPayload.subreddit_id || null,
+        display_name: upstreamPayload.display_name || cleanSubreddit,
+        subscribers: upstreamPayload.subscribers || 0,
+        weekly_active_users: upstreamPayload.weekly_active_users || 0,
+        weekly_contributions: upstreamPayload.weekly_contributions || 0,
+        description: upstreamPayload.description || "",
+        rules: upstreamPayload.rules || "",
+        icon_img: upstreamPayload.icon_img || null,
+        header_img: upstreamPayload.header_img || null,
+        advertiser_category: upstreamPayload.advertiser_category || "",
+        created_at: upstreamPayload.created_at || null,
+        submit_text: upstreamPayload.submit_text || ""
+    };
+
+    req.user.credits -= costPerRequest;
+
+    return res.status(200).json({
+        success: true,
+        credits_remaining: req.user.credits,
+        credits_charged: costPerRequest,
+        ...responseData // Excluded provider_used completely
+    });
 });
 
 // --- 2. UPDATED EXPRESS ROUTE ---
 app.get('/v1/reddit/subreddit/posts', authMiddleware, async (req, res) => {
-    const subreddit = req.query.subreddit || req.query.name;
+    const rawInput = req.query.subreddit || req.query.name;
     const sort = req.query.sort || 'hot';
     const timeframe = req.query.timeframe || 'all';
-    
-    // Support both 'cursor' and 'after' for backward compatibility
     const cursor = req.query.cursor || req.query.after || null; 
-    
-    // Parse limit, fallback to 100
     const limit = parseInt(req.query.limit, 10) || 100; 
     const trim = req.query.trim === 'true';
 
-    if (!subreddit) {
+    if (!rawInput) {
         return res.status(400).json({
             success: false,
-            error: "400 Bad Request: Missing required parameter 'subreddit'"
+            error: "400 Bad Request: Missing required parameter 'subreddit' or 'name'"
         });
     }
 
-    if (req.user.credits < 1) {
+    let cleanSubreddit = rawInput.trim().split('?')[0].replace(/\/$/, '');
+    if (cleanSubreddit.includes('reddit.com/r/')) {
+        cleanSubreddit = cleanSubreddit.split('reddit.com/r/')[1].split('/')[0];
+    } else if (cleanSubreddit.startsWith('r/')) {
+        cleanSubreddit = cleanSubreddit.replace(/^r\//, '');
+    }
+
+    const costPerRequest = 1;
+
+    if (req.user.credits < costPerRequest) {
         return res.status(403).json({
             success: false,
-            error: "403 Forbidden: Insufficient credits (Requires 1 credit)"
+            error: `403 Forbidden: Insufficient credits. This request requires ${costPerRequest} credit(s).`
         });
     }
 
-    try {
-        // --- NEW: Use fallback orchestrator ---
-        const result = await redditOrchestrator.execute(
-            () => scrapeSubredditPosts(subreddit, sort, timeframe, cursor, limit),
-            'subreddit/posts'
-        );
+    let postsData = null;
+    let nextCursor = null;
+    let primaryErrorMsg = "";
 
-        if (!result.success) {
-            return res.status(503).json({
-                success: false,
-                error: result.error,
-                details: result.details
-            });
+    try {
+        // --- PRIMARY ATTEMPT: GetAnyAPI ---
+        const getAnyApiKey = process.env.GETANYAPI_KEY;
+        if (!getAnyApiKey) throw new Error("Missing primary API key");
+
+        const getAnyApiBody = {
+            subreddit: cleanSubreddit,
+            sort: sort,
+            limit: limit
+        };
+        
+        if (sort === 'top') {
+            getAnyApiBody.timeframe = timeframe;
+        }
+        if (cursor) {
+            getAnyApiBody.cursor = cursor;
         }
 
-        const formattedPosts = formatRedditPosts(result.data.posts, trim);
-
-        // Always deduct 1 credit (all requests charged, Playwright or fallback)
-        req.user.credits -= result.creditCost;
-
-        const responsePayload = {
-            posts: formattedPosts,
-            next_cursor: result.data.next_cursor
-        };
-
-        // The universalCacheMiddleware automatically captures this response and saves it to cache
-        return res.status(200).json({
-            success: true,
-            credits_remaining: req.user.credits,
-            credits_charged: result.creditCost,
-            ...responsePayload
+        const primaryResponse = await fetch('https://api.getanyapi.com/v1/run/reddit.subreddit_posts', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${getAnyApiKey}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(getAnyApiBody),
+            signal: AbortSignal.timeout(8000)
         });
 
-    } catch (error) {
-        const statusCode = error.statusCode || 500;
-        const errorMessage = error.message || "Internal Server Error";
+        if (!primaryResponse.ok) {
+            throw new Error(`HTTP ${primaryResponse.status}`);
+        }
 
-        if (statusCode >= 500 || statusCode === 403 || statusCode === 429) {
+        const primaryData = await primaryResponse.json();
+
+        if (primaryData.output && primaryData.output.found) {
+            postsData = primaryData.output.data.posts;
+            nextCursor = primaryData.output.data.nextCursor;
+        } else {
+            throw new Error("404 Not Found");
+        }
+
+    } catch (primaryError) {
+        primaryErrorMsg = primaryError.message;
+        
+        // --- FALLBACK ATTEMPT: ScrapeCreators ---
+        try {
+            const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
+            if (!upstreamApiKey) throw new Error("Missing fallback API key");
+
+            const targetUrl = new URL('https://api.scrapecreators.com/v1/reddit/subreddit/posts');
+            targetUrl.searchParams.append('subreddit', cleanSubreddit);
+            targetUrl.searchParams.append('sort', sort);
+            if (timeframe && sort === 'top') targetUrl.searchParams.append('timeframe', timeframe);
+            if (cursor) targetUrl.searchParams.append('cursor', cursor);
+            targetUrl.searchParams.append('limit', limit);
+
+            const fallbackResponse = await fetch(targetUrl.toString(), {
+                method: 'GET',
+                headers: {
+                    'x-api-key': upstreamApiKey,
+                    'Content-Type': 'application/json'
+                },
+                signal: AbortSignal.timeout(12000)
+            });
+
+            const fallbackPayload = await fallbackResponse.json();
+
+            if (!fallbackResponse.ok || fallbackPayload.success === false) {
+                const apiErr = fallbackPayload.error ? fallbackPayload.error.toLowerCase() : "";
+                if (fallbackResponse.status === 404 || apiErr.includes('not found')) {
+                    throw new Error("404 Not Found");
+                }
+                throw new Error(fallbackPayload.error || `HTTP ${fallbackResponse.status}`);
+            }
+
+            postsData = fallbackPayload.posts;
+            nextCursor = fallbackPayload.next_cursor;
+
+        } catch (fallbackError) {
+            // Determine clean, white-labeled error for the customer
+            const isTimeout = fallbackError.name === 'TimeoutError' || primaryError.name === 'TimeoutError';
+            const isNotFound = fallbackError.message.includes('404') || primaryErrorMsg.includes('404');
+            
+            let statusCode = 500;
+            let clientErrorMsg = "Internal Server Error: Failed to extract posts at this time.";
+
+            if (isNotFound) {
+                statusCode = 404;
+                clientErrorMsg = "404 Not Found: The requested subreddit does not exist, is banned, or is private.";
+            } else if (isTimeout) {
+                statusCode = 504;
+                clientErrorMsg = "504 Gateway Timeout: Data extraction took too long to complete. Please try again.";
+            }
+
+            // Send detailed internal logs to Discord only
             if (typeof notifyFailure === 'function') {
                 notifyFailure({
                     endpoint: '/v1/reddit/subreddit/posts',
-                    params: { subreddit, sort, timeframe, cursor, limit, trim },
-                    statusCode,
-                    errorMsg: errorMessage
+                    params: { subreddit: cleanSubreddit, sort, timeframe, cursor, limit, trim },
+                    statusCode: statusCode,
+                    errorMsg: `Primary: ${primaryErrorMsg} | Fallback: ${fallbackError.message}`
                 });
             }
-        }
 
-        return res.status(statusCode).json({
-            success: false,
-            error: `${statusCode}: ${errorMessage}`
-        });
+            return res.status(statusCode).json({
+                success: false,
+                error: clientErrorMsg
+            });
+        }
     }
+
+    const formattedPosts = formatRedditPosts(postsData, trim);
+
+    req.user.credits -= costPerRequest;
+
+    return res.status(200).json({
+        success: true,
+        credits_remaining: req.user.credits,
+        credits_charged: costPerRequest,
+        posts: formattedPosts,
+        next_cursor: nextCursor
+    });
 });
 
 
@@ -512,82 +639,149 @@ app.get('/v1/reddit/subreddit/search', authMiddleware, async (req, res) => {
         });
     }
 
-    // Cache key includes base64 query to safely handle special characters in search terms
+    let upstreamPayload = null;
+    let primaryErrorMsg = "";
 
     try {
+        // --- PRIMARY ATTEMPT: GetAnyAPI ---
+        const getAnyApiKey = process.env.GETANYAPI_KEY;
+        if (!getAnyApiKey) throw new Error("Missing primary API key");
 
-
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
-
-        const targetUrl = new URL('https://api.scrapecreators.com/v1/reddit/subreddit/search');
-        targetUrl.searchParams.append('subreddit', cleanSubreddit);
-        targetUrl.searchParams.append('query', query);
-        targetUrl.searchParams.append('sort', sort);
-        targetUrl.searchParams.append('timeframe', timeframe);
-        
-        // ScrapeCreators natively uses 'cursor' for this specific endpoint
-        if (cursor) {
-            targetUrl.searchParams.append('cursor', cursor);
-        }
-
-        const response = await fetch(targetUrl.toString(), {
-            method: 'GET',
-            headers: {
-                'x-api-key': upstreamApiKey,
-                'Content-Type': 'application/json'
-            },
-            signal: AbortSignal.timeout(15000)
-        });
-
-        const upstreamPayload = await response.json();
-
-        if (!response.ok || upstreamPayload.success === false) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to search subreddit'}`);
-        }
-
-        // --- NAMED 'cursor' AND PLACED AT THE TOP OF THE PAYLOAD ---
-        const responseData = {
-            cursor: upstreamPayload.cursor || null,
-            posts: upstreamPayload.posts || [],
-            comments: upstreamPayload.comments || [],
-            media: upstreamPayload.media || []
+        const getAnyApiBody = {
+            subreddit: cleanSubreddit,
+            query: query,
+            sort: sort,
+            timeframe: timeframe
         };
         
-        req.user.credits -= costPerRequest;
+        if (cursor) {
+            getAnyApiBody.cursor = cursor;
+        }
 
-        return res.status(200).json({
-            success: true,
-            credits_remaining: req.user.credits,
-            credits_charged: costPerRequest,
-            cursor: responseData.cursor,
-            ...responseData // cursor renders right below provider
+        const primaryResponse = await fetch('https://api.getanyapi.com/v1/run/reddit.subreddit_search', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${getAnyApiKey}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(getAnyApiBody),
+            signal: AbortSignal.timeout(8000)
         });
 
-    } catch (error) {
-        const errorMessage = error.message || "Internal Server Error";
-        const isTimeout = error.name === 'TimeoutError';
-        const statusCode = isTimeout ? 504 : (error.statusCode || 500);
-        const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to respond." 
-            : errorMessage;
+        if (!primaryResponse.ok) {
+            throw new Error(`HTTP ${primaryResponse.status}`);
+        }
 
-        if (statusCode >= 500 || statusCode === 403 || statusCode === 429) {
+        const primaryData = await primaryResponse.json();
+
+        if (primaryData.output && primaryData.output.found) {
+            const data = primaryData.output.data;
+            
+            // Map GetAnyAPI schema to expected internal format
+            upstreamPayload = {
+                cursor: data.nextCursor || null,
+                posts: data.posts || [],
+                comments: data.comments || [],
+                media: data.media || []
+            };
+        } else {
+            throw new Error("404 Not Found");
+        }
+
+    } catch (primaryError) {
+        primaryErrorMsg = primaryError.message;
+        
+        // --- FALLBACK ATTEMPT: ScrapeCreators ---
+        try {
+            const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
+            if (!upstreamApiKey) throw new Error("Missing fallback API key");
+
+            const targetUrl = new URL('https://api.scrapecreators.com/v1/reddit/subreddit/search');
+            targetUrl.searchParams.append('subreddit', cleanSubreddit);
+            targetUrl.searchParams.append('query', query);
+            targetUrl.searchParams.append('sort', sort);
+            targetUrl.searchParams.append('timeframe', timeframe);
+            
+            if (cursor) {
+                targetUrl.searchParams.append('cursor', cursor);
+            }
+
+            const fallbackResponse = await fetch(targetUrl.toString(), {
+                method: 'GET',
+                headers: {
+                    'x-api-key': upstreamApiKey,
+                    'Content-Type': 'application/json'
+                },
+                signal: AbortSignal.timeout(12000)
+            });
+
+            const fallbackPayload = await fallbackResponse.json();
+
+            if (!fallbackResponse.ok || fallbackPayload.success === false) {
+                const apiErr = fallbackPayload.error ? fallbackPayload.error.toLowerCase() : "";
+                if (fallbackResponse.status === 404 || apiErr.includes('not found')) {
+                    throw new Error("404 Not Found");
+                }
+                throw new Error(fallbackPayload.error || `HTTP ${fallbackResponse.status}`);
+            }
+
+            upstreamPayload = {
+                cursor: fallbackPayload.cursor || null,
+                posts: fallbackPayload.posts || [],
+                comments: fallbackPayload.comments || [],
+                media: fallbackPayload.media || []
+            };
+
+        } catch (fallbackError) {
+            // Determine clean, white-labeled error for the customer
+            const isTimeout = fallbackError.name === 'TimeoutError' || primaryError.name === 'TimeoutError';
+            const isNotFound = fallbackError.message.includes('404') || primaryErrorMsg.includes('404');
+            
+            let statusCode = 500;
+            let clientErrorMsg = "Internal Server Error: Failed to execute search at this time.";
+
+            if (isNotFound) {
+                statusCode = 404;
+                clientErrorMsg = "404 Not Found: The requested subreddit does not exist or cannot be searched.";
+            } else if (isTimeout) {
+                statusCode = 504;
+                clientErrorMsg = "504 Gateway Timeout: The search query took too long to complete. Please try again.";
+            }
+
+            // Send detailed internal logs to Discord only
             if (typeof notifyFailure === 'function') {
                 notifyFailure({
                     endpoint: '/v1/reddit/subreddit/search',
                     params: { subreddit: cleanSubreddit, query, sort, timeframe, cursor, limit },
                     statusCode: statusCode,
-                    errorMsg: finalErrorMsg
+                    errorMsg: `Primary: ${primaryErrorMsg} | Fallback: ${fallbackError.message}`
                 });
             }
-        }
 
-        return res.status(statusCode).json({
-            success: false,
-            error: finalErrorMsg
-        });
+            return res.status(statusCode).json({
+                success: false,
+                error: clientErrorMsg
+            });
+        }
     }
+
+    // --- NAMED 'cursor' AND PLACED AT THE TOP OF THE PAYLOAD ---
+    const responseData = {
+        cursor: upstreamPayload.cursor,
+        posts: upstreamPayload.posts,
+        comments: upstreamPayload.comments,
+        media: upstreamPayload.media
+    };
+    
+    req.user.credits -= costPerRequest;
+
+    return res.status(200).json({
+        success: true,
+        credits_remaining: req.user.credits,
+        credits_charged: costPerRequest,
+        cursor: responseData.cursor,
+        ...responseData // cursor renders right below provider info
+    });
 });
 
 const { scrapePostComments } = require('./src/scrapers/reddit');
@@ -601,9 +795,6 @@ app.get('/v1/reddit/post/comments', authMiddleware, async (req, res) => {
     const cursor = req.query.cursor || req.query.after || null;
     const trim = req.query.trim === 'true';
     
-    // Limit is tracked for cache keys and internal webhooks, but ScrapeCreators handles volume implicitly
-    const limit = parseInt(req.query.limit, 10) || 100;
-
     if (!postUrl) {
         return res.status(400).json({
             success: false,
@@ -628,84 +819,150 @@ app.get('/v1/reddit/post/comments', authMiddleware, async (req, res) => {
         });
     }
 
-    // Extract the post ID (e.g., "ablzuq") from the URL for a clean cache key
-    const urlParts = postUrl.split('/comments/');
-    const postId = urlParts.length > 1 ? urlParts[1].split('/')[0] : 'unknown';
-    
-    // Cache key incorporates the cursor and trim parameter
+    let upstreamPayload = { comments: [] };
+    let primaryErrorMsg = "";
 
     try {
- 
+        // --- PRIMARY ATTEMPT: GetAnyAPI ---
+        const getAnyApiKey = process.env.GETANYAPI_KEY;
+        if (!getAnyApiKey) throw new Error("Missing primary API key");
 
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
-
-        const targetUrl = new URL('https://api.scrapecreators.com/v1/reddit/post/comments');
-        targetUrl.searchParams.append('url', postUrl);
-        
-        if (cursor) {
-            targetUrl.searchParams.append('cursor', cursor);
-        }
-        if (trim) {
-            targetUrl.searchParams.append('trim', 'true');
-        }
-
-        const response = await fetch(targetUrl.toString(), {
-            method: 'GET',
-            headers: {
-                'x-api-key': upstreamApiKey,
-                'Content-Type': 'application/json'
-            },
-            signal: AbortSignal.timeout(15000)
-        });
-
-        const upstreamPayload = await response.json();
-
-        if (!response.ok || upstreamPayload.success === false) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch post comments'}`);
-        }
-
-        // --- PLACED AT THE TOP: 'more' object containing the pagination cursor ---
-        const responseData = {
-            more: upstreamPayload.more || null, 
-            post: upstreamPayload.post || null,
-            comments: upstreamPayload.comments || []
+        const getAnyApiBody = {
+            url: postUrl
         };
         
-        req.user.credits -= costPerRequest;
+        if (cursor) {
+            getAnyApiBody.cursor = cursor;
+        }
 
-        return res.status(200).json({
-            success: true,
-            credits_remaining: req.user.credits,
-            credits_charged: costPerRequest,
-            cursor: responseData.cursor,
-            ...responseData // 'more' renders right below provider
+        const primaryResponse = await fetch('https://api.getanyapi.com/v1/run/reddit.post_comments', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${getAnyApiKey}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(getAnyApiBody),
+            signal: AbortSignal.timeout(8000)
         });
 
-    } catch (error) {
-        const errorMessage = error.message || "Internal Server Error";
-        const isTimeout = error.name === 'TimeoutError';
-        const statusCode = isTimeout ? 504 : (error.statusCode || 500);
-        const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to respond." 
-            : errorMessage;
+        if (!primaryResponse.ok) {
+            throw new Error(`HTTP ${primaryResponse.status}`);
+        }
 
-        if (statusCode >= 500 || statusCode === 403 || statusCode === 429) {
+        const primaryData = await primaryResponse.json();
+
+        if (primaryData.output && primaryData.output.found) {
+            // GetAnyAPI groups comments array and nextCursor inside output.data
+            // We need to map this back to the expected schema
+            const data = primaryData.output.data;
+            
+            // Reconstruct the 'more' object expected by the frontend
+            const moreObject = data.nextCursor ? { id: data.nextCursor } : null;
+            
+            // GetAnyAPI doesn't return the parent 'post' metadata in this endpoint, 
+            // so we'll leave it null, just like the fallback might if it trims it.
+            upstreamPayload = {
+                more: moreObject,
+                post: null, 
+                comments: data.comments || [],
+                cursor: data.nextCursor || null
+            };
+        } else {
+            throw new Error("404 Not Found");
+        }
+
+    } catch (primaryError) {
+        primaryErrorMsg = primaryError.message;
+        
+        // --- FALLBACK ATTEMPT: ScrapeCreators ---
+        try {
+            const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
+            if (!upstreamApiKey) throw new Error("Missing fallback API key");
+
+            const targetUrl = new URL('https://api.scrapecreators.com/v1/reddit/post/comments');
+            targetUrl.searchParams.append('url', postUrl);
+            
+            if (cursor) {
+                targetUrl.searchParams.append('cursor', cursor);
+            }
+            if (trim) {
+                targetUrl.searchParams.append('trim', 'true');
+            }
+
+            const fallbackResponse = await fetch(targetUrl.toString(), {
+                method: 'GET',
+                headers: {
+                    'x-api-key': upstreamApiKey,
+                    'Content-Type': 'application/json'
+                },
+                signal: AbortSignal.timeout(12000)
+            });
+
+            const fallbackPayload = await fallbackResponse.json();
+
+            if (!fallbackResponse.ok || fallbackPayload.success === false) {
+                const apiErr = fallbackPayload.error ? fallbackPayload.error.toLowerCase() : "";
+                if (fallbackResponse.status === 404 || apiErr.includes('not found') || apiErr.includes('invalid url')) {
+                    throw new Error("404 Not Found");
+                }
+                throw new Error(fallbackPayload.error || `HTTP ${fallbackResponse.status}`);
+            }
+
+            // Map the ScrapeCreators payload directly
+            upstreamPayload = {
+                more: fallbackPayload.more || null,
+                post: fallbackPayload.post || null,
+                comments: fallbackPayload.comments || [],
+                cursor: fallbackPayload.cursor || null
+            };
+
+        } catch (fallbackError) {
+            // Determine clean, white-labeled error for the customer
+            const isTimeout = fallbackError.name === 'TimeoutError' || primaryError.name === 'TimeoutError';
+            const isNotFound = fallbackError.message.includes('404') || primaryErrorMsg.includes('404');
+            
+            let statusCode = 500;
+            let clientErrorMsg = "Internal Server Error: Failed to extract comments at this time.";
+
+            if (isNotFound) {
+                statusCode = 404;
+                clientErrorMsg = "404 Not Found: The requested post does not exist, was deleted, or the URL is invalid.";
+            } else if (isTimeout) {
+                statusCode = 504;
+                clientErrorMsg = "504 Gateway Timeout: Data extraction took too long to complete. Please try again.";
+            }
+
+            // Send detailed internal logs to Discord only
             if (typeof notifyFailure === 'function') {
                 notifyFailure({
                     endpoint: '/v1/reddit/post/comments',
-                    params: { postUrl, cursor, limit, trim },
+                    params: { postUrl, cursor, trim },
                     statusCode: statusCode,
-                    errorMsg: finalErrorMsg
+                    errorMsg: `Primary: ${primaryErrorMsg} | Fallback: ${fallbackError.message}`
                 });
             }
-        }
 
-        return res.status(statusCode).json({
-            success: false,
-            error: finalErrorMsg
-        });
+            return res.status(statusCode).json({
+                success: false,
+                error: clientErrorMsg
+            });
+        }
     }
+    
+    // Fallback cursor mapping logic (in case GetAnyAPI returns nextCursor but we need it at top level)
+    const activeCursor = upstreamPayload.cursor || (upstreamPayload.more ? upstreamPayload.more.id : null);
+
+    req.user.credits -= costPerRequest;
+
+    return res.status(200).json({
+        success: true,
+        credits_remaining: req.user.credits,
+        credits_charged: costPerRequest,
+        cursor: activeCursor,
+        more: upstreamPayload.more,
+        post: upstreamPayload.post,
+        comments: upstreamPayload.comments
+    });
 });
 const { scrapeGlobalSearch } = require('./src/scrapers/reddit');
 
@@ -949,7 +1206,7 @@ app.get('/v1/instagram/user/posts', authMiddleware, async (req, res) => {
         cleanHandle = cleanHandle.split('instagram.com/')[1].split('/')[0];
     }
 
-    const costPerRequest = 2; // DaaS markup
+    const costPerRequest = 1; // DaaS markup
 
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({
@@ -3329,7 +3586,7 @@ app.get('/v1/tiktok/video/comments', authMiddleware, async (req, res) => {
     }
 
     // 2. Pre-flight Credit Check (1 credit)
-    const costPerRequest = 2;
+    const costPerRequest = 1;
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({ 
             success: false, 
@@ -3704,7 +3961,7 @@ app.get('/v1/tiktok/profile/videos', authMiddleware, async (req, res) => {
     }
 
     // Dynamic Pricing Logic: 1 credit
-    const costPerRequest = 2;
+    const costPerRequest = 1;
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({ 
             success: false, 
@@ -4002,7 +4259,7 @@ app.get('/v1/tiktok/collection/videos', authMiddleware, async (req, res) => {
     }
 
     // Dynamic Pricing Logic: Base is 1 credit.
-    const costPerRequest = 2;
+    const costPerRequest = 1;
 
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({
