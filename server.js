@@ -2057,7 +2057,7 @@ app.get('/v1/youtube/channel/videos', authMiddleware, async (req, res) => {
 
     // Dynamic Pricing Logic: Base is 1 credit as per spec. 
     // You can adjust this if includeExtras adds more cost later.
-    const costPerRequest = 2;
+    const costPerRequest = 1;
 
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({
@@ -2170,7 +2170,7 @@ app.get('/v1/youtube/channel/playlists', authMiddleware, async (req, res) => {
     }
 
     // Dynamic Pricing Logic: Base is 1 credit as per spec.
-    const costPerRequest = 2;
+    const costPerRequest = 1;
 
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({
@@ -2276,7 +2276,7 @@ app.get('/v1/youtube/channel/lives', authMiddleware, async (req, res) => {
     }
 
     // Dynamic Pricing Logic: Base is 1 credit as per spec.
-    const costPerRequest = 2;
+    const costPerRequest = 1;
 
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({
@@ -2382,7 +2382,7 @@ app.get('/v1/youtube/channel/community-posts', authMiddleware, async (req, res) 
     }
 
     // Dynamic Pricing Logic: Base is 1 credit as per spec.
-    const costPerRequest = 2;
+    const costPerRequest = 1;
 
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({
@@ -2491,7 +2491,7 @@ app.get('/v1/youtube/channel/shorts', authMiddleware, async (req, res) => {
     }
 
     // Dynamic Pricing Logic: Base is 1 credit.
-    const costPerRequest = 2;
+    const costPerRequest = 1;
 
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({
@@ -2680,7 +2680,7 @@ app.get('/v1/youtube/transcript', authMiddleware, async (req, res) => {
     }
 
     // Dynamic Pricing Logic: Premium endpoint, charging 2 credits for a 2x markup.
-    const costPerRequest = 2;
+    const costPerRequest = 1;
 
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({
@@ -2791,7 +2791,7 @@ app.get('/v1/youtube/search', authMiddleware, async (req, res) => {
     }
 
     // Dynamic Pricing Logic: Base is 1 credit.
-    const costPerRequest = 2;
+    const costPerRequest = 1;
 
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({
