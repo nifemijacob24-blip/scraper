@@ -1823,7 +1823,7 @@ app.get('/v1/instagram/post/comments', authMiddleware, async (req, res) => {
     }
 
     // Dynamic Pricing Logic: Base is 2 credits, Replies are 30 credits (2x markup)
-    const costPerRequest = includeReplies ? 30 : 2;
+    const costPerRequest = includeReplies ? 15 : 2;
 
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({
