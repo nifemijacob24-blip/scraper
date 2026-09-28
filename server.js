@@ -3036,7 +3036,7 @@ app.get('/v1/google/search', authMiddleware, async (req, res) => {
     }
 
     // Dynamic Pricing Logic: Base is 1 credit.
-    const costPerRequest = 2;
+    const costPerRequest = 1;
 
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({
@@ -4713,7 +4713,7 @@ app.get('/v1/linkedin/company/posts', authMiddleware, async (req, res) => {
     }
 
     // 2. Pre-flight Credit Check (Charges 3 Credits as requested)
-    const costToUser = 3;
+    const costToUser = 2;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
             success: false, 
@@ -4823,7 +4823,7 @@ app.get('/v1/linkedin/search/posts', authMiddleware, async (req, res) => {
     }
 
     // 2. Pre-flight Credit Check (Charges 3 Credits for a 3x Markup)
-    const costToUser = 3;
+    const costToUser = 2;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
             success: false, 
