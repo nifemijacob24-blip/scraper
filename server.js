@@ -70,10 +70,12 @@ app.post('/api/webhook/dodo', express.raw({ type: 'application/json' }), async (
                 // Determine how many credits to add based on the tier
                 let creditsToAdd = 0;
                 
-                if (tier === 'freelance') {
+                if (tier === 'starter') {
+                    creditsToAdd = 7500;
+                } else if (tier === 'freelance') {
                     creditsToAdd = 25000;
                 } else if (tier === 'business') {
-                    creditsToAdd = 500000;
+                    creditsToAdd = 400000;
                 } else {
                     console.warn(`Unrecognized tier mapped in webhook: ${tier}`);
                 }
@@ -125,7 +127,8 @@ app.use(express.json());
 // --- 3. CHECKOUT ROUTE ---
 const DODO_PRODUCTS = {
     freelance: 'pdt_0Nm64vHyFBNMYQ8psOOvG',   // $43 / 25k credits
-    business: 'pdt_0Nm65NK5dcgDghkgeaYD5'      // $448 / 500k credits
+    business: 'pdt_0Nm65NK5dcgDghkgeaYD5',
+    starter:   'pdt_0Noa0SXDyHzMb0Ak1Efy1'
 };
 
 // ** NOTE: Make sure your `authMiddleware` function is defined below here in your file! **
