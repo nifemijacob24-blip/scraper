@@ -62,3 +62,5 @@ async function scrapeTrustpilotSearch(query) {
     const ssrData = JSON.parse(scriptContent);
     return extractTrustpilotBusinesses(ssrData);
 }
+
+module.exports = { scrapeTrustpilotSearch,scrapeTrustpilotReviews };
