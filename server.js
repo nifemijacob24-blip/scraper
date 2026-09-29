@@ -4347,7 +4347,7 @@ app.get('/v1/tiktok/collection/videos', authMiddleware, async (req, res) => {
 // @ts-nocheck
 /* eslint-disable */
 
-const { scrapeLinkedInProfile } = require('./linkedinScraper'); // Adjust path as needed
+const { scrapeLinkedInProfile } = require('./src/scrapers/linkedinScraper'); // Adjust path as needed
 
 app.get('/v1/linkedin/profile', authMiddleware, async (req, res) => {
     let targetLinkedInUrl = req.query.url;
