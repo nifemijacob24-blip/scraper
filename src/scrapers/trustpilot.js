@@ -1,6 +1,7 @@
 const axios = require('axios');
 const cheerio = require('cheerio');
 const { HttpsProxyAgent } = require('https-proxy-agent');
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
 async function scrapeTrustpilotReviews(domain, pageNum = 1, sort = 'recency', stars = '') {
     if (!process.env.PROXY_URL) throw new Error("PROXY_URL missing from environment");
