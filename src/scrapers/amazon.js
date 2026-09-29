@@ -5,6 +5,9 @@ const { HttpsProxyAgent } = require('https-proxy-agent');
 const axios = require('axios');
 const cheerio = require('cheerio');
 
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
+
 chromium.use(stealth);
 
 const MARKETPLACE_MAP = {
