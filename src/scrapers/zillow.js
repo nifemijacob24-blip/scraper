@@ -1,46 +1,41 @@
-// @ts-nocheck
-/* eslint-disable */
-
 const axios = require('axios');
 const cheerio = require('cheerio');
-const { HttpsProxyAgent } = require('https-proxy-agent');
-
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
 async function scrapeZillowSearchAPI(location, pageNum = 1) {
-    if (!process.env.PROXY_URL) throw new Error("PROXY_URL missing from environment");
+    if (!process.env.SCRAPER_API_KEY) throw new Error("SCRAPER_API_KEY missing from environment");
 
     const cleanLocation = encodeURIComponent(location.trim().replace(/\s+/g, '-'));
     const pagePath = pageNum > 1 ? `${pageNum}_p/` : '';
     const targetUrl = `https://www.zillow.com/homes/${cleanLocation}_rb/${pagePath}`;
 
-    const response = await axios.get(targetUrl, {
-        httpsAgent: new HttpsProxyAgent(process.env.PROXY_URL),
-        timeout: 60000,
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-        }
+    const response = await axios.get('https://api.scraperapi.com/', {
+        params: {
+            api_key: process.env.SCRAPER_API_KEY,
+            url: targetUrl,
+            premium: 'true',      // Crucial: Forces Residential IPs to bypass PerimeterX
+            country_code: 'us'    // Forces US proxies for Zillow localization
+        },
+        timeout: 60000 // Allow up to 60s for the API to retry and rotate IPs internally
     });
 
-    const parser = cheerio.load(response.data);
-    const pageTitle = parser('title').text();
+    const $ = cheerio.load(response.data);
     
-    // Safety check: Did PerimeterX somehow block the residential IP?
-    if (pageTitle.includes('Robot') || response.data.includes('Pardon Our Interruption')) {
-        throw new Error("PerimeterX blocked the proxy. The provider will rotate IPs on the next request.");
+    // Safety check: Did PerimeterX somehow block the Scraping API's residential IP?
+    if ($('title').text().includes('Robot') || response.data.includes('Pardon Our Interruption')) {
+        throw new Error("PerimeterX blocked the Scraping API. The provider will rotate IPs on the next request.");
     }
 
     let finalPayload = null;
     
     // Check standard Next.js state
-    const nextData = parser('#__NEXT_DATA__').html();
+    const nextData = $('#__NEXT_DATA__').html();
     if (nextData) {
         try { finalPayload = JSON.parse(nextData); } catch (e) {}
     }
     
     // Check Apollo GraphQL state (Zillow's newer architecture)
     if (!finalPayload) {
-        const apolloData = parser('#hdpApolloPreloadedData').html();
+        const apolloData = $('#hdpApolloPreloadedData').html();
         if (apolloData) {
             try { finalPayload = JSON.parse(apolloData); } catch (e) {}
         }
@@ -54,36 +49,37 @@ async function scrapeZillowSearchAPI(location, pageNum = 1) {
 }
 
 async function scrapeZillowDetailAPI(zpid, url) {
-    if (!process.env.PROXY_URL) throw new Error("PROXY_URL missing from environment");
+    if (!process.env.SCRAPER_API_KEY) throw new Error("SCRAPER_API_KEY missing from environment");
 
     let targetUrl = url;
     if (!targetUrl && zpid) {
         targetUrl = `https://www.zillow.com/homedetails/${zpid.trim()}_zpid/`;
     }
 
-    const response = await axios.get(targetUrl, {
-        httpsAgent: new HttpsProxyAgent(process.env.PROXY_URL),
-        timeout: 60000,
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-        }
+    const response = await axios.get('https://api.scraperapi.com/', {
+        params: {
+            api_key: process.env.SCRAPER_API_KEY,
+            url: targetUrl,
+            premium: 'true',
+            country_code: 'us'
+        },
+        timeout: 60000 
     });
 
-    const parser = cheerio.load(response.data);
-    const pageTitle = parser('title').text();
+    const $ = cheerio.load(response.data);
     
-    if (pageTitle.includes('Robot') || response.data.includes('Pardon Our Interruption')) {
-        throw new Error("PerimeterX blocked the proxy. The provider will rotate IPs on the next request.");
+    if ($('title').text().includes('Robot') || response.data.includes('Pardon Our Interruption')) {
+        throw new Error("PerimeterX blocked the Scraping API. The provider will rotate IPs on the next request.");
     }
 
     let finalPayload = null;
-    const nextData = parser('#__NEXT_DATA__').html();
+    const nextData = $('#__NEXT_DATA__').html();
     if (nextData) {
         try { finalPayload = JSON.parse(nextData); } catch (e) {}
     }
     
     if (!finalPayload) {
-        const apolloData = parser('#hdpApolloPreloadedData').html();
+        const apolloData = $('#hdpApolloPreloadedData').html();
         if (apolloData) {
             try { finalPayload = JSON.parse(apolloData); } catch (e) {}
         }
@@ -107,33 +103,22 @@ function extractZillowListings(payload) {
             results = payload.searchPageState.cat1.searchResults.listResults; 
         }
 
-        listings = results.map(item => {
-            let detailUrl = "";
-            if (item.detailUrl) {
-                if (item.detailUrl.startsWith('http')) {
-                    detailUrl = item.detailUrl;
-                } else {
-                    detailUrl = `https://www.zillow.com${item.detailUrl}`;
-                }
-            }
-
-            return {
-                zpid: item.zpid || "",
-                status: item.statusType || item.statusText || "",
-                price: item.price || item.unformattedPrice || "",
-                address: item.address || "",
-                address_zip: item.addressZipcode || "",
-                beds: item.beds || 0,
-                baths: item.baths || 0,
-                area_sqft: item.area || 0,
-                property_type: item.propertyTypeDimension || item.sgapt || "",
-                latitude: item.latLong?.latitude || null,
-                longitude: item.latLong?.longitude || null,
-                broker_name: item.brokerName || "",
-                image_url: item.imgSrc || "",
-                detail_url: detailUrl
-            };
-        });
+        listings = results.map(item => ({
+            zpid: item.zpid || "",
+            status: item.statusType || item.statusText || "",
+            price: item.price || item.unformattedPrice || "",
+            address: item.address || "",
+            address_zip: item.addressZipcode || "",
+            beds: item.beds || 0,
+            baths: item.baths || 0,
+            area_sqft: item.area || 0,
+            property_type: item.propertyTypeDimension || item.sgapt || "",
+            latitude: item.latLong?.latitude || null,
+            longitude: item.latLong?.longitude || null,
+            broker_name: item.brokerName || "",
+            image_url: item.imgSrc || "",
+            detail_url: item.detailUrl ? (item.detailUrl.startsWith('http') ? item.detailUrl : `https://www.zillow.com${item.detailUrl}`) : ""
+        }));
     } catch (e) { }
     return listings;
 }
