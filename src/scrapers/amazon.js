@@ -1,15 +1,12 @@
-
 const { chromium } = require('playwright-extra');
 const stealth = require('puppeteer-extra-plugin-stealth')();
 const { ApifyClient } = require('apify-client');
-
-
-chromium.use(stealth);
-
+const { HttpsProxyAgent } = require('https-proxy-agent');
 const axios = require('axios');
 const cheerio = require('cheerio');
 
-// Map user-friendly marketplace codes to Amazon TLDs and ScraperAPI country codes
+chromium.use(stealth);
+
 const MARKETPLACE_MAP = {
     us: { domain: 'amazon.com', country: 'us' },
     uk: { domain: 'amazon.co.uk', country: 'gb' },
@@ -24,86 +21,99 @@ const MARKETPLACE_MAP = {
 };
 
 async function scrapeAmazonSearchAPI(keyword, marketplace = 'us', page = 1) {
-    if (!process.env.SCRAPER_API_KEY) throw new Error("SCRAPER_API_KEY missing from environment");
+    if (!process.env.PROXY_URL) throw new Error("PROXY_URL missing from environment");
 
     const code = marketplace.toLowerCase().trim();
-    const targetMarket = MARKETPLACE_MAP[code] || MARKETPLACE_MAP['us'];
+    let targetMarket = MARKETPLACE_MAP[code];
+    if (!targetMarket) {
+        targetMarket = MARKETPLACE_MAP['us'];
+    }
 
-    const pageNum = parseInt(page, 10) || 1;
+    let pageNum = parseInt(page, 10);
+    if (!pageNum) {
+        pageNum = 1;
+    }
+
     const encodedKeyword = encodeURIComponent(keyword.trim());
     const searchUrl = `https://www.${targetMarket.domain}/s?k=${encodedKeyword}&page=${pageNum}`;
 
-    const response = await axios.get('https://api.scraperapi.com/', {
-        params: {
-            api_key: process.env.SCRAPER_API_KEY,
-            url: searchUrl,
-            premium: 'true',
-            country_code: targetMarket.country,
-            render: 'true'
-        },
-        timeout: 60000
+    const response = await axios.get(searchUrl, {
+        httpsAgent: new HttpsProxyAgent(process.env.PROXY_URL),
+        timeout: 60000,
+        headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        }
     });
 
-    const $ = cheerio.load(response.data);
+    const parser = cheerio.load(response.data);
+    const pageTitle = parser('title').text();
 
-    // FIX: Replaced \vert{}\vert{} with standard JavaScript ||
-    if ($('title').text().includes('Robot Check') || $('title').text().includes('CAPTCHA')) {
-        throw new Error("Amazon served a CAPTCHA to the proxy. Retry request.");
-    }
+    if (pageTitle.includes('Robot Check')) throw new Error("Amazon served a CAPTCHA. Retry request.");
+    if (pageTitle.includes('CAPTCHA')) throw new Error("Amazon served a CAPTCHA. Retry request.");
 
     const products = [];
     const seenAsins = new Set();
 
-    // Target all search result card containers with a valid ASIN
-    $('div[data-asin]:not([data-asin=""])').each((i, el) => {
-        const $el =$(el);
-        const asin = $el.attr('data-asin')?.trim();
+    parser('div[data-asin]:not([data-asin=""])').each((i, el) => {
+        const element = parser(el);
+        const asin = element.attr('data-asin')?.trim();
 
-        if (!asin || asin.length !== 10 || seenAsins.has(asin)) return;
+        if (!asin) return;
+        if (asin.length !== 10) return;
+        if (seenAsins.has(asin)) return;
 
-        // Extract Title
-        let name = $el.find('h2 a span, h2 span, h2 a').first().text().trim();
+        let name = element.find('h2 a span, h2 span, h2 a').first().text().trim();
         if (!name) {
-            name = $el.find('img.s-image').attr('alt')?.trim() || "";
+            const altText = element.find('img.s-image').attr('alt');
+            if (altText) {
+                name = altText.trim();
+            } else {
+                name = "";
+            }
         }
 
-        // Filter out promotional ads/banners that carry an ASIN but no real title
-        if (!name || name.toLowerCase().includes('overall pick') || name.toLowerCase().includes('featured from our brands')) {
-            return;
-        }
+        if (!name) return;
+        const lowerName = name.toLowerCase();
+        if (lowerName.includes('overall pick')) return;
+        if (lowerName.includes('featured from our brands')) return;
 
-        // Extract Price
         let price = null;
-        const priceOffscreen = $el.find('.a-price .a-offscreen').first().text().trim();
+        const priceOffscreen = element.find('.a-price .a-offscreen').first().text().trim();
         if (priceOffscreen) {
-            const priceMatch = priceOffscreen.match(/[\d,]+\.\d{2}/) || priceOffscreen.match(/[\d,]+/);
+            let priceMatch = priceOffscreen.match(/[\d,]+\.\d{2}/);
+            if (!priceMatch) {
+                priceMatch = priceOffscreen.match(/[\d,]+/);
+            }
             if (priceMatch) {
                 price = parseFloat(priceMatch[0].replace(/,/g, ''));
             }
         }
 
-        // Fallback for whole + fraction price spans
         if (price === null) {
-            const whole = $el.find('.a-price-whole').first().text().replace(/[^0-9]/g, '');
-            const fraction = $el.find('.a-price-fraction').first().text().replace(/[^0-9]/g, '') || '00';
+            const whole = element.find('.a-price-whole').first().text().replace(/[^0-9]/g, '');
+            let fraction = element.find('.a-price-fraction').first().text().replace(/[^0-9]/g, '');
+            if (!fraction) {
+                fraction = '00';
+            }
             if (whole) {
                 price = parseFloat(`${whole}.${fraction}`);
             }
         }
 
-        // Extract Rating
         let rating = null;
-        const ratingText = $el.find('i[class*="a-icon-star"] span, .a-icon-alt').first().text().trim();
+        const ratingText = element.find('i[class*="a-icon-star"] span, .a-icon-alt').first().text().trim();
         if (ratingText) {
-            const ratingMatch = ratingText.match(/([\d.]+)\s*out of/i) || ratingText.match(/^([\d.]+)/);
+            let ratingMatch = ratingText.match(/([\d.]+)\s*out of/i);
+            if (!ratingMatch) {
+                ratingMatch = ratingText.match(/^([\d.]+)/);
+            }
             if (ratingMatch) {
                 rating = parseFloat(ratingMatch[1]);
             }
         }
 
-        // Extract Reviews Count
         let reviews_count = null;
-        const reviewsText = $el.find('span[aria-label*="ratings"], a[href*="#customerReviews"] span, span.a-size-base.s-underline-text').first().text().trim();
+        const reviewsText = element.find('span[aria-label*="ratings"], a[href*="#customerReviews"] span, span.a-size-base.s-underline-text').first().text().trim();
         if (reviewsText) {
             const reviewsMatch = reviewsText.replace(/,/g, '').match(/\d+/);
             if (reviewsMatch) {
@@ -111,9 +121,10 @@ async function scrapeAmazonSearchAPI(keyword, marketplace = 'us', page = 1) {
             }
         }
 
-        // Extract Image
-        // Extract Image
-        const image = $el.find('img.s-image').attr('src') || "";
+        let image = element.find('img.s-image').attr('src');
+        if (!image) {
+            image = "";
+        }
 
         seenAsins.add(asin);
         products.push({
@@ -127,7 +138,6 @@ async function scrapeAmazonSearchAPI(keyword, marketplace = 'us', page = 1) {
         });
     });
 
-    // FIX: Return the raw array so the orchestrator's internal .length check succeeds
     return products;
 }
 
@@ -139,38 +149,36 @@ const cleanText = (str) => {
 };
 
 async function scrapeAmazonProductAPI(asin, marketplace = 'us') {
-    if (!process.env.SCRAPER_API_KEY) throw new Error("SCRAPER_API_KEY missing from environment");
+    if (!process.env.PROXY_URL) throw new Error("PROXY_URL missing from environment");
 
     const code = marketplace.toLowerCase().trim();
-    const targetMarket = MARKETPLACE_MAP[code] || MARKETPLACE_MAP['us'];
+    let targetMarket = MARKETPLACE_MAP[code];
+    if (!targetMarket) {
+        targetMarket = MARKETPLACE_MAP['us'];
+    }
+    
     const cleanAsin = asin.toUpperCase().trim();
-
     const targetUrl = `https://www.${targetMarket.domain}/dp/${cleanAsin}?th=1&psc=1`;
 
-    const response = await axios.get('https://api.scraperapi.com/', {
-        params: {
-            api_key: process.env.SCRAPER_API_KEY,
-            url: targetUrl,
-            premium: 'true',
-            country_code: targetMarket.country,
-            render: 'true'
-        },
-        timeout: 60000
+    const response = await axios.get(targetUrl, {
+        httpsAgent: new HttpsProxyAgent(process.env.PROXY_URL),
+        timeout: 60000,
+        headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        }
     });
 
-    const $ = cheerio.load(response.data);
-    const htmlBody = $.html();
+    const parser = cheerio.load(response.data);
+    const htmlBody = parser.html();
+    const pageTitle = parser('title').text();
 
-    if ($('title').text().includes('Robot Check') || $('title').text().includes('CAPTCHA')) {
-        throw new Error("Amazon served a CAPTCHA to the proxy. The provider will rotate IPs on the next request.");
-    }
+    if (pageTitle.includes('Robot Check')) throw new Error("Amazon served a CAPTCHA. Retry request.");
+    if (pageTitle.includes('CAPTCHA')) throw new Error("Amazon served a CAPTCHA. Retry request.");
 
-    const title = $('#productTitle').text().trim();
+    const title = parser('#productTitle').text().trim();
     if (!title) {
-        throw new Error(`Product not found. The ASIN '${cleanAsin}' may be invalid or unavailable in the '${code}' marketplace.`);
+        throw new Error(`Product not found. The ASIN '${cleanAsin}' may be invalid.`);
     }
-
-    const cleanText = (text) => text ? text.replace(/\s+/g, ' ').trim() : '';
 
     const product = {
         asin: cleanAsin,
@@ -191,51 +199,60 @@ async function scrapeAmazonProductAPI(asin, marketplace = 'us') {
         url: targetUrl
     };
 
-    // --- 1. HIDDEN JSON-LD SCHEMA EXTRACTION ---
-    $('script[type="application/ld+json"]').each((_, el) => {
+    parser('script[type="application/ld+json"]').each((_, el) => {
         try {
-            const data = JSON.parse($(el).html());
-            const item = Array.isArray(data) ? data[0] : data;
+            const data = JSON.parse(parser(el).html());
+            let item = data;
+            if (Array.isArray(data)) {
+                item = data[0];
+            }
             if (item['@type'] === 'Product' || item['@type'] === 'ItemPage') {
                 if (item.brand && item.brand.name) product.brand = cleanText(item.brand.name);
                 if (item.description) product.about_product = cleanText(item.description);
                 
-                // Fix: Handle when Amazon wraps 'offers' in an array
                 let offers = item.offers;
                 if (Array.isArray(offers)) {
                     offers = offers.find(o => o.price || o.lowPrice);
                 }
                 
                 if (offers) {
-                    if (offers.price) product.price = parseFloat(offers.price);
-                    else if (offers.lowPrice) product.price = parseFloat(offers.lowPrice); 
+                    if (offers.price) {
+                        product.price = parseFloat(offers.price);
+                    } else if (offers.lowPrice) {
+                        product.price = parseFloat(offers.lowPrice);
+                    }
                     
-                    if (offers.priceCurrency) {
-                        if (offers.priceCurrency === 'GBP') product.currency = '£';
-                        else if (offers.priceCurrency === 'EUR') product.currency = '€';
+                    if (offers.priceCurrency === 'GBP') {
+                        product.currency = '£';
+                    } else if (offers.priceCurrency === 'EUR') {
+                        product.currency = '€';
                     }
                 }
             }
         } catch (e) {}
     });
 
-    // --- 2. BRAND FALLBACKS ---
     if (!product.brand) {
-        let brandText = $('#bylineInfo, #brand, .po-brand .a-span9').first().text();
+        let brandText = parser('#bylineInfo, #brand, .po-brand .a-span9').first().text();
         brandText = cleanText(brandText).replace(/^Visit the /i, '').replace(/ Store$/i, '').replace(/^Brand:\s*/i, '');
-        product.brand = brandText || title.split(' ')[0]; 
+        if (brandText) {
+            product.brand = brandText;
+        } else {
+            product.brand = title.split(' ')[0];
+        }
     }
 
-    // --- 3A. HIDDEN TWISTER INPUT EXTRACTION ---
     if (!product.price) {
-        const twisterPrice = $('#twister-plus-price-data-price').val() || $('#twister-plus-price-data-price-core').val();
+        let twisterPrice = parser('#twister-plus-price-data-price').val();
+        if (!twisterPrice) {
+            twisterPrice = parser('#twister-plus-price-data-price-core').val();
+        }
         if (twisterPrice) {
             const parsed = parseFloat(twisterPrice);
             if (!isNaN(parsed) && parsed > 0) product.price = parsed;
         }
     }
 
-    // --- 3B. AGGRESSIVE DOM PRICE EXTRACTION (BUY BOX) ---
     if (!product.price) {
         const priceSelectors = [
             '#corePriceDisplay_desktop_feature_div .a-price .a-offscreen',
@@ -251,10 +268,13 @@ async function scrapeAmazonProductAPI(asin, marketplace = 'us') {
         ];
 
         for (const selector of priceSelectors) {
-            $(selector).each((_, el) => {
+            parser(selector).each((_, el) => {
                 if (product.price) return;
-                const priceText = $(el).text();
-                const priceMatch = priceText.replace(/\s/g, '').match(/[\d,]+\.\d{2}/) || priceText.replace(/\s/g, '').match(/[\d,]+/);
+                const priceText = parser(el).text();
+                let priceMatch = priceText.replace(/\s/g, '').match(/[\d,]+\.\d{2}/);
+                if (!priceMatch) {
+                    priceMatch = priceText.replace(/\s/g, '').match(/[\d,]+/);
+                }
                 
                 if (priceMatch) {
                     const parsedPrice = parseFloat(priceMatch[0].replace(/,/g, ''));
@@ -269,7 +289,6 @@ async function scrapeAmazonProductAPI(asin, marketplace = 'us') {
         }
     }
 
-    // --- 3C. DEEP REGEX SEARCH (ULTIMATE FALLBACK) ---
     if (!product.price) {
         const rawMatches = [
             ...htmlBody.matchAll(/"priceAmount":\s*([\d.]+)/g),
@@ -286,43 +305,49 @@ async function scrapeAmazonProductAPI(asin, marketplace = 'us') {
         }
     }
 
-    // --- 4. RATINGS & REVIEWS ---
-    const ratingText = $('#acrPopover').attr('title') || $('.a-icon-star .a-icon-alt').first().text();
+    let ratingText = parser('#acrPopover').attr('title');
+    if (!ratingText) {
+        ratingText = parser('.a-icon-star .a-icon-alt').first().text();
+    }
     if (ratingText) {
         const rMatch = ratingText.match(/([\d.]+)\s*out of/i);
         if (rMatch) product.rating = parseFloat(rMatch[1]);
     }
 
-    const reviewText = $('#acrCustomerReviewText').first().text();
+    const reviewText = parser('#acrCustomerReviewText').first().text();
     if (reviewText) {
         const revMatch = reviewText.replace(/,/g, '').match(/\d+/);
         if (revMatch) product.reviews_count = parseInt(revMatch[0], 10);
     }
 
-    // --- 5. CATEGORIES / BREADCRUMBS ---
-    $('#wayfinding-breadcrumbs_feature_div ul li a').each((_, el) => {
-        const cat = cleanText($(el).text());
+    parser('#wayfinding-breadcrumbs_feature_div ul li a').each((_, el) => {
+        const cat = cleanText(parser(el).text());
         if (cat) product.categories.push(cat);
     });
 
-    // --- 6. AVAILABILITY & PRIME STATUS ---
-    product.availability = cleanText($('#availability span').first().text()) || "Unknown";
-    if (htmlBody.includes('icon-prime') || htmlBody.includes('prime-logo')) {
+    let availText = parser('#availability span').first().text();
+    if (availText) {
+        product.availability = cleanText(availText);
+    } else {
+        product.availability = "Unknown";
+    }
+
+    if (htmlBody.includes('icon-prime')) {
+        product.is_prime = true;
+    } else if (htmlBody.includes('prime-logo')) {
         product.is_prime = true;
     }
 
-    // --- 7. BULLET POINTS EXTRACTION ---
-    $('#feature-bullets li span.a-list-item').each((_, el) => {
-        const point = cleanText($(el).text());
+    parser('#feature-bullets li span.a-list-item').each((_, el) => {
+        const point = cleanText(parser(el).text());
         if (point && !point.toLowerCase().includes('make sure this fits')) {
             product.description.push(point);
         }
     });
 
-    // --- 8. TRUE HIGH-RES IMAGE GALLERY ---
     const imageSet = new Set();
-    $('#altImages img').each((_, el) => {
-        const src = $(el).attr('src');
+    parser('#altImages img').each((_, el) => {
+        const src = parser(el).attr('src');
         if (src && src.includes('/images/I/') && !src.includes('play-button')) {
             const highResUrl = src.replace(/\._.*?_\./g, '.');
             imageSet.add(highResUrl);
@@ -330,16 +355,15 @@ async function scrapeAmazonProductAPI(asin, marketplace = 'us') {
     });
     product.images = Array.from(imageSet);
 
-    // --- 9. GHOST-CHARACTER FREE SPECIFICATIONS ---
-    $('#productDetails_techSpec_section_1 tr, #prodDetails tr').each((_, el) => {
-        const key = cleanText($(el).find('th, td.prodDetSectionEntry').text());
-        const value = cleanText($(el).find('td:not(.prodDetSectionEntry)').text());
+    parser('#productDetails_techSpec_section_1 tr, #prodDetails tr').each((_, el) => {
+        const key = cleanText(parser(el).find('th, td.prodDetSectionEntry').text());
+        const value = cleanText(parser(el).find('td:not(.prodDetSectionEntry)').text());
         if (key && value) product.specifications[key] = value;
     });
 
     if (Object.keys(product.specifications).length === 0) {
-        $('#detailBullets_feature_div li').each((_, el) => {
-            const text = $(el).text();
+        parser('#detailBullets_feature_div li').each((_, el) => {
+            const text = parser(el).text();
             const parts = text.split(':');
             if (parts.length >= 2) {
                 const key = cleanText(parts[0]);
@@ -351,13 +375,20 @@ async function scrapeAmazonProductAPI(asin, marketplace = 'us') {
         });
     }
 
-    // --- 10. DEEP VARIANT EXTRACTION ---
     const variantSet = new Set();
+    parser('[data-defaultasin], [data-dp-url]').each((_, el) => {
+        let dpUrl = parser(el).attr('data-dp-url');
+        if (!dpUrl) dpUrl = "";
+        
+        let vAsin = parser(el).attr('data-defaultasin');
+        if (!vAsin) {
+            const urlMatch = dpUrl.match(/\/dp\/([A-Z0-9]{10})/);
+            if (urlMatch) vAsin = urlMatch[1];
+        }
 
-    $('[data-defaultasin], [data-dp-url]').each((_, el) => {
-        const dpUrl = $(el).attr('data-dp-url') || "";
-        const vAsin = $(el).attr('data-defaultasin') || (dpUrl.match(/\/dp\/([A-Z0-9]{10})/) || [])[1];
-        if (vAsin && vAsin.toUpperCase() !== cleanAsin) variantSet.add(vAsin.toUpperCase());
+        if (vAsin && vAsin.toUpperCase() !== cleanAsin) {
+            variantSet.add(vAsin.toUpperCase());
+        }
     });
 
     const variantRegex = /"asin":"(B[A-Z0-9]{9})"/gi;
@@ -375,8 +406,17 @@ async function scrapeAmazonStorefront(storeUrl) {
     if (!process.env.PROXY_URL) throw new Error("PROXY_URL missing from environment");
 
     const proxyUrl = new URL(process.env.PROXY_URL);
+    let proxyPort = proxyUrl.port;
+    if (!proxyPort) {
+        if (proxyUrl.protocol === 'https:') {
+            proxyPort = '443';
+        } else {
+            proxyPort = '80';
+        }
+    }
+    
     const proxyConfig = {
-        server: `${proxyUrl.protocol}//${proxyUrl.hostname}:${proxyUrl.port}`,
+        server: `${proxyUrl.protocol}//${proxyUrl.hostname}:${proxyPort}`,
         username: proxyUrl.username,
         password: proxyUrl.password
     };
@@ -395,12 +435,10 @@ async function scrapeAmazonStorefront(storeUrl) {
         });
 
         const page = await context.newPage();
-        
         const targetUrl = storeUrl.split('?')[0].split('ref=')[0];
         
         await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-        // Scroll to force Amazon's React widgets to render
         await page.evaluate(async () => {
             await new Promise((resolve) => {
                 let totalHeight = 0;
@@ -410,8 +448,10 @@ async function scrapeAmazonStorefront(storeUrl) {
                     window.scrollBy(0, distance);
                     totalHeight += distance;
 
-                    // Stop if we hit the bottom or scroll too deep (failsafe)
-                    if (totalHeight >= scrollHeight - window.innerHeight || totalHeight > 15000) {
+                    if (totalHeight >= scrollHeight - window.innerHeight) {
+                        clearInterval(timer);
+                        resolve();
+                    } else if (totalHeight > 15000) {
                         clearInterval(timer);
                         resolve();
                     }
@@ -425,11 +465,9 @@ async function scrapeAmazonStorefront(storeUrl) {
             const results = [];
             const seenAsins = new Set();
             
-            // Targets BOTH Influencer Shops and React Brand Stores
             const cards = document.querySelectorAll('[data-asin], li[class*="item"], div[class*="ProductGridItem"], div[class*="style__item__"]');
             
             cards.forEach(card => {
-                // 1. ASIN Extraction
                 let asin = card.getAttribute('data-asin');
                 if (!asin) {
                     const link = card.querySelector('a[href*="/dp/"], a[href*="/gp/product/"]');
@@ -439,11 +477,12 @@ async function scrapeAmazonStorefront(storeUrl) {
                     }
                 }
                 
-                // Ignore Amazon Credit Card Ads
+                if (!asin) return;
+                if (seenAsins.has(asin)) return;
+                
                 const ignoredASINs = new Set(['B084KP3NG6', 'B0DVBL912R', 'B079RQCGVB']);
-                if (!asin || seenAsins.has(asin) || ignoredASINs.has(asin)) return;
+                if (ignoredASINs.has(asin)) return;
 
-                // 2. Title Extraction
                 let name = "";
                 const titleEl = card.querySelector('h2, [class*="title" i], [class*="name" i], .a-truncate-cut');
                 
@@ -460,18 +499,20 @@ async function scrapeAmazonStorefront(storeUrl) {
                     }
                 }
 
-                // Fallback: Split raw text to find the title
                 if (!name) {
                     const lines = (card.innerText || "").split('\n').map(l => l.trim());
                     const validLine = lines.find(l => l.length > 10 && !l.includes('$') && !l.toLowerCase().includes('out of'));
                     if (validLine) name = validLine;
                 }
 
-                // Clean artifacts and skip promotional banners
+                if (!name) return;
+                
                 name = name.replace(/^Sponsored\s*/i, '').replace(/\n/g, ' ').trim();
-                if (!name || name.toLowerCase().includes('overall pick') || name.toLowerCase().includes('products highlighted')) return;
+                const lowerName = name.toLowerCase();
+                
+                if (lowerName.includes('overall pick')) return;
+                if (lowerName.includes('products highlighted')) return;
 
-                // 3. Price Extraction
                 let price = null;
                 const offscreen = card.querySelector('.a-price .a-offscreen');
                 
@@ -495,29 +536,35 @@ async function scrapeAmazonStorefront(storeUrl) {
                     }
                 }
 
-                // 4. Rating Extraction (UPDATED)
                 let rating = null;
                 const ratingEl = card.querySelector('[aria-label*="out of 5"], [title*="out of 5"], .a-icon-alt, i[class*="star"]');
                 
                 if (ratingEl) {
-                    const rText = ratingEl.getAttribute('aria-label') || 
-                                  ratingEl.getAttribute('title') || 
-                                  ratingEl.innerText || 
-                                  "";
+                    let rText = ratingEl.getAttribute('aria-label');
+                    if (!rText) rText = ratingEl.getAttribute('title');
+                    if (!rText) rText = ratingEl.innerText;
+                    if (!rText) rText = "";
+                    
                     const rMatch = rText.match(/([\d.]+)\s*out of/i);
                     if (rMatch) rating = parseFloat(rMatch[1]);
                 }
 
                 if (rating === null) {
-                    const rawMatch = (card.innerText || "").match(/([\d.]+)\s*out of\s*5/i);
-                    if (rawMatch) rating = parseFloat(rawMatch[1]);
+                    const rawText = card.innerText;
+                    if (rawText) {
+                        const rawMatch = rawText.match(/([\d.]+)\s*out of\s*5/i);
+                        if (rawMatch) rating = parseFloat(rawMatch[1]);
+                    }
                 }
 
-                // 5. Image Extraction
+                let image = "";
                 const img = card.querySelector('img');
-                const image = img ? (img.getAttribute('src') || img.getAttribute('data-src') || "") : "";
+                if (img) {
+                    image = img.getAttribute('src');
+                    if (!image) image = img.getAttribute('data-src');
+                    if (!image) image = "";
+                }
 
-                // Strict filter: MUST have a valid price and a valid title to return!
                 if (price !== null && price > 0 && name.length > 5) {
                     seenAsins.add(asin);
                     results.push({ 
@@ -542,5 +589,4 @@ async function scrapeAmazonStorefront(storeUrl) {
     }
 }
 
-
-module.exports = { scrapeAmazonStorefront,scrapeAmazonSearchAPI,MARKETPLACE_MAP,scrapeAmazonProductAPI };
+module.exports = { scrapeAmazonStorefront, scrapeAmazonSearchAPI, MARKETPLACE_MAP, scrapeAmazonProductAPI };
