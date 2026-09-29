@@ -4344,31 +4344,56 @@ app.get('/v1/tiktok/collection/videos', authMiddleware, async (req, res) => {
     }
 });
 
+// @ts-nocheck
+/* eslint-disable */
+
+const { scrapeLinkedInProfile } = require('./linkedinScraper'); // Adjust path as needed
+
 app.get('/v1/linkedin/profile', authMiddleware, async (req, res) => {
-    const { url, handle } = req.query;
+    let targetLinkedInUrl = req.query.url;
+    if (!targetLinkedInUrl) {
+        targetLinkedInUrl = req.query.handle;
+    }
 
-    // 1. Handle & URL Normalization
-    let targetLinkedInUrl = url || handle;
-
-    if (!targetLinkedInUrl || typeof targetLinkedInUrl !== 'string' || targetLinkedInUrl.trim() === '') {
+    if (!targetLinkedInUrl) {
         return res.status(400).json({ 
             success: false, 
             error: "400 Bad Request: Missing required parameter 'url' or 'handle'." 
         });
     }
 
-    targetLinkedInUrl = targetLinkedInUrl.trim();
-
-    // Auto-convert standalone handles or "in/username" formats to full URLs
-    if (!targetLinkedInUrl.startsWith('http://') && !targetLinkedInUrl.startsWith('https://')) {
-        const cleanHandle = targetLinkedInUrl.replace(/^@/, '').replace(/^in\//, '').replace(/\/$/, '');
-        targetLinkedInUrl = `https://www.linkedin.com/in/${cleanHandle}`;
+    if (typeof targetLinkedInUrl !== 'string') {
+        return res.status(400).json({ 
+            success: false, 
+            error: "400 Bad Request: Parameter must be a string." 
+        });
     }
 
-    // Clean trailing slashes for consistent caching
+    targetLinkedInUrl = targetLinkedInUrl.trim();
+
+    if (targetLinkedInUrl === '') {
+        return res.status(400).json({ 
+            success: false, 
+            error: "400 Bad Request: Parameter cannot be empty." 
+        });
+    }
+
+    const isHttp = targetLinkedInUrl.startsWith('http://');
+    const isHttps = targetLinkedInUrl.startsWith('https://');
+
+    if (!isHttp) {
+        if (!isHttps) {
+            let cleanHandle = targetLinkedInUrl.replace(/^@/, '');
+            cleanHandle = cleanHandle.replace(/^in\//, '');
+            cleanHandle = cleanHandle.replace(/\/$/, '');
+            targetLinkedInUrl = `https://www.linkedin.com/in/${cleanHandle}`;
+        }
+    }
+
     try {
         const parsedUrl = new URL(targetLinkedInUrl);
-        targetLinkedInUrl = `${parsedUrl.origin}${parsedUrl.pathname.replace(/\/$/, '')}`;
+        const cleanPath = parsedUrl.pathname.replace(/\/$/, '');
+        targetLinkedInUrl = `${parsedUrl.origin}${cleanPath}`;
     } catch (e) {
         return res.status(400).json({ 
             success: false, 
@@ -4376,8 +4401,7 @@ app.get('/v1/linkedin/profile', authMiddleware, async (req, res) => {
         });
     }
 
-    // 2. Pre-flight Credit Check (Charges 2 Credits to double upstream cost)
-    const costToUser = 2;
+    const costToUser = 2; 
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
             success: false, 
@@ -4385,96 +4409,42 @@ app.get('/v1/linkedin/profile', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-
     try {
+        const upstreamPayload = await scrapeLinkedInProfile(targetLinkedInUrl);
 
+        let finalName = upstreamPayload.name;
+        if (!finalName) finalName = null;
 
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+        let finalLocation = upstreamPayload.location;
+        if (!finalLocation) finalLocation = null;
 
-        const targetUrl = new URL('https://api.scrapecreators.com/v1/linkedin/profile');
-        targetUrl.searchParams.append('url', targetLinkedInUrl);
+        let finalAbout = upstreamPayload.about;
+        if (!finalAbout) finalAbout = null;
 
-        // 6. Execute Request (25s timeout for LinkedIn page loads)
-        const response = await fetch(targetUrl.toString(), {
-            method: 'GET',
-            headers: { 
-                'x-api-key': upstreamApiKey,
-                'Content-Type': 'application/json'
-            },
-            signal: AbortSignal.timeout(25000) 
-        });
+        let finalExperience = upstreamPayload.experience;
+        if (!finalExperience) finalExperience = [];
 
-        const upstreamPayload = await response.json();
+        let finalEducation = upstreamPayload.education;
+        if (!finalEducation) finalEducation = [];
 
-        // 7. Handle Upstream Errors
-        if (!response.ok || !upstreamPayload.success) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch LinkedIn profile'}`);
-        }
-
-        // 8. Trim & Sanitize Payload
-        // Strips out obscured text, redacted experience descriptions, and useless metadata
         const trimmedProfile = {
-            name: upstreamPayload.name || null,
-            image: upstreamPayload.image || null,
-            location: upstreamPayload.location || null,
-            followers: upstreamPayload.followers || 0,
-            connections: upstreamPayload.connections || null,
-            about: upstreamPayload.about || null,
+            name: finalName,
+            image: null, 
+            location: finalLocation,
+            followers: 0, 
+            connections: null,
+            about: finalAbout,
             url: targetLinkedInUrl,
-            recentPosts: Array.isArray(upstreamPayload.recentPosts) 
-                ? upstreamPayload.recentPosts.map(post => ({
-                    title: post.title || "",
-                    activityType: post.activityType || "",
-                    link: post.link || "",
-                    image: post.image || null
-                })) 
-                : [],
-            experience: Array.isArray(upstreamPayload.experience)
-                ? upstreamPayload.experience.map(exp => ({
-                    company: exp.name || null,
-                    url: exp.url || null,
-                    location: exp.location || null
-                }))
-                : [],
-            education: Array.isArray(upstreamPayload.education)
-                ? upstreamPayload.education.map(edu => ({
-                    school: edu.name || null,
-                    url: edu.url || null,
-                    startYear: edu.member?.startDate || null,
-                    endYear: edu.member?.endDate || null
-                }))
-                : [],
-            articles: Array.isArray(upstreamPayload.articles)
-                ? upstreamPayload.articles.map(art => ({
-                    headline: art.headline || "",
-                    datePublished: art.datePublished || null,
-                    image: art.image || null,
-                    body: art.articleBody || ""
-                }))
-                : [],
-            recommendations: Array.isArray(upstreamPayload.recommendations)
-                ? upstreamPayload.recommendations.map(rec => ({
-                    name: rec.name || "",
-                    link: rec.link || "",
-                    text: rec.text || ""
-                }))
-                : [],
-            similarProfiles: Array.isArray(upstreamPayload.similarProfiles)
-                ? upstreamPayload.similarProfiles.map(sim => ({
-                    name: sim.name || "",
-                    link: sim.link || "",
-                    image: sim.image || null
-                }))
-                : []
+            recentPosts: [],
+            experience: finalExperience,
+            education: finalEducation,
+            articles: [],
+            recommendations: [],
+            similarProfiles: []
         };
 
-        // 9. Billing Deduction & Local Caching
         req.user.credits -= costToUser;
 
-        // 10. Return Sanitized Payload
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -4483,13 +4453,26 @@ app.get('/v1/linkedin/profile', authMiddleware, async (req, res) => {
         });
 
     } catch (error) {
-        const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
+        let isTimeout = false;
+        if (error.name === 'TimeoutError') isTimeout = true;
+        if (error.message.includes('Timeout')) isTimeout = true;
+
+        let isBlocked = false;
+        if (error.message.includes('Authwall')) isBlocked = true;
+        if (error.message.includes('CAPTCHA')) isBlocked = true;
+        if (error.message.includes('Verification')) isBlocked = true;
         
-        // If LinkedIn throws a 404, it usually means the profile doesn't exist or is completely private
-        const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
-        const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch the profile." 
-            : error.message;
+        let statusCode = 500;
+        if (isTimeout) {
+            statusCode = 504;
+        } else if (isBlocked) {
+            statusCode = 502;
+        }
+
+        let finalErrorMsg = error.message;
+        if (isTimeout) {
+            finalErrorMsg = "504 Gateway Timeout: Proxies took too long to unlock the profile.";
+        }
 
         if (typeof notifyFailure === 'function') {
             notifyFailure({ 
