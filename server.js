@@ -8642,7 +8642,10 @@ app.get('/v1/trustpilot/reviews', authMiddleware, async (req, res) => {
     }
 
     const cleanDomain = domain.trim().toLowerCase();
-    const safePage = page ? parseInt(page, 10) : 1;
+    
+    // Note: AnyAPI fetches up to 200 reviews in one go instead of strict pagination.
+    // We retain safePage to keep your API response schema backward-compatible for your users.
+    const safePage = page ? parseInt(page, 10) : 1; 
     const safeSort = sort ? sort.trim() : 'recency';
     const safeStars = stars ? stars.trim() : '';
 
@@ -8655,52 +8658,83 @@ app.get('/v1/trustpilot/reviews', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-
     try {
+        // 3. Map parameters to AnyAPI Schema
+        const payload = {
+            company: cleanDomain,
+            limit: 200 // Max allowed by AnyAPI
+        };
 
-
-        // 5. Try Playwright first, then SocialCrawl when its parameters are supported
-        const result = await trustpilotOrchestrator.executeReviews(
-            () => scrapeTrustpilotReviews(cleanDomain, safePage, safeSort, safeStars),
-            { domain: cleanDomain, page: safePage, sort: safeSort, stars: safeStars }
-        );
-
-        if (!result.success) {
-            return res.status(503).json({
-                success: false,
-                error: result.error,
-                details: result.details
-            });
+        // AnyAPI expects "recent", "relevancy", or "auto"
+        if (safeSort === 'recency' || safeSort === 'recent') {
+            payload.sortBy = 'recent';
+        } else if (safeSort === 'relevancy') {
+            payload.sortBy = 'relevancy';
+        } else {
+            payload.sortBy = 'auto';
         }
 
-        const responseData = {
+        if (safeStars) {
+            payload.stars = safeStars.toString();
+        }
+
+        // 4. Execute Request to AnyAPI
+        // Ensure you have ANYAPI_KEY in your .env file
+        const anyApiResponse = await axios.post(
+            'https://api.getanyapi.com/v1/run/trustpilot.reviews',
+            payload,
+            {
+                headers: {
+                    'Authorization': `Bearer ${process.env.ANYAPI_KEY}`,
+                    'Content-Type': 'application/json'
+                },
+                timeout: 30000 // Give the managed API up to 30s to navigate Cloudflare
+            }
+        );
+
+        const resultData = anyApiResponse.data;
+
+        // Handle case where AnyAPI successfully searched but the company wasn't found
+        if (resultData.output && resultData.output.found === false) {
+             return res.status(404).json({
+                success: false,
+                error: `No reviews found for domain: ${cleanDomain}. Reason: ${resultData.output.reason}`
+             });
+        }
+
+        // 5. Deduct Credit
+        req.user.credits -= costToUser;
+
+        // 6. Return Response mapped to your original structure
+        return res.status(200).json({
+            success: true,
+            credits_remaining: req.user.credits,
+            credits_charged: costToUser,
             query: {
                 domain: cleanDomain,
                 page: safePage,
                 sort: safeSort,
                 stars: safeStars
             },
-            ...result.data
-        };
-
-        // 6. Deduct Credit & Store in Cache
-        req.user.credits -= result.creditCost;
-
-        // 7. Return Response
-        return res.status(200).json({
-            success: true,
-            credits_remaining: req.user.credits,
-            credits_charged: result.creditCost,
-            ...responseData
+            // AnyAPI returns the review array inside output.data.items
+            data: resultData.output.data,
+            // Optional: Pass through upstream cost for your own internal logging/metrics
+            upstream_cost: resultData.costUsd 
         });
 
     } catch (error) {
-        const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
-        const statusCode = isTimeout ? 504 : 500;
-        const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: The scraper took too long to fetch Trustpilot reviews." 
+        // 7. Handle Upstream Errors (Timeouts, AnyAPI Rate Limits, Payment Auth)
+        const isTimeout = error.code === 'ECONNABORTED' || (error.message && error.message.includes('timeout'));
+        const statusCode = error.response ? error.response.status : (isTimeout ? 504 : 500);
+        
+        let finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The upstream provider took too long to fetch Trustpilot reviews." 
             : error.message;
+
+        // Extract native AnyAPI error messages (e.g., 402 Insufficient Balance, 429 Rate Limit)
+        if (error.response?.data?.error) {
+            finalErrorMsg = `${statusCode} Upstream Provider Error: ${error.response.data.error}`;
+        }
 
         if (typeof notifyFailure === 'function') {
             notifyFailure({ 
@@ -8881,38 +8915,108 @@ const { scrapeZillowSearchAPI, scrapeZillowDetailAPI } = require('./src/scrapers
 app.get('/v1/zillow/search', authMiddleware, async (req, res) => {
     const { location, page } = req.query;
 
+    // 1. Parameter Validation
     if (!location || typeof location !== 'string' || location.trim() === '') {
-        return res.status(400).json({ success: false, error: "400 Bad Request: Missing 'location'." });
+        return res.status(400).json({ 
+            success: false, 
+            error: "400 Bad Request: Missing 'location'." 
+        });
     }
 
     const cleanLocation = location.trim();
-    const safePage = page ? parseInt(page, 10) : 1;
+    // Retained for backward compatibility with your existing frontend/users
+    const safePage = page ? parseInt(page, 10) : 1; 
     const costToUser = 1;
 
+    // 2. Pre-flight Credit Check
     if (req.user.credits < costToUser) {
-        return res.status(403).json({ success: false, error: `403 Forbidden: Insufficient credits.` });
+        return res.status(403).json({ 
+            success: false, 
+            error: `403 Forbidden: Insufficient credits.` 
+        });
     }
 
-
     try {
+        // 3. Map parameters to AnyAPI Schema
+        const payload = {
+            location: cleanLocation,
+            limit: 25 // Maximum allowed by AnyAPI Zillow Search
+        };
 
-        const listings = await scrapeZillowSearchAPI(cleanLocation, safePage);
+        // 4. Execute Request to AnyAPI
+        const anyApiResponse = await axios.post(
+            'https://api.getanyapi.com/v1/run/zillow.search',
+            payload,
+            {
+                headers: {
+                    'Authorization': `Bearer ${process.env.ANYAPI_KEY}`,
+                    'Content-Type': 'application/json'
+                },
+                timeout: 30000 // 30 seconds for AnyAPI to navigate DataDome/PerimeterX
+            }
+        );
+
+        const resultData = anyApiResponse.data;
+
+        // Handle clean "Not Found" states without throwing 500s
+        if (resultData.output && resultData.output.found === false) {
+             return res.status(404).json({
+                success: false,
+                error: `No listings found for location: ${cleanLocation}. Reason: ${resultData.output.reason}`
+             });
+        }
+
+        // Extract the normalized items array from AnyAPI's output envelope
+        const listings = resultData.output?.data?.items || [];
 
         const responseData = {
-            query: { location: cleanLocation, page: safePage },
+            query: { 
+                location: cleanLocation, 
+                page: safePage 
+            },
             total_results_on_page: listings.length,
             listings: listings
         };
 
+        // 5. Deduct Credit
         req.user.credits -= costToUser;
 
+        // 6. Return Response
         return res.status(200).json({
-            success: true, credits_remaining: req.user.credits, credits_charged: costToUser,
+            success: true, 
+            credits_remaining: req.user.credits, 
+            credits_charged: costToUser,
+            upstream_cost: resultData.costUsd, // Useful for your own margin tracking
             ...responseData
         });
 
     } catch (error) {
-        return res.status(500).json({ success: false, error: error.message });
+        // 7. Standardized Error Handling
+        const isTimeout = error.code === 'ECONNABORTED' || (error.message && error.message.includes('timeout'));
+        const statusCode = error.response ? error.response.status : (isTimeout ? 504 : 500);
+        
+        let finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The upstream provider took too long to fetch Zillow listings." 
+            : error.message;
+
+        // Pass through native AnyAPI errors (e.g., 402 Payment Required, 429 Rate Limit)
+        if (error.response?.data?.error) {
+            finalErrorMsg = `${statusCode} Upstream Provider Error: ${error.response.data.error}`;
+        }
+
+        if (typeof notifyFailure === 'function') {
+            notifyFailure({ 
+                endpoint: '/v1/zillow/search', 
+                params: { location: cleanLocation, page: safePage }, 
+                statusCode: statusCode, 
+                errorMsg: finalErrorMsg 
+            });
+        }
+
+        return res.status(statusCode).json({ 
+            success: false, 
+            error: finalErrorMsg 
+        });
     }
 });
 
@@ -8922,37 +9026,99 @@ app.get('/v1/zillow/item', authMiddleware, async (req, res) => {
     const { zpid, url } = req.query;
 
     if (!zpid && !url) {
-        return res.status(400).json({ success: false, error: "400 Bad Request: Missing 'zpid' or 'url'." });
+        return res.status(400).json({ 
+            success: false, 
+            error: "400 Bad Request: Missing 'zpid' or 'url'." 
+        });
     }
 
     const safeZpid = zpid ? zpid.trim() : null;
     const cleanUrl = url ? url.trim().split('?')[0] : null;
+    
+    // AnyAPI requires a URL. If the user only provides a ZPID, we construct a valid Zillow URL.
+    // Zillow's backend ignores the slug (the "property" text) as long as the ZPID is correct at the end.
+    const targetUrl = cleanUrl || `https://www.zillow.com/homedetails/property/${safeZpid}_zpid/`;
+
     const costToUser = 1;
 
     if (req.user.credits < costToUser) {
-        return res.status(403).json({ success: false, error: `403 Forbidden: Insufficient credits.` });
+        return res.status(403).json({ 
+            success: false, 
+            error: `403 Forbidden: Insufficient credits.` 
+        });
     }
 
-    const identifier = safeZpid ? `zpid_${safeZpid}` : `url_${Buffer.from(cleanUrl).toString('base64').substring(0, 20)}`;
-
     try {
+        const payload = {
+            url: targetUrl
+        };
 
+        const anyApiResponse = await axios.post(
+            'https://api.getanyapi.com/v1/run/zillow.property',
+            payload,
+            {
+                headers: {
+                    'Authorization': `Bearer ${process.env.ANYAPI_KEY}`,
+                    'Content-Type': 'application/json'
+                },
+                timeout: 30000 // 30 seconds for AnyAPI to bypass Zillow's protections
+            }
+        );
 
-        const propertyData = await scrapeZillowDetailAPI(safeZpid, cleanUrl);
+        const resultData = anyApiResponse.data;
+
+        // Cleanly handle cases where the property was taken down or doesn't exist
+        if (resultData.output && resultData.output.found === false) {
+             return res.status(404).json({
+                success: false,
+                error: `Property not found. Reason: ${resultData.output.reason}`
+             });
+        }
+
+        // AnyAPI returns a single element array for specific property lookups
+        const propertyData = resultData.output?.data?.items?.[0];
 
         if (!propertyData) {
             throw new Error("Successfully fetched the page, but failed to locate the property data block.");
         }
 
+        // Deduct Credit
         req.user.credits -= costToUser;
 
         return res.status(200).json({
-            success: true, credits_remaining: req.user.credits, credits_charged: costToUser,
-            ...propertyData
+            success: true, 
+            credits_remaining: req.user.credits, 
+            credits_charged: costToUser,
+            upstream_cost: resultData.costUsd,
+            // Spreading the property data keeps your existing output schema identical
+            ...propertyData 
         });
 
     } catch (error) {
-        return res.status(500).json({ success: false, error: error.message });
+        const isTimeout = error.code === 'ECONNABORTED' || (error.message && error.message.includes('timeout'));
+        const statusCode = error.response ? error.response.status : (isTimeout ? 504 : 500);
+        
+        let finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The upstream provider took too long to fetch Zillow property details." 
+            : error.message;
+
+        if (error.response?.data?.error) {
+            finalErrorMsg = `${statusCode} Upstream Provider Error: ${error.response.data.error}`;
+        }
+
+        if (typeof notifyFailure === 'function') {
+            notifyFailure({ 
+                endpoint: '/v1/zillow/item', 
+                params: { zpid: safeZpid, url: cleanUrl }, 
+                statusCode: statusCode, 
+                errorMsg: finalErrorMsg 
+            });
+        }
+
+        return res.status(statusCode).json({ 
+            success: false, 
+            error: finalErrorMsg 
+        });
     }
 });
 
