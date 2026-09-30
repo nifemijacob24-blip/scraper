@@ -6,6 +6,7 @@ const trustpilotOrchestrator = require('./src/services/trustpilot-orchestrator')
 const amazonOrchestrator = require('./src/services/amazon-orchestrator');
 const sequenzy = require('./src/services/sequenzy');
 const { universalCacheMiddleware } = require('./cacheMiddleware');
+const axios = require('axios');
 
 
 const cors = require('cors');
