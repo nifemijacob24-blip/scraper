@@ -1085,6 +1085,111 @@ app.get('/v1/reddit/search', authMiddleware, async (req, res) => {
 
 const { scrapeInstagramProfile } = require('./src/scrapers/instagram');
 
+// --- ENDPOINT 6: INSTAGRAM BASIC PROFILE (1 CREDIT) ---
+app.get('/v1/instagram/basic-profile', authMiddleware, async (req, res) => {
+    const userId = typeof req.query.userId === 'string' ? req.query.userId.trim() : '';
+    const cacheMaxAge = req.query.cache_max_age || '7d';
+    const supportedCacheAges = new Set(['1d', '3d', '7d', '14d', '30d']);
+
+    if (!userId) {
+        return res.status(400).json({
+            success: false,
+            error: "400 Bad Request: Missing required parameter 'userId'."
+        });
+    }
+
+    if (!supportedCacheAges.has(cacheMaxAge)) {
+        return res.status(400).json({
+            success: false,
+            error: "400 Bad Request: 'cache_max_age' must be one of 1d, 3d, 7d, 14d, or 30d."
+        });
+    }
+
+    if (req.user.credits < 1) {
+        return res.status(403).json({
+            success: false,
+            error: '403 Forbidden: Insufficient credits. This request requires 1 credit.'
+        });
+    }
+
+    try {
+        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!upstreamApiKey) {
+            throw new Error('Missing ScrapeCreators API Key in environment');
+        }
+
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/instagram/basic-profile');
+        targetUrl.searchParams.set('userId', userId);
+        targetUrl.searchParams.set('cache_max_age', cacheMaxAge);
+
+        const response = await fetch(targetUrl, {
+            method: 'GET',
+            headers: {
+                'x-api-key': upstreamApiKey,
+                'Accept': 'application/json'
+            },
+            signal: AbortSignal.timeout(15000)
+        });
+
+        let upstreamPayload;
+        try {
+            upstreamPayload = await response.json();
+        } catch (parseError) {
+            throw new Error(`Upstream API returned invalid JSON (HTTP ${response.status})`);
+        }
+
+        if (!response.ok || upstreamPayload.success === false) {
+            const upstreamError = upstreamPayload.error || response.statusText || 'Failed to fetch Instagram basic profile';
+            const error = new Error(`Upstream API Error: ${upstreamError}`);
+            error.statusCode = response.status;
+            throw error;
+        }
+
+        const creditsCharged = Number.isFinite(Number(upstreamPayload.credits_charged))
+            ? Number(upstreamPayload.credits_charged)
+            : 1;
+
+        if (creditsCharged < 0 || creditsCharged > 1) {
+            throw new Error('Upstream API returned an invalid credit charge');
+        }
+
+        const {
+            success,
+            credits_remaining: upstreamCreditsRemaining,
+            credits_charged: upstreamCreditsCharged,
+            ...profileData
+        } = upstreamPayload;
+
+        req.user.credits -= creditsCharged;
+
+        return res.status(200).json({
+            success: true,
+            credits_remaining: req.user.credits,
+            credits_charged: creditsCharged,
+            ...profileData
+        });
+    } catch (error) {
+        const statusCode = error.name === 'TimeoutError'
+            ? 504
+            : (error.statusCode >= 400 && error.statusCode < 500 ? error.statusCode : 500);
+        const errorMessage = error.name === 'TimeoutError'
+            ? '504 Gateway Timeout: Upstream provider took too long to respond.'
+            : error.message || 'Internal Server Error';
+
+        notifyFailure({
+            endpoint: '/v1/instagram/basic-profile',
+            params: { userId, cache_max_age: cacheMaxAge },
+            statusCode,
+            errorMsg: errorMessage
+        });
+
+        return res.status(statusCode).json({
+            success: false,
+            error: errorMessage
+        });
+    }
+});
+
 // --- ENDPOINT 6: INSTAGRAM PROFILE (1 CREDIT) ---
 app.get('/v1/instagram/profile', authMiddleware, async (req, res) => {
     // Support 'username', 'user', and 'handle' to ensure zero breaking changes for your API consumers
@@ -8720,7 +8825,6 @@ app.get('/v1/trustpilot/reviews', authMiddleware, async (req, res) => {
             // AnyAPI returns the review array inside output.data.items
             data: resultData.output.data,
             // Optional: Pass through upstream cost for your own internal logging/metrics
-            upstream_cost: resultData.costUsd 
         });
 
     } catch (error) {
@@ -8987,7 +9091,6 @@ app.get('/v1/zillow/search', authMiddleware, async (req, res) => {
             success: true, 
             credits_remaining: req.user.credits, 
             credits_charged: costToUser,
-            upstream_cost: resultData.costUsd, // Useful for your own margin tracking
             ...responseData
         });
 
@@ -9090,7 +9193,6 @@ app.get('/v1/zillow/item', authMiddleware, async (req, res) => {
             success: true, 
             credits_remaining: req.user.credits, 
             credits_charged: costToUser,
-            upstream_cost: resultData.costUsd,
             // Spreading the property data keeps your existing output schema identical
             ...propertyData 
         });
