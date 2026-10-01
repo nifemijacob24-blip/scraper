@@ -4538,6 +4538,7 @@ app.get('/v1/linkedin/profile', authMiddleware, async (req, res) => {
                     image: post.image || null
                 })) 
                 : [],
+
             experience: Array.isArray(upstreamPayload.experience)
                 ? upstreamPayload.experience.map(exp => ({
                     company: exp.name || null,
@@ -4609,6 +4610,90 @@ app.get('/v1/linkedin/profile', authMiddleware, async (req, res) => {
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
+        });
+    }
+});
+
+app.get('/v1/linkedin/email', authMiddleware, async (req, res) => {
+    const profileUrl = req.query.profileUrl || req.query.url;
+    const costToUser = 15;
+
+    if (!profileUrl || typeof profileUrl !== 'string' || profileUrl.trim() === '') {
+        return res.status(400).json({
+            success: false,
+            error: "400 Bad Request: Missing required parameter 'profileUrl'."
+        });
+    }
+
+    const cleanProfileUrl = profileUrl.trim();
+
+    if (req.user.credits < costToUser) {
+        return res.status(403).json({
+            success: false,
+            error: `403 Forbidden: Insufficient credits. This request requires ${costToUser} credits.`
+        });
+    }
+
+    try {
+        const getAnyApiKey = process.env.GETANYAPI_KEY;
+        if (!getAnyApiKey) throw new Error('Missing GETANYAPI_KEY in environment');
+
+        const response = await fetch('https://api.getanyapi.com/v1/run/linkedin.email', {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${getAnyApiKey}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ profileUrl: cleanProfileUrl }),
+            signal: AbortSignal.timeout(25000)
+        });
+
+        let upstreamPayload;
+        try {
+            upstreamPayload = await response.json();
+        } catch (parseError) {
+            throw new Error(`AnyAPI returned invalid JSON (HTTP ${response.status})`);
+        }
+
+        if (!response.ok) {
+            const upstreamError = upstreamPayload.error || response.statusText || 'Failed to find LinkedIn email';
+            const error = new Error(`AnyAPI Error: ${upstreamError}`);
+            error.statusCode = response.status;
+            throw error;
+        }
+
+        const output = upstreamPayload.output || {};
+        req.user.credits -= costToUser;
+
+        return res.status(200).json({
+            success: true,
+            credits_remaining: req.user.credits,
+            credits_charged: costToUser,
+            found: output.found ?? false,
+            data: output.data ?? null,
+            ...(output.reason ? { reason: output.reason } : {})
+        });
+    } catch (error) {
+        const isTimeout = error.name === 'TimeoutError';
+        const statusCode = isTimeout
+            ? 504
+            : (error.statusCode >= 400 && error.statusCode < 500 ? error.statusCode : 500);
+        const errorMessage = isTimeout
+            ? '504 Gateway Timeout: AnyAPI took too long to find the LinkedIn email.'
+            : error.message || 'Internal Server Error';
+
+        if (typeof notifyFailure === 'function') {
+            notifyFailure({
+                endpoint: '/v1/linkedin/email',
+                params: { profileUrl: cleanProfileUrl },
+                statusCode,
+                errorMsg: errorMessage
+            });
+        }
+
+        return res.status(statusCode).json({
+            success: false,
+            error: errorMessage
         });
     }
 });
