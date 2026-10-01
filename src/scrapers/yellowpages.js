@@ -1,72 +1,39 @@
-const axios = require('axios');
-const cheerio = require('cheerio');
+const { ApifyClient } = require('apify-client');
+
+const YELLOWPAGES_ACTOR = 'dainty_screw/advanced-yellowpages-scraper';
 
 async function scrapeYellowpagesAPI(term, location, pageNum = 1) {
-    if (!process.env.SCRAPER_API_KEY) throw new Error("SCRAPER_API_KEY missing from environment");
+    if (!process.env.APIFY_API_TOKEN) throw new Error("APIFY_API_TOKEN missing from environment");
 
     const cleanTerm = term.trim();
     const cleanLocation = location.trim();
-    const targetUrl = `https://www.yellowpages.com/search?search_terms=${encodeURIComponent(cleanTerm)}&geo_location_terms=${encodeURIComponent(cleanLocation)}&page=${pageNum}`;
+    const safePage = Number.isInteger(pageNum) && pageNum > 0 ? pageNum : 1;
+    const targetUrl = new URL('https://www.yellowpages.com/search');
+    targetUrl.searchParams.set('search_terms', cleanTerm);
+    targetUrl.searchParams.set('geo_location_terms', cleanLocation);
+    targetUrl.searchParams.set('page', safePage.toString());
 
-    const response = await axios.get('https://api.scraperapi.com/', {
-        params: {
-            api_key: process.env.SCRAPER_API_KEY,
-            url: targetUrl,
-            premium: 'true',
-            country_code: 'us',
-            render: 'true'
-        },
-        timeout: 60000
+    const client = new ApifyClient({ token: process.env.APIFY_API_TOKEN });
+    const run = await client.actor(YELLOWPAGES_ACTOR).call({
+        site: 'us',
+        startUrls: [{ url: targetUrl.toString() }],
+        maxItems: 1,
+        proxyConfiguration: { useApifyProxy: false }
     });
+    const { items } = await client.dataset(run.defaultDatasetId).listItems();
 
-    const $ = cheerio.load(response.data);
-
-    // Block detection check
-    const pageText = $('body').text().toLowerCase();
-    if (pageText.includes('sorry, you have been blocked') || pageText.includes('pardon our interruption') || $('title').text().includes('Robot Check')) {
-        throw new Error("Yellowpages served a block/CAPTCHA page. The provider will rotate IPs on the next request.");
-    }
-
-    const businesses = [];
-    const seenNames = new Set();
-
-    $('.result, .srp-listing').each((i, el) => {
-        const $el = $(el);
-
-        const nameNode = $el.find('.business-name, .business-name span').first();
-        const name = nameNode.text().trim();
-        if (!name || seenNames.has(name)) return;
-
-        let ypUrl = $el.find('.business-name').attr('href') || nameNode.attr('href') || "";
-        if (ypUrl && !ypUrl.startsWith('http')) {
-            ypUrl = `https://www.yellowpages.com${ypUrl}`;
-        }
-
-        const phone = $el.find('.phones').first().text().trim();
-
-        const street = $el.find('.street-address').first().text().trim();
-        const locality = $el.find('.locality').first().text().trim();
-        const address = `${street} ${locality}`.trim();
-
-        const website = $el.find('.track-visit-website, .links a[href^="http"]').first().attr('href') || null;
-
-        const ratingNode = $el.find('.ratings .rating div').first();
-        const ratingClass = ratingNode.attr('class') || "";
-        const reviewCountText = $el.find('.ratings .count').first().text().replace(/\D/g, '') || "0";
-
-        seenNames.add(name);
-        businesses.push({
-            name,
-            phone,
-            address,
-            website,
-            yellowpages_url: ypUrl,
-            rating_indicator: ratingClass,
-            review_count: parseInt(reviewCountText, 10) || 0
-        });
-    });
-
-    return businesses;
+    return (items || []).map(item => ({
+        name: item.name || '',
+        phone: item.phone || '',
+        address: item.address || '',
+        website: item.website || null,
+        yellowpages_url: item.url || '',
+        rating_indicator: item.rating ?? null,
+        review_count: item.reviewCount || 0,
+        rating: item.rating ?? null,
+        review_snippet: item.reviewSnippet || '',
+        categories: Array.isArray(item.categories) ? item.categories : []
+    }));
 }
 
 module.exports = { scrapeYellowpagesAPI };
