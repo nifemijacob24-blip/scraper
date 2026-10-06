@@ -53,6 +53,30 @@ const PORT = process.env.PORT || 3000;
 // 3. Checkout & Other Routes
 // ==========================================
 
+// Reusable logging function
+const logApiRequest = async (req, endpoint, cost, params, statusCode) => {
+    // Safety check: Don't try to log if there's no authenticated user attached
+    if (!req.user || !req.user.id) return;
+
+    try {
+        const { error } = await supabase
+            .from('api_logs')
+            .insert({
+                user_id: req.user.id,
+                endpoint: endpoint,
+                cost: cost,
+                request_params: params,
+                status_code: statusCode
+            });
+
+        if (error) {
+            console.error(`Failed to log ${endpoint} usage:`, error);
+        }
+    } catch (err) {
+        console.error('Server error during logging:', err);
+    }
+};
+
 app.post('/api/webhook/dodo', express.raw({ type: 'application/json' }), async (req, res) => {
     try {
         const event = dodo.webhooks.unwrap(req.body, req.headers);
@@ -322,7 +346,6 @@ app.get('/v1/reddit/subreddit/details', authMiddleware, async (req, res) => {
             }
 
         } catch (fallbackError) {
-            // Determine clean, white-labeled error for the customer
             const isTimeout = fallbackError.name === 'TimeoutError' || primaryError.name === 'TimeoutError';
             const isNotFound = fallbackError.message.includes('404') || primaryErrorMsg.includes('404');
             
@@ -337,7 +360,6 @@ app.get('/v1/reddit/subreddit/details', authMiddleware, async (req, res) => {
                 clientErrorMsg = "504 Gateway Timeout: Data extraction took too long to complete. Please try again.";
             }
 
-            // Send detailed internal logs to Discord only
             if (typeof notifyFailure === 'function') {
                 notifyFailure({
                     endpoint: '/v1/reddit/subreddit/details',
@@ -346,6 +368,9 @@ app.get('/v1/reddit/subreddit/details', authMiddleware, async (req, res) => {
                     errorMsg: `Primary: ${primaryErrorMsg} | Fallback: ${fallbackError.message}`
                 });
             }
+
+            // [NEW] 1. LOG THE FAILURE (Cost = 0)
+            await logApiRequest(req, '/v1/reddit/subreddit/details', 0, { subreddit: cleanSubreddit }, statusCode);
 
             return res.status(statusCode).json({
                 success: false,
@@ -371,11 +396,14 @@ app.get('/v1/reddit/subreddit/details', authMiddleware, async (req, res) => {
 
     req.user.credits -= costPerRequest;
 
+    // [NEW] 2. LOG THE SUCCESS (Cost = 1)
+    await logApiRequest(req, '/v1/reddit/subreddit/details', costPerRequest, { subreddit: cleanSubreddit }, 200);
+
     return res.status(200).json({
         success: true,
         credits_remaining: req.user.credits,
         credits_charged: costPerRequest,
-        ...responseData // Excluded provider_used completely
+        ...responseData 
     });
 });
 
@@ -494,7 +522,6 @@ app.get('/v1/reddit/subreddit/posts', authMiddleware, async (req, res) => {
             nextCursor = fallbackPayload.next_cursor;
 
         } catch (fallbackError) {
-            // Determine clean, white-labeled error for the customer
             const isTimeout = fallbackError.name === 'TimeoutError' || primaryError.name === 'TimeoutError';
             const isNotFound = fallbackError.message.includes('404') || primaryErrorMsg.includes('404');
             
@@ -509,7 +536,6 @@ app.get('/v1/reddit/subreddit/posts', authMiddleware, async (req, res) => {
                 clientErrorMsg = "504 Gateway Timeout: Data extraction took too long to complete. Please try again.";
             }
 
-            // Send detailed internal logs to Discord only
             if (typeof notifyFailure === 'function') {
                 notifyFailure({
                     endpoint: '/v1/reddit/subreddit/posts',
@@ -518,6 +544,9 @@ app.get('/v1/reddit/subreddit/posts', authMiddleware, async (req, res) => {
                     errorMsg: `Primary: ${primaryErrorMsg} | Fallback: ${fallbackError.message}`
                 });
             }
+
+            // [NEW] 1. LOG THE FAILURE (Cost = 0)
+            await logApiRequest(req, '/v1/reddit/subreddit/posts', 0, { subreddit: cleanSubreddit, sort, timeframe, cursor, limit, trim }, statusCode);
 
             return res.status(statusCode).json({
                 success: false,
@@ -529,6 +558,9 @@ app.get('/v1/reddit/subreddit/posts', authMiddleware, async (req, res) => {
     const formattedPosts = formatRedditPosts(postsData, trim);
 
     req.user.credits -= costPerRequest;
+
+    // [NEW] 2. LOG THE SUCCESS (Cost = 1)
+    await logApiRequest(req, '/v1/reddit/subreddit/posts', costPerRequest, { subreddit: cleanSubreddit, sort, timeframe, cursor, limit, trim }, 200);
 
     return res.status(200).json({
         success: true,
@@ -545,11 +577,7 @@ app.get('/v1/reddit/subreddit/search', authMiddleware, async (req, res) => {
     const query = req.query.q || req.query.query;
     const sort = req.query.sort || 'relevance';
     const timeframe = req.query.timeframe || 'all';
-    
-    // Support 'after' for legacy consumers, but strictly use 'cursor' going forward
     const cursor = req.query.cursor || req.query.after || null;
-    
-    // Parse limit for your internal tracking/webhooks (ScrapeCreators handles limit implicitly)
     const limit = parseInt(req.query.limit, 10) || 100;
 
     if (!rawInput || !query) {
@@ -559,7 +587,6 @@ app.get('/v1/reddit/subreddit/search', authMiddleware, async (req, res) => {
         });
     }
 
-    // Clean up input while preserving case sensitivity
     let cleanSubreddit = rawInput.trim().split('?')[0].replace(/\/$/, '');
     if (cleanSubreddit.includes('reddit.com/r/')) {
         cleanSubreddit = cleanSubreddit.split('reddit.com/r/')[1].split('/')[0];
@@ -614,7 +641,6 @@ app.get('/v1/reddit/subreddit/search', authMiddleware, async (req, res) => {
         if (primaryData.output && primaryData.output.found) {
             const data = primaryData.output.data;
             
-            // Map GetAnyAPI schema to expected internal format
             upstreamPayload = {
                 cursor: data.nextCursor || null,
                 posts: data.posts || [],
@@ -670,7 +696,6 @@ app.get('/v1/reddit/subreddit/search', authMiddleware, async (req, res) => {
             };
 
         } catch (fallbackError) {
-            // Determine clean, white-labeled error for the customer
             const isTimeout = fallbackError.name === 'TimeoutError' || primaryError.name === 'TimeoutError';
             const isNotFound = fallbackError.message.includes('404') || primaryErrorMsg.includes('404');
             
@@ -685,7 +710,6 @@ app.get('/v1/reddit/subreddit/search', authMiddleware, async (req, res) => {
                 clientErrorMsg = "504 Gateway Timeout: The search query took too long to complete. Please try again.";
             }
 
-            // Send detailed internal logs to Discord only
             if (typeof notifyFailure === 'function') {
                 notifyFailure({
                     endpoint: '/v1/reddit/subreddit/search',
@@ -695,6 +719,9 @@ app.get('/v1/reddit/subreddit/search', authMiddleware, async (req, res) => {
                 });
             }
 
+            // [NEW] 1. LOG THE FAILURE (Cost = 0)
+            await logApiRequest(req, '/v1/reddit/subreddit/search', 0, { subreddit: cleanSubreddit, query, sort, timeframe, cursor, limit }, statusCode);
+
             return res.status(statusCode).json({
                 success: false,
                 error: clientErrorMsg
@@ -702,7 +729,6 @@ app.get('/v1/reddit/subreddit/search', authMiddleware, async (req, res) => {
         }
     }
 
-    // --- NAMED 'cursor' AND PLACED AT THE TOP OF THE PAYLOAD ---
     const responseData = {
         cursor: upstreamPayload.cursor,
         posts: upstreamPayload.posts,
@@ -712,12 +738,15 @@ app.get('/v1/reddit/subreddit/search', authMiddleware, async (req, res) => {
     
     req.user.credits -= costPerRequest;
 
+    // [NEW] 2. LOG THE SUCCESS (Cost = 1)
+    await logApiRequest(req, '/v1/reddit/subreddit/search', costPerRequest, { subreddit: cleanSubreddit, query, sort, timeframe, cursor, limit }, 200);
+
     return res.status(200).json({
         success: true,
         credits_remaining: req.user.credits,
         credits_charged: costPerRequest,
         cursor: responseData.cursor,
-        ...responseData // cursor renders right below provider info
+        ...responseData 
     });
 });
 
@@ -739,7 +768,6 @@ app.get('/v1/reddit/post/comments', authMiddleware, async (req, res) => {
         });
     }
 
-    // Basic validation to ensure it's a valid Reddit post URL format
     if (!postUrl.includes('reddit.com/r/') || !postUrl.includes('/comments/')) {
         return res.status(400).json({
             success: false,
@@ -789,15 +817,10 @@ app.get('/v1/reddit/post/comments', authMiddleware, async (req, res) => {
         const primaryData = await primaryResponse.json();
 
         if (primaryData.output && primaryData.output.found) {
-            // GetAnyAPI groups comments array and nextCursor inside output.data
-            // We need to map this back to the expected schema
             const data = primaryData.output.data;
             
-            // Reconstruct the 'more' object expected by the frontend
             const moreObject = data.nextCursor ? { id: data.nextCursor } : null;
             
-            // GetAnyAPI doesn't return the parent 'post' metadata in this endpoint, 
-            // so we'll leave it null, just like the fallback might if it trims it.
             upstreamPayload = {
                 more: moreObject,
                 post: null, 
@@ -845,7 +868,6 @@ app.get('/v1/reddit/post/comments', authMiddleware, async (req, res) => {
                 throw new Error(fallbackPayload.error || `HTTP ${fallbackResponse.status}`);
             }
 
-            // Map the ScrapeCreators payload directly
             upstreamPayload = {
                 more: fallbackPayload.more || null,
                 post: fallbackPayload.post || null,
@@ -854,7 +876,6 @@ app.get('/v1/reddit/post/comments', authMiddleware, async (req, res) => {
             };
 
         } catch (fallbackError) {
-            // Determine clean, white-labeled error for the customer
             const isTimeout = fallbackError.name === 'TimeoutError' || primaryError.name === 'TimeoutError';
             const isNotFound = fallbackError.message.includes('404') || primaryErrorMsg.includes('404');
             
@@ -869,7 +890,6 @@ app.get('/v1/reddit/post/comments', authMiddleware, async (req, res) => {
                 clientErrorMsg = "504 Gateway Timeout: Data extraction took too long to complete. Please try again.";
             }
 
-            // Send detailed internal logs to Discord only
             if (typeof notifyFailure === 'function') {
                 notifyFailure({
                     endpoint: '/v1/reddit/post/comments',
@@ -879,6 +899,9 @@ app.get('/v1/reddit/post/comments', authMiddleware, async (req, res) => {
                 });
             }
 
+            // [NEW] 1. LOG THE FAILURE (Cost = 0)
+            await logApiRequest(req, '/v1/reddit/post/comments', 0, { url: postUrl, cursor, trim }, statusCode);
+
             return res.status(statusCode).json({
                 success: false,
                 error: clientErrorMsg
@@ -886,10 +909,12 @@ app.get('/v1/reddit/post/comments', authMiddleware, async (req, res) => {
         }
     }
     
-    // Fallback cursor mapping logic (in case GetAnyAPI returns nextCursor but we need it at top level)
     const activeCursor = upstreamPayload.cursor || (upstreamPayload.more ? upstreamPayload.more.id : null);
 
     req.user.credits -= costPerRequest;
+
+    // [NEW] 2. LOG THE SUCCESS (Cost = 1)
+    await logApiRequest(req, '/v1/reddit/post/comments', costPerRequest, { url: postUrl, cursor, trim }, 200);
 
     return res.status(200).json({
         success: true,
@@ -901,23 +926,18 @@ app.get('/v1/reddit/post/comments', authMiddleware, async (req, res) => {
         comments: upstreamPayload.comments
     });
 });
-const { scrapeGlobalSearch } = require('./src/scrapers/reddit');
+
 
 // --- ENDPOINT 5: GLOBAL SEARCH (1 CREDIT) ---
-// --- 2. UPDATED EXPRESS ROUTE ---
 app.get('/v1/reddit/search', authMiddleware, async (req, res) => {
     const query = req.query.q || req.query.query;
     const sort = req.query.sort || 'relevance';
     const timeframe = req.query.timeframe || 'all';
     
-    // ScrapeCreators supports filtering by 'posts' or 'comments' for global search
     const filter = req.query.filter || 'posts';
     
-    // Support 'after' for legacy consumers, but strictly use 'cursor' for output
     const cursor = req.query.cursor || req.query.after || null;
     const trim = req.query.trim === 'true';
-    
-    // Limit is tracked for cache keys and internal webhooks
     const limit = parseInt(req.query.limit, 10) || 100;
 
     if (!query) {
@@ -936,10 +956,7 @@ app.get('/v1/reddit/search', authMiddleware, async (req, res) => {
         });
     }
 
-    // Cache key uses base64 query to safely handle special characters (e.g., query="scrape API data")
-
     try {
-
         const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
         if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
 
@@ -948,12 +965,10 @@ app.get('/v1/reddit/search', authMiddleware, async (req, res) => {
         targetUrl.searchParams.append('sort', sort);
         targetUrl.searchParams.append('timeframe', timeframe);
         
-        // Pass the filter if the user explicitly provided it (e.g., searching for comments only)
         if (req.query.filter) {
             targetUrl.searchParams.append('filter', filter);
         }
 
-        // Secretly map your 'cursor' to ScrapeCreators' 'after' requirement
         if (cursor) {
             targetUrl.searchParams.append('after', cursor);
         }
@@ -976,7 +991,6 @@ app.get('/v1/reddit/search', authMiddleware, async (req, res) => {
             throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to execute global search'}`);
         }
 
-        // --- NAMED 'cursor' AND PLACED AT THE TOP OF THE PAYLOAD ---
         const responseData = {
             cursor: upstreamPayload.after || null,
             posts: upstreamPayload.posts || [],
@@ -984,13 +998,15 @@ app.get('/v1/reddit/search', authMiddleware, async (req, res) => {
         };
         
         req.user.credits -= costPerRequest;
-        // mockRedisCache[cacheKey] = responseData;
+
+        // [NEW] 1. LOG THE SUCCESS (Cost = 1)
+        await logApiRequest(req, '/v1/reddit/search', costPerRequest, { query, filter, sort, timeframe, cursor, limit, trim }, 200);
 
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
             credits_charged: costPerRequest,
-            ...responseData // cursor renders right below provider
+            ...responseData 
         });
 
     } catch (error) {
@@ -998,7 +1014,7 @@ app.get('/v1/reddit/search', authMiddleware, async (req, res) => {
         const isTimeout = error.name === 'TimeoutError';
         const statusCode = isTimeout ? 504 : (error.statusCode || 500);
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to respond." 
+            ? "504 Gateway Timeout: Server took too long to respond." 
             : errorMessage;
 
         if (statusCode >= 500 || statusCode === 403 || statusCode === 429) {
@@ -1012,6 +1028,9 @@ app.get('/v1/reddit/search', authMiddleware, async (req, res) => {
             }
         }
 
+        // [NEW] 2. LOG THE FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/reddit/search', 0, { query, filter, sort, timeframe, cursor, limit, trim }, statusCode);
+
         return res.status(statusCode).json({
             success: false,
             error: finalErrorMsg
@@ -1021,6 +1040,7 @@ app.get('/v1/reddit/search', authMiddleware, async (req, res) => {
 
 const { scrapeInstagramProfile } = require('./src/scrapers/instagram');
 
+// --- ENDPOINT 6: INSTAGRAM BASIC PROFILE (1 CREDIT) ---
 // --- ENDPOINT 6: INSTAGRAM BASIC PROFILE (1 CREDIT) ---
 app.get('/v1/instagram/basic-profile', authMiddleware, async (req, res) => {
     const userId = typeof req.query.userId === 'string' ? req.query.userId.trim() : '';
@@ -1041,17 +1061,19 @@ app.get('/v1/instagram/basic-profile', authMiddleware, async (req, res) => {
         });
     }
 
-    if (req.user.credits < 1) {
+    const costPerRequest = 1;
+
+    if (req.user.credits < costPerRequest) {
         return res.status(403).json({
             success: false,
-            error: '403 Forbidden: Insufficient credits. This request requires 1 credit.'
+            error: `403 Forbidden: Insufficient credits. This request requires ${costPerRequest} credit.`
         });
     }
 
     try {
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error('Missing ScrapeCreators API Key in environment');
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error('Missing extraction API Key in environment');
         }
 
         const targetUrl = new URL('https://api.scrapecreators.com/v1/instagram/basic-profile');
@@ -1061,42 +1083,45 @@ app.get('/v1/instagram/basic-profile', authMiddleware, async (req, res) => {
         const response = await fetch(targetUrl, {
             method: 'GET',
             headers: {
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Accept': 'application/json'
             },
             signal: AbortSignal.timeout(15000)
         });
 
-        let upstreamPayload;
+        let payload;
         try {
-            upstreamPayload = await response.json();
+            payload = await response.json();
         } catch (parseError) {
-            throw new Error(`Upstream API returned invalid JSON (HTTP ${response.status})`);
+            throw new Error(`Extraction server returned invalid JSON (HTTP ${response.status})`);
         }
 
-        if (!response.ok || upstreamPayload.success === false) {
-            const upstreamError = upstreamPayload.error || response.statusText || 'Failed to fetch Instagram basic profile';
-            const error = new Error(`Upstream API Error: ${upstreamError}`);
+        if (!response.ok || payload.success === false) {
+            const serverError = payload.error || response.statusText || 'Failed to fetch Instagram basic profile';
+            const error = new Error(`Server Error: ${serverError}`);
             error.statusCode = response.status;
             throw error;
         }
 
-        const creditsCharged = Number.isFinite(Number(upstreamPayload.credits_charged))
-            ? Number(upstreamPayload.credits_charged)
-            : 1;
+        const creditsCharged = Number.isFinite(Number(payload.credits_charged))
+            ? Number(payload.credits_charged)
+            : costPerRequest;
 
         if (creditsCharged < 0 || creditsCharged > 1) {
-            throw new Error('Upstream API returned an invalid credit charge');
+            throw new Error('Server returned an invalid credit charge');
         }
 
         const {
             success,
-            credits_remaining: upstreamCreditsRemaining,
-            credits_charged: upstreamCreditsCharged,
+            credits_remaining: ignoredCreditsRemaining,
+            credits_charged: ignoredCreditsCharged,
             ...profileData
-        } = upstreamPayload;
+        } = payload;
 
         req.user.credits -= creditsCharged;
+
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/instagram/basic-profile', creditsCharged, { userId, cache_max_age: cacheMaxAge }, 200);
 
         return res.status(200).json({
             success: true,
@@ -1108,16 +1133,23 @@ app.get('/v1/instagram/basic-profile', authMiddleware, async (req, res) => {
         const statusCode = error.name === 'TimeoutError'
             ? 504
             : (error.statusCode >= 400 && error.statusCode < 500 ? error.statusCode : 500);
+            
+        // White-labeled timeout message
         const errorMessage = error.name === 'TimeoutError'
-            ? '504 Gateway Timeout: Upstream provider took too long to respond.'
+            ? '504 Gateway Timeout: The extraction server took too long to respond.'
             : error.message || 'Internal Server Error';
 
-        notifyFailure({
-            endpoint: '/v1/instagram/basic-profile',
-            params: { userId, cache_max_age: cacheMaxAge },
-            statusCode,
-            errorMsg: errorMessage
-        });
+        if (typeof notifyFailure === 'function') {
+            notifyFailure({
+                endpoint: '/v1/instagram/basic-profile',
+                params: { userId, cache_max_age: cacheMaxAge },
+                statusCode,
+                errorMsg: errorMessage
+            });
+        }
+
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/instagram/basic-profile', 0, { userId, cache_max_age: cacheMaxAge }, statusCode);
 
         return res.status(statusCode).json({
             success: false,
@@ -1128,7 +1160,6 @@ app.get('/v1/instagram/basic-profile', authMiddleware, async (req, res) => {
 
 // --- ENDPOINT 6: INSTAGRAM PROFILE (1 CREDIT) ---
 app.get('/v1/instagram/profile', authMiddleware, async (req, res) => {
-    // Support 'username', 'user', and 'handle' to ensure zero breaking changes for your API consumers
     const rawInput = req.query.username || req.query.user || req.query.handle;
     const trim = req.query.trim === 'true';
     const cacheMaxAge = req.query.cache_max_age || '7d';
@@ -1140,7 +1171,6 @@ app.get('/v1/instagram/profile', authMiddleware, async (req, res) => {
         });
     }
 
-    // Aggressive sanitization: strip @ symbols, tracking params, trailing slashes, and full URLs
     let cleanHandle = rawInput.trim().replace('@', '').split('?')[0].replace(/\/$/, '').toLowerCase();
     if (cleanHandle.includes('instagram.com/')) {
         cleanHandle = cleanHandle.split('instagram.com/')[1].split('/')[0];
@@ -1156,13 +1186,11 @@ app.get('/v1/instagram/profile', authMiddleware, async (req, res) => {
     }
 
     try {
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API Key in environment");
 
         const targetUrl = new URL('https://api.scrapecreators.com/v1/instagram/profile');
         targetUrl.searchParams.append('handle', cleanHandle);
-        
-        // Still forward cache_max_age upstream to save costs if they cache it
         targetUrl.searchParams.append('cache_max_age', cacheMaxAge);
         
         if (trim) {
@@ -1172,31 +1200,32 @@ app.get('/v1/instagram/profile', authMiddleware, async (req, res) => {
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: {
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(15000)
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        if (!response.ok || upstreamPayload.success === false) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch Instagram profile'}`);
+        if (!response.ok || payload.success === false) {
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to fetch Instagram profile'}`);
         }
 
-        // Map ScrapeCreators' nested data.user payload directly to the root for your consumers
         const responseData = {
-            user: upstreamPayload.data?.user || upstreamPayload.user || null
+            user: payload.data?.user || payload.user || null
         };
         
         req.user.credits -= costPerRequest;
 
-        // The universalCacheMiddleware automatically captures this response and saves it
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/instagram/profile', costPerRequest, { handle: cleanHandle, trim, cache_max_age: cacheMaxAge }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
             credits_charged: costPerRequest,
-            cursor: upstreamPayload.cursor || null, // Fixed: pulled from upstream payload instead of the deleted local cache
+            cursor: payload.cursor || null,
             ...responseData 
         });
 
@@ -1204,20 +1233,25 @@ app.get('/v1/instagram/profile', authMiddleware, async (req, res) => {
         const errorMessage = error.message || "Internal Server Error";
         const isTimeout = error.name === 'TimeoutError';
         const statusCode = isTimeout ? 504 : (error.statusCode || 500);
+        
+        // White-labeled timeout message
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to respond." 
+            ? "504 Gateway Timeout: The extraction server took too long to respond." 
             : errorMessage;
 
         if (statusCode >= 500 || statusCode === 403 || statusCode === 429) {
             if (typeof notifyFailure === 'function') {
                 notifyFailure({
                     endpoint: '/v1/instagram/profile',
-                    params: { handle: cleanHandle, trim },
+                    params: { handle: cleanHandle, trim, cache_max_age: cacheMaxAge },
                     statusCode: statusCode,
                     errorMsg: finalErrorMsg
                 });
             }
         }
+
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/instagram/profile', 0, { handle: cleanHandle, trim, cache_max_age: cacheMaxAge }, statusCode);
 
         return res.status(statusCode).json({
             success: false,
@@ -1226,11 +1260,8 @@ app.get('/v1/instagram/profile', authMiddleware, async (req, res) => {
     }
 }); 
 
-// In your main router file (e.g., app.js or routes.js)
-// --- EXPRESS ROUTE: INSTAGRAM USER FEED (ARBITRAGE) ---
 // --- EXPRESS ROUTE: INSTAGRAM USER POSTS (v2 ARBITRAGE) ---
 app.get('/v1/instagram/user/posts', authMiddleware, async (req, res) => {
-    // Support both 'handle' and 'username' so you don't break existing consumers
     const handle = req.query.handle || req.query.username;
     const cursor = req.query.next_max_id || req.query.cursor || null;
     const trim = req.query.trim === 'true';
@@ -1242,13 +1273,12 @@ app.get('/v1/instagram/user/posts', authMiddleware, async (req, res) => {
         });
     }
 
-    // Clean up the handle in case users paste full URLs or '@' symbols
     let cleanHandle = handle.split('?')[0].replace(/\/$/, '').replace('@', '');
     if (cleanHandle.includes('instagram.com/')) {
         cleanHandle = cleanHandle.split('instagram.com/')[1].split('/')[0];
     }
 
-    const costPerRequest = 1; // DaaS markup
+    const costPerRequest = 1; 
 
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({
@@ -1257,13 +1287,9 @@ app.get('/v1/instagram/user/posts', authMiddleware, async (req, res) => {
         });
     }
 
-    // Cache key incorporates the trim parameter to avoid serving trimmed data to a non-trim request
-
     try {
-       
-
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API Key in environment");
 
         const targetUrl = new URL('https://api.scrapecreators.com/v2/instagram/user/posts');
         targetUrl.searchParams.append('handle', cleanHandle);
@@ -1278,29 +1304,30 @@ app.get('/v1/instagram/user/posts', authMiddleware, async (req, res) => {
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: {
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(15000)
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        if (!response.ok || !upstreamPayload.success) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch user posts'}`);
+        if (!response.ok || !payload.success) {
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to fetch user posts'}`);
         }
 
-        // Standardize the output so your consumers get a consistent format
-        // Note: As you mentioned, 'play_count' inside items will be IG-only views
         const responseData = {
-            user: upstreamPayload.user || null,
-            post_count: upstreamPayload.num_results || (upstreamPayload.items ? upstreamPayload.items.length : 0),
-            has_more: upstreamPayload.more_available || false,
-            next_cursor: upstreamPayload.next_max_id || null, 
-            posts: upstreamPayload.items || [] 
+            user: payload.user || null,
+            post_count: payload.num_results || (payload.items ? payload.items.length : 0),
+            has_more: payload.more_available || false,
+            next_cursor: payload.next_max_id || null, 
+            posts: payload.items || [] 
         };
 
         req.user.credits -= costPerRequest;
+
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/instagram/user/posts', costPerRequest, { handle: cleanHandle, cursor, trim }, 200);
 
         return res.status(200).json({
             success: true,
@@ -1313,9 +1340,12 @@ app.get('/v1/instagram/user/posts', authMiddleware, async (req, res) => {
         const errorMessage = error.message || "Internal Server Error";
         const isTimeout = error.name === 'TimeoutError';
         const statusCode = isTimeout ? 504 : 500;
-        const finalErrorMsg = isTimeout ? "504 Gateway Timeout: Upstream provider took too long to respond." : errorMessage;
+        
+        // White-labeled timeout message
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction server took too long to respond." 
+            : errorMessage;
 
-        // Discord Failure Alert
         if (typeof notifyFailure === 'function') {
             notifyFailure({
                 endpoint: '/v1/instagram/user/posts',
@@ -1325,6 +1355,9 @@ app.get('/v1/instagram/user/posts', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/instagram/user/posts', 0, { handle: cleanHandle, cursor, trim }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -1333,8 +1366,8 @@ app.get('/v1/instagram/user/posts', authMiddleware, async (req, res) => {
 });
 
 // --- EXPRESS ROUTE: INSTAGRAM USER HIGHLIGHTS (ARBITRAGE) ---
+// --- ENDPOINT 7: INSTAGRAM USER HIGHLIGHTS (2 CREDITS) ---
 app.get('/v1/instagram/user/highlights', authMiddleware, async (req, res) => {
-    // API supports both, but prefers user_id for speed
     const userId = req.query.user_id;
     const handle = req.query.handle || req.query.username;
 
@@ -1345,7 +1378,6 @@ app.get('/v1/instagram/user/highlights', authMiddleware, async (req, res) => {
         });
     }
 
-    // Clean up handle if it was provided
     let cleanHandle = handle ? handle.split('?')[0].replace(/\/$/, '').replace('@', '') : null;
     if (cleanHandle && cleanHandle.includes('instagram.com/')) {
         cleanHandle = cleanHandle.split('instagram.com/')[1].split('/')[0];
@@ -1360,12 +1392,9 @@ app.get('/v1/instagram/user/highlights', authMiddleware, async (req, res) => {
         });
     }
 
-    // Create a unique cache key depending on which parameter they used
-
     try {
-
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API Key in environment");
 
         const targetUrl = new URL('https://api.scrapecreators.com/v1/instagram/user/highlights');
         
@@ -1378,20 +1407,19 @@ app.get('/v1/instagram/user/highlights', authMiddleware, async (req, res) => {
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: {
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(15000)
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        if (!response.ok || !upstreamPayload.success) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch highlights'}`);
+        if (!response.ok || !payload.success) {
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to fetch highlights'}`);
         }
 
-        // Safely extract the highlights array
-        const highlights = upstreamPayload.highlights || (upstreamPayload.data && upstreamPayload.data.highlights) || [];
+        const highlights = payload.highlights || (payload.data && payload.data.highlights) || [];
 
         const responseData = {
             highlights_count: highlights.length,
@@ -1399,7 +1427,9 @@ app.get('/v1/instagram/user/highlights', authMiddleware, async (req, res) => {
         };
 
         req.user.credits -= costPerRequest;
-        // mockRedisCache[cacheKey] = responseData;
+
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/instagram/user/highlights', costPerRequest, { user_id: userId, handle: cleanHandle }, 200);
 
         return res.status(200).json({
             success: true,
@@ -1412,7 +1442,11 @@ app.get('/v1/instagram/user/highlights', authMiddleware, async (req, res) => {
         const errorMessage = error.message || "Internal Server Error";
         const isTimeout = error.name === 'TimeoutError';
         const statusCode = isTimeout ? 504 : 500;
-        const finalErrorMsg = isTimeout ? "504 Gateway Timeout: Upstream provider took too long to respond." : errorMessage;
+        
+        // White-labeled
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction server took too long to respond." 
+            : errorMessage;
 
         if (typeof notifyFailure === 'function') {
             notifyFailure({
@@ -1423,6 +1457,9 @@ app.get('/v1/instagram/user/highlights', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/instagram/user/highlights', 0, { user_id: userId, handle: cleanHandle }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -1430,12 +1467,8 @@ app.get('/v1/instagram/user/highlights', authMiddleware, async (req, res) => {
     }
 });
 
-// In your main router file (e.g., app.js or routes.js)
-const { transcribeVideoBuffer } = require('./src/services/transcription');
-// Assume you build a scrapeSinglePost function using your existing Playwright architecture
 
-const { scrapeSinglePost } = require('./src/scrapers/instagram');
-
+// --- ENDPOINT 8: INSTAGRAM SINGLE POST ---
 app.get('/v1/instagram/post', authMiddleware, async (req, res) => {
     const { shortcode, region, trim, download_media, cache_max_age } = req.query;
 
@@ -1445,6 +1478,7 @@ app.get('/v1/instagram/post', authMiddleware, async (req, res) => {
 
     const isDownloadRequested = String(download_media).toLowerCase() === 'true';
     const maxExpectedCost = isDownloadRequested ? 10 : 1;
+    
     if (req.user.credits < maxExpectedCost) {
         return res.status(403).json({
             success: false,
@@ -1457,28 +1491,36 @@ app.get('/v1/instagram/post', authMiddleware, async (req, res) => {
         : `https://www.instagram.com/p/${shortcode}/`;
 
     let primaryError;
+    
+    // --- PRIMARY ENGINE ---
     try {
-        const getAnyApiKey = process.env.GETANYAPI_KEY;
-        if (!getAnyApiKey) throw new Error('Missing GETANYAPI_KEY in environment');
+        const primaryApiKey = process.env.GETANYAPI_KEY;
+        if (!primaryApiKey) throw new Error('Missing primary API key in environment');
 
         const response = await fetch('https://api.getanyapi.com/v1/run/instagram.post', {
             method: 'POST',
             headers: {
-                Authorization: `Bearer ${getAnyApiKey}`,
+                Authorization: `Bearer ${primaryApiKey}`,
                 'Content-Type': 'application/json'
             },
             body: JSON.stringify({ url: targetUrl, ...(isDownloadRequested ? { hostVideo: true } : {}) }),
             signal: AbortSignal.timeout(20000)
         });
+        
         const payload = await response.json();
+        
         if (!response.ok) {
-            const error = new Error(`AnyAPI Error: ${payload.error || response.statusText || 'Failed to fetch Instagram post'}`);
+            const error = new Error(`Extraction Error: ${payload.error || response.statusText || 'Failed to fetch Instagram post'}`);
             error.statusCode = response.status;
             throw error;
         }
 
         const actualCreditsCharged = isDownloadRequested ? 10 : 1;
         req.user.credits -= actualCreditsCharged;
+
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/instagram/post', actualCreditsCharged, { shortcode, region, trim, download_media, cache_max_age }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -1488,9 +1530,10 @@ app.get('/v1/instagram/post', authMiddleware, async (req, res) => {
         });
     } catch (error) {
         primaryError = error;
-        console.error('[SignalQub] AnyAPI Instagram post failed:', error.message);
+        console.error('[SignalQub] Primary extraction engine failed:', error.message);
     }
 
+    // --- FALLBACK ENGINE ---
     try {
         const fallbackUrl = new URL('https://api.scrapecreators.com/v1/instagram/post');
         fallbackUrl.searchParams.set('url', targetUrl);
@@ -1507,7 +1550,9 @@ app.get('/v1/instagram/post', authMiddleware, async (req, res) => {
             },
             signal: AbortSignal.timeout(20000)
         });
+        
         const payload = await response.json();
+        
         if (!response.ok || !payload.success) {
             const error = new Error(payload.detail || payload.message || payload.error || 'Failed to fetch Instagram post');
             error.statusCode = response.status === 200 ? 500 : response.status;
@@ -1516,6 +1561,10 @@ app.get('/v1/instagram/post', authMiddleware, async (req, res) => {
 
         const actualCreditsCharged = payload.credits_charged || 1;
         req.user.credits -= actualCreditsCharged;
+
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/instagram/post', actualCreditsCharged, { shortcode, region, trim, download_media, cache_max_age }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -1526,23 +1575,31 @@ app.get('/v1/instagram/post', authMiddleware, async (req, res) => {
     } catch (fallbackError) {
         const isTimeout = fallbackError.name === 'TimeoutError' || primaryError?.name === 'TimeoutError';
         const statusCode = isTimeout ? 504 : (fallbackError.statusCode || 500);
+        
+        // White-labeled
         const errorMessage = isTimeout
-            ? '504 Gateway Timeout: All Instagram post providers took too long to respond.'
+            ? '504 Gateway Timeout: All extraction servers took too long to respond.'
             : `500 Internal Server Error: The extraction failed. (${fallbackError.message})`;
 
-        notifyFailure({
-            endpoint: '/v1/instagram/post',
-            params: { shortcode, region, trim, download_media, cache_max_age },
-            statusCode,
-            errorMsg: `AnyAPI: ${primaryError?.message || 'unknown'} | ScrapeCreators: ${fallbackError.message}`
-        });
+        if (typeof notifyFailure === 'function') {
+            notifyFailure({
+                endpoint: '/v1/instagram/post',
+                params: { shortcode, region, trim, download_media, cache_max_age },
+                statusCode,
+                errorMsg: `Primary Engine: ${primaryError?.message || 'unknown'} | Fallback Engine: ${fallbackError.message}`
+            });
+        }
+
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/instagram/post', 0, { shortcode, region, trim, download_media, cache_max_age }, statusCode);
 
         return res.status(statusCode).json({ success: false, error: errorMessage });
     }
 });
 
+
+// --- ENDPOINT 9: INSTAGRAM POST (LEGACY) ---
 app.get('/v1/instagram/post-legacy', authMiddleware, async (req, res) => {
-    // 1. Extract parameters from the user's request
     const { shortcode, region, trim, download_media, cache_max_age } = req.query;
 
     if (!shortcode) {
@@ -1552,8 +1609,6 @@ app.get('/v1/instagram/post-legacy', authMiddleware, async (req, res) => {
         });
     }
 
-    // 2. Determine maximum expected cost to protect user margins
-    // Upstream charges up to 10 credits if media is successfully downloaded
     const isDownloadRequested = String(download_media).toLowerCase() === 'true';
     const maxExpectedCost = isDownloadRequested ? 10 : 1;
 
@@ -1564,49 +1619,38 @@ app.get('/v1/instagram/post-legacy', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Safely construct the Upstream URL
-    const upstreamUrl = new URL('https://api.scrapecreators.com/v1/instagram/post');
+    const serverUrl = new URL('https://api.scrapecreators.com/v1/instagram/post');
     
-    // Auto-correct: If user passed a full URL instead of a shortcode, pass it directly.
-    // Otherwise, convert the shortcode to an IG post URL.
     let targetUrl = shortcode;
     if (!shortcode.startsWith('http')) {
         targetUrl = `https://www.instagram.com/p/${shortcode}/`;
     }
     
-    upstreamUrl.searchParams.append('url', targetUrl);
-    
-    // Append optional upstream parameters if the user provided them
-    if (region) upstreamUrl.searchParams.append('region', region);
-    if (trim) upstreamUrl.searchParams.append('trim', trim);
-    if (download_media) upstreamUrl.searchParams.append('download_media', download_media);
-    
-    // Pass cache_max_age upstream to save costs there, but our global middleware 
-    // will intercept it first if we already have it in our local cache.
-    if (cache_max_age) upstreamUrl.searchParams.append('cache_max_age', cache_max_age);
+    serverUrl.searchParams.append('url', targetUrl);
+    if (region) serverUrl.searchParams.append('region', region);
+    if (trim) serverUrl.searchParams.append('trim', trim);
+    if (download_media) serverUrl.searchParams.append('download_media', download_media);
+    if (cache_max_age) serverUrl.searchParams.append('cache_max_age', cache_max_age);
 
     try {
-        console.log(`[SignalQub] Calling ScrapeCreators for: ${targetUrl}`);
+        console.log(`[SignalQub] Calling extraction server for: ${targetUrl}`);
 
-        // 4. Make the API call to ScrapeCreators
-        const response = await fetch(upstreamUrl.toString(), {
+        const response = await fetch(serverUrl.toString(), {
             method: 'GET',
             headers: {
                 'x-api-key': process.env.SCRAPE_CREATORS_API_KEY, 
                 'Content-Type': 'application/json'
             },
-            signal: AbortSignal.timeout(20000) // Added a timeout to match your other routes
+            signal: AbortSignal.timeout(20000) 
         });
 
-        const targetData = await response.json();
+        const payload = await response.json();
         
-        console.log(`[Upstream Response] Status: ${response.status}`, JSON.stringify(targetData).substring(0, 250));
+        console.log(`[Extraction Response] Status: ${response.status}`, JSON.stringify(payload).substring(0, 250));
 
-        // 5. Intercept and Sanitize Errors (White-labeling)
-        if (!response.ok || !targetData.success) {
+        if (!response.ok || !payload.success) {
             const statusCode = response.status === 200 ? 500 : response.status;
-            
-            const rawError = targetData.detail || targetData.message || targetData.error || "Unknown extraction error occurred.";
+            const rawError = payload.detail || payload.message || payload.error || "Unknown extraction error occurred.";
             
             let cleanErrorMsg = "500 Internal Server Error: Extraction failed. The engineering team has been notified.";
 
@@ -1615,10 +1659,14 @@ app.get('/v1/instagram/post-legacy', authMiddleware, async (req, res) => {
             } else if (statusCode === 429) {
                 cleanErrorMsg = "429 Too Many Requests: Extraction rate limit exceeded. Please back off and retry.";
             } else if (statusCode === 400 || statusCode === 422 || statusCode === 401 || statusCode === 403) {
+                // Completely swap out any provider branding
                 cleanErrorMsg = `${statusCode} Error: ${rawError.replace(/scrapecreators|upstream|provider/ig, 'SignalQub')}`;
             } else if (statusCode >= 500) {
                 cleanErrorMsg = "500 Internal Server Error: Instagram anti-bot protection triggered. Please try again in a few moments.";
             }
+
+            // [NEW] LOG FAILURE (Cost = 0) BEFORE EARLY RETURN
+            await logApiRequest(req, '/v1/instagram/post-legacy', 0, { shortcode, region, trim, download_media, cache_max_age }, statusCode);
 
             return res.status(statusCode).json({
                 success: false,
@@ -1626,18 +1674,18 @@ app.get('/v1/instagram/post-legacy', authMiddleware, async (req, res) => {
             });
         }
 
-        // 6. Deduct the EXACT credits charged by the provider
-        const actualCreditsCharged = targetData.credits_charged || 1;
+        const actualCreditsCharged = payload.credits_charged || 1;
         req.user.credits -= actualCreditsCharged;
 
-        // 7. Return the formatted success response. 
-        // The universalCacheMiddleware automatically captures this and caches it.
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/instagram/post-legacy', actualCreditsCharged, { shortcode, region, trim, download_media, cache_max_age }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
             credits_charged: actualCreditsCharged,
             status: "success",
-            data: targetData.data 
+            data: payload.data 
         });
 
     } catch (error) {
@@ -1645,9 +1693,14 @@ app.get('/v1/instagram/post-legacy', authMiddleware, async (req, res) => {
         
         const isTimeout = error.name === 'TimeoutError' || error.message === 'TimeoutError';
         const statusCode = isTimeout ? 504 : 500;
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
             ? "504 Gateway Timeout: The extraction engine took too long to respond." 
             : `500 Internal Server Error: The extraction failed. (${error.message})`;
+
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/instagram/post-legacy', 0, { shortcode, region, trim, download_media, cache_max_age }, statusCode);
 
         return res.status(statusCode).json({ 
             success: false, 
@@ -1656,8 +1709,9 @@ app.get('/v1/instagram/post-legacy', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- ENDPOINT 10: INSTAGRAM TRANSCRIPT ---
 app.get('/v1/instagram/transcript', authMiddleware, async (req, res) => {
-    // 1. Extract parameters
     const { shortcode, cache_max_age } = req.query;
 
     if (!shortcode) {
@@ -1667,7 +1721,6 @@ app.get('/v1/instagram/transcript', authMiddleware, async (req, res) => {
         });
     }
 
-    // 2. Set your internal pricing
     const costPerRequest = 2;
 
     if (req.user.credits < costPerRequest) {
@@ -1677,41 +1730,35 @@ app.get('/v1/instagram/transcript', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Construct the Upstream URL for ScrapeCreators V2
-    const upstreamUrl = new URL('https://api.scrapecreators.com/v2/instagram/media/transcript');
+    const serverUrl = new URL('https://api.scrapecreators.com/v2/instagram/media/transcript');
     
-    // Auto-correct: Ensure we pass a full URL to the server
     let targetUrl = shortcode;
     if (!shortcode.startsWith('http')) {
         targetUrl = `https://www.instagram.com/p/${shortcode}/`;
     }
     
-    upstreamUrl.searchParams.append('url', targetUrl);
-    if (cache_max_age) upstreamUrl.searchParams.append('cache_max_age', cache_max_age);
+    serverUrl.searchParams.append('url', targetUrl);
+    if (cache_max_age) serverUrl.searchParams.append('cache_max_age', cache_max_age);
 
     try {
         console.log(`[SignalQub] Requesting AI Transcript for: ${targetUrl}`);
 
-        // 4. Call the upstream AI transcription endpoint
-        const response = await fetch(upstreamUrl.toString(), {
+        const response = await fetch(serverUrl.toString(), {
             method: 'GET',
             headers: {
                 'x-api-key': process.env.SCRAPE_CREATORS_API_KEY,
                 'Content-Type': 'application/json'
             },
-            // Added a 35s timeout specifically for the heavy AI transcription task
             signal: AbortSignal.timeout(35000) 
         });
 
-        const targetData = await response.json();
+        const payload = await response.json();
 
-        // 🚨 Diagnostic Log
-        console.log(`[Upstream Transcript] Status: ${response.status}`, JSON.stringify(targetData).substring(0, 200));
+        console.log(`[Server Transcript] Status: ${response.status}`, JSON.stringify(payload).substring(0, 200));
 
-        // 5. White-labeled Error Handling
-        if (!response.ok || !targetData.success) {
+        if (!response.ok || !payload.success) {
             const statusCode = response.status === 200 ? 500 : response.status;
-            const rawError = targetData.detail || targetData.message || targetData.error || "Failed to generate transcript.";
+            const rawError = payload.detail || payload.message || payload.error || "Failed to generate transcript.";
             
             let cleanErrorMsg = "500 Internal Server Error: AI Transcription failed. The engineering team has been notified.";
 
@@ -1720,10 +1767,14 @@ app.get('/v1/instagram/transcript', authMiddleware, async (req, res) => {
             } else if (statusCode === 429) {
                 cleanErrorMsg = "429 Too Many Requests: Rate limit exceeded. Please back off and retry.";
             } else if (statusCode === 400 || statusCode === 422 || statusCode === 401 || statusCode === 403) {
+                // White-label regex swap
                 cleanErrorMsg = `${statusCode} Error: ${rawError.replace(/scrapecreators|upstream|provider/ig, 'SignalQub')}`;
             } else if (statusCode >= 500) {
                 cleanErrorMsg = "500 Internal Server Error: Video extraction or transcription process failed. Please ensure the video is under 2 minutes.";
             }
+
+            // [NEW] LOG FAILURE (Cost = 0) BEFORE EARLY RETURN
+            await logApiRequest(req, '/v1/instagram/transcript', 0, { shortcode, cache_max_age }, statusCode);
 
             return res.status(statusCode).json({
                 success: false,
@@ -1731,18 +1782,17 @@ app.get('/v1/instagram/transcript', authMiddleware, async (req, res) => {
             });
         }
 
-        // 6. Map the upstream data to match your existing SignalQub schema
-        const formattedTranscripts = (targetData.transcripts || []).map(t => ({
+        const formattedTranscripts = (payload.transcripts || []).map(t => ({
             id: t.id,
             type: 'video', 
             transcript: t.text || null
         }));
 
-        // 7. Deduct the credits
         req.user.credits -= costPerRequest;
 
-        // 8. Return the final payload
-        // The universalCacheMiddleware automatically intercepts and caches this
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/instagram/transcript', costPerRequest, { shortcode, cache_max_age }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -1759,9 +1809,14 @@ app.get('/v1/instagram/transcript', authMiddleware, async (req, res) => {
         
         const isTimeout = error.name === 'TimeoutError' || error.message === 'TimeoutError';
         const statusCode = isTimeout ? 504 : 500;
+        
+        // White-labeled
         const errorMsg = isTimeout 
             ? "504 Gateway Timeout: The AI transcription engine took too long to respond. The video may be too long or the queue is full."
             : `500 Internal Server Error: ${error.message}`;
+
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/instagram/transcript', 0, { shortcode, cache_max_age }, statusCode);
 
         return res.status(statusCode).json({ 
             success: false, 
@@ -1773,6 +1828,7 @@ app.get('/v1/instagram/transcript', authMiddleware, async (req, res) => {
 // --- 2. EXPRESS ROUTE ---
 // --- EXPRESS ROUTE: INSTAGRAM ARBITRAGE SEARCH ---
 // --- EXPRESS ROUTE: INSTAGRAM ARBITRAGE SEARCH ---
+// --- EXPRESS ROUTE: INSTAGRAM SEARCH ---
 app.get('/v1/instagram/search', authMiddleware, async (req, res) => {
     const query = req.query.q || req.query.query;
     
@@ -1792,12 +1848,9 @@ app.get('/v1/instagram/search', authMiddleware, async (req, res) => {
         });
     }
 
-
     try {
-        
-        // 1. Fetch from Upstream API (ScrapeCreators)
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API Key in environment");
 
         const targetUrl = new URL('https://api.scrapecreators.com/v1/instagram/search');
         targetUrl.searchParams.append('query', query);
@@ -1805,28 +1858,25 @@ app.get('/v1/instagram/search', authMiddleware, async (req, res) => {
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: {
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(15000) 
         });
 
-        // Rename variable to avoid shadowing
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 2. Handle Upstream Errors
-        if (!response.ok || !upstreamPayload.success) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Unknown Error'}`);
+        if (!response.ok || !payload.success) {
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Unknown Error'}`);
         }
 
-        // THE FIX: If they nested it inside .data, extract it. Otherwise, pass the whole payload.
-        const scrapedContent = upstreamPayload.data !== undefined ? upstreamPayload.data : upstreamPayload;
+        const scrapedContent = payload.data !== undefined ? payload.data : payload;
 
-        // 3. Deduct Credits & Cache
         req.user.credits -= costPerRequest;
-        // mockRedisCache[cacheKey] = scrapedContent;
 
-        // 4. Return to Consumer
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/instagram/search', costPerRequest, { query }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -1839,9 +1889,12 @@ app.get('/v1/instagram/search', authMiddleware, async (req, res) => {
         
         const isTimeout = error.name === 'TimeoutError';
         const statusCode = isTimeout ? 504 : 500;
-        const finalErrorMsg = isTimeout ? "504 Gateway Timeout: Upstream provider took too long to respond." : errorMessage;
+        
+        // White-labeled
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction server took too long to respond." 
+            : errorMessage;
 
-        // Fire Discord Webhook
         if (typeof notifyFailure === 'function') {
             notifyFailure({
                 endpoint: '/v1/instagram/search',
@@ -1850,6 +1903,9 @@ app.get('/v1/instagram/search', authMiddleware, async (req, res) => {
                 errorMsg: finalErrorMsg
             });
         }
+
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/instagram/search', 0, { query }, statusCode);
 
         return res.status(statusCode).json({
             success: false,
@@ -1879,13 +1935,9 @@ app.get('/v1/instagram/user/tagged-posts', authMiddleware, async (req, res) => {
         });
     }
 
-
     try {
-
-
-        // 2. Fetch from ScrapeCreators
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API Key in environment");
 
         const targetUrl = new URL('https://api.scrapecreators.com/v1/instagram/user/tagged-posts');
         targetUrl.searchParams.append('user_id', userId);
@@ -1896,23 +1948,21 @@ app.get('/v1/instagram/user/tagged-posts', authMiddleware, async (req, res) => {
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: {
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(15000)
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 3. Handle Upstream Errors
-        if (!response.ok || !upstreamPayload.success) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch tagged posts'}`);
+        if (!response.ok || !payload.success) {
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to fetch tagged posts'}`);
         }
 
-        // Safely extract posts and pagination data
-        const posts = upstreamPayload.posts || (upstreamPayload.data && upstreamPayload.data.posts) || [];
-        const nextCursor = upstreamPayload.cursor || (upstreamPayload.data && upstreamPayload.data.cursor) || null;
-        const hasMore = upstreamPayload.has_more ?? (upstreamPayload.data && upstreamPayload.data.has_more) ?? false;
+        const posts = payload.posts || (payload.data && payload.data.posts) || [];
+        const nextCursor = payload.cursor || (payload.data && payload.data.cursor) || null;
+        const hasMore = payload.has_more ?? (payload.data && payload.data.has_more) ?? false;
 
         const responseData = {
             posts: posts,
@@ -1920,10 +1970,11 @@ app.get('/v1/instagram/user/tagged-posts', authMiddleware, async (req, res) => {
             has_more: hasMore
         };
 
-        // 4. Deduct Credits & Cache
         req.user.credits -= costPerRequest;
 
-        // 5. Return to Consumer
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/instagram/user/tagged-posts', costPerRequest, { user_id: userId, cursor }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -1936,9 +1987,12 @@ app.get('/v1/instagram/user/tagged-posts', authMiddleware, async (req, res) => {
         
         const isTimeout = error.name === 'TimeoutError';
         const statusCode = isTimeout ? 504 : 500;
-        const finalErrorMsg = isTimeout ? "504 Gateway Timeout: Upstream provider took too long to respond." : errorMessage;
+        
+        // White-labeled
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction server took too long to respond." 
+            : errorMessage;
 
-        // Discord Failure Alert
         if (typeof notifyFailure === 'function') {
             notifyFailure({
                 endpoint: '/v1/instagram/user/tagged-posts',
@@ -1947,6 +2001,9 @@ app.get('/v1/instagram/user/tagged-posts', authMiddleware, async (req, res) => {
                 errorMsg: finalErrorMsg
             });
         }
+
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/instagram/user/tagged-posts', 0, { user_id: userId, cursor }, statusCode);
 
         return res.status(statusCode).json({
             success: false,
@@ -1960,7 +2017,7 @@ app.get('/v1/instagram/user/tagged-posts', authMiddleware, async (req, res) => {
 app.get('/v1/instagram/post/comments', authMiddleware, async (req, res) => {
     const postUrl = req.query.url;
     const cursor = req.query.cursor || null;
-    const includeReplies = req.query.include_replies === 'true'; // Boolean cast
+    const includeReplies = req.query.include_replies === 'true'; 
 
     if (!postUrl) {
         return res.status(400).json({
@@ -1969,7 +2026,6 @@ app.get('/v1/instagram/post/comments', authMiddleware, async (req, res) => {
         });
     }
 
-    // Dynamic Pricing Logic: Base is 2 credits, Replies are 30 credits (2x markup)
     const costPerRequest = includeReplies ? 15 : 2;
 
     if (req.user.credits < costPerRequest) {
@@ -1979,15 +2035,9 @@ app.get('/v1/instagram/post/comments', authMiddleware, async (req, res) => {
         });
     }
 
-    // Cache key includes the include_replies flag to prevent serving base data to a replies request
-
     try {
-        // 1. Cache Check
-       
-
-        // 2. Fetch from ScrapeCreators
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API Key in environment");
 
         const targetUrl = new URL('https://api.scrapecreators.com/v2/instagram/post/comments');
         targetUrl.searchParams.append('url', postUrl);
@@ -1999,37 +2049,34 @@ app.get('/v1/instagram/post/comments', authMiddleware, async (req, res) => {
             targetUrl.searchParams.append('include_replies', 'true');
         }
 
-        // 35-second timeout because upstream can take up to 29 seconds when fetching replies
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: {
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(35000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 3. Handle Upstream Errors (Expected ~10% of the time according to docs)
-        if (!response.ok || !upstreamPayload.success) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch comments'}`);
+        if (!response.ok || !payload.success) {
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to fetch comments'}`);
         }
 
-        // 4. Safely extract comments and pagination data
-        const comments = upstreamPayload.comments || (upstreamPayload.data && upstreamPayload.data.comments) || [];
-        const nextCursor = upstreamPayload.cursor || (upstreamPayload.data && upstreamPayload.data.cursor) || null;
+        const comments = payload.comments || (payload.data && payload.data.comments) || [];
+        const nextCursor = payload.cursor || (payload.data && payload.data.cursor) || null;
 
         const responseData = {
             comments: comments,
             cursor: nextCursor
         };
 
-        // 5. Deduct Credits & Cache
         req.user.credits -= costPerRequest;
-        // mockRedisCache[cacheKey] = responseData;
 
-        // 6. Return to Consumer
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/instagram/post/comments', costPerRequest, { url: postUrl, cursor, include_replies: includeReplies }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -2042,9 +2089,12 @@ app.get('/v1/instagram/post/comments', authMiddleware, async (req, res) => {
         
         const isTimeout = error.name === 'TimeoutError';
         const statusCode = isTimeout ? 504 : 500;
-        const finalErrorMsg = isTimeout ? "504 Gateway Timeout: Upstream provider took too long to respond. This is common when include_replies=true." : errorMessage;
+        
+        // White-labeled
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction server took too long to respond. This is common when include_replies=true." 
+            : errorMessage;
 
-        // Discord Failure Alert - crucial for monitoring this specific 90%-success endpoint
         if (typeof notifyFailure === 'function') {
             notifyFailure({
                 endpoint: '/v1/instagram/post/comments',
@@ -2054,7 +2104,9 @@ app.get('/v1/instagram/post/comments', authMiddleware, async (req, res) => {
             });
         }
 
-        // Only refund/don't charge the user if the request failed
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/instagram/post/comments', 0, { url: postUrl, cursor, include_replies: includeReplies }, statusCode);
+
         return res.status(statusCode).json({
             success: false,
             error: finalErrorMsg
@@ -2065,15 +2117,14 @@ app.get('/v1/instagram/post/comments', authMiddleware, async (req, res) => {
 // --- 2. EXPRESS ROUTE ---
 
 // --- 2. EXPRESS ROUTE ---
+// --- EXPRESS ROUTE: YOUTUBE CHANNEL INFO ---
 app.get('/v1/youtube/channel', authMiddleware, async (req, res) => {
-    // Check multiple query parameters for backward compatibility
     const channelId = req.query.channelId;
     const handle = req.query.handle;
     const url = req.query.url;
-    const q = req.query.q; // Some consumers might use generic 'q'
+    const q = req.query.q; 
     const cacheMaxAge = req.query.cache_max_age || '7d';
 
-    // Prioritize how we send the payload upstream based on what the user gave us
     let targetParamKey = null;
     let targetParamValue = null;
 
@@ -2082,13 +2133,11 @@ app.get('/v1/youtube/channel', authMiddleware, async (req, res) => {
         targetParamValue = channelId.trim();
     } else if (handle) {
         targetParamKey = 'handle';
-        // Ensure handle starts with @ if it's a handle (ScrapeCreators usually handles this, but it's safer)
         targetParamValue = handle.trim().startsWith('@') ? handle.trim() : `@${handle.trim()}`;
     } else if (url) {
         targetParamKey = 'url';
         targetParamValue = url.trim();
     } else if (q) {
-        // Fallback for generic 'q' inputs: try to guess if it's an ID, handle, or URL
         const rawQ = q.trim();
         if (rawQ.startsWith('http')) {
             targetParamKey = 'url';
@@ -2097,7 +2146,6 @@ app.get('/v1/youtube/channel', authMiddleware, async (req, res) => {
         } else if (rawQ.startsWith('UC') && rawQ.length === 24) {
             targetParamKey = 'channelId';
         } else {
-            // Default to handle if we can't figure it out
             targetParamKey = 'handle';
         }
         targetParamValue = rawQ;
@@ -2119,9 +2167,9 @@ app.get('/v1/youtube/channel', authMiddleware, async (req, res) => {
         });
     }
 
-    let anyApiInput;
+    let extractionInput;
     if (targetParamKey === 'channelId' || targetParamKey === 'handle') {
-        anyApiInput = { [targetParamKey]: targetParamValue };
+        extractionInput = { [targetParamKey]: targetParamValue };
     } else {
         try {
             const parsedUrl = new URL(targetParamValue);
@@ -2129,11 +2177,11 @@ app.get('/v1/youtube/channel', authMiddleware, async (req, res) => {
             const channelPathIndex = pathParts.indexOf('channel');
 
             if (channelPathIndex >= 0 && pathParts[channelPathIndex + 1]) {
-                anyApiInput = { channelId: pathParts[channelPathIndex + 1] };
+                extractionInput = { channelId: pathParts[channelPathIndex + 1] };
             } else if (pathParts[0]?.startsWith('@')) {
-                anyApiInput = { handle: pathParts[0] };
+                extractionInput = { handle: pathParts[0] };
             } else if (pathParts[0] === 'user' || pathParts[0] === 'c') {
-                anyApiInput = { handle: `@${pathParts[1] || ''}` };
+                extractionInput = { handle: `@${pathParts[1] || ''}` };
             }
         } catch (error) {
             return res.status(400).json({
@@ -2143,7 +2191,7 @@ app.get('/v1/youtube/channel', authMiddleware, async (req, res) => {
         }
     }
 
-    if (!anyApiInput || Object.values(anyApiInput)[0] === '') {
+    if (!extractionInput || Object.values(extractionInput)[0] === '') {
         return res.status(400).json({
             success: false,
             error: "400 Bad Request: Could not determine a YouTube handle or channel ID."
@@ -2151,39 +2199,41 @@ app.get('/v1/youtube/channel', authMiddleware, async (req, res) => {
     }
 
     try {
-        const getAnyApiKey = process.env.GETANYAPI_KEY;
-        if (!getAnyApiKey) throw new Error("Missing GETANYAPI_KEY in environment");
+        const apiKey = process.env.GETANYAPI_KEY;
+        if (!apiKey) throw new Error("Missing extraction API key in environment");
 
         const response = await fetch('https://api.getanyapi.com/v1/run/youtube.channel', {
             method: 'POST',
             headers: {
-                Authorization: `Bearer ${getAnyApiKey}`,
+                Authorization: `Bearer ${apiKey}`,
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify(anyApiInput),
+            body: JSON.stringify(extractionInput),
             signal: AbortSignal.timeout(15000)
         });
 
-        let upstreamPayload;
+        let payload;
         try {
-            upstreamPayload = await response.json();
+            payload = await response.json();
         } catch (parseError) {
-            throw new Error(`AnyAPI returned invalid JSON (HTTP ${response.status})`);
+            throw new Error(`Extraction server returned invalid JSON (HTTP ${response.status})`);
         }
 
         if (!response.ok) {
-            const upstreamError = upstreamPayload.error || response.statusText || 'Failed to fetch YouTube channel info';
-            const error = new Error(`AnyAPI Error: ${upstreamError}`);
+            const serverError = payload.error || response.statusText || 'Failed to fetch YouTube channel info';
+            const error = new Error(`Server Error: ${serverError}`);
             error.statusCode = response.status;
             throw error;
         }
 
-        const output = upstreamPayload.output || {};
+        const output = payload.output || {};
         const channelData = output.data || {};
 
         req.user.credits -= costPerRequest;
 
-        // The universalCacheMiddleware automatically captures this response and saves it
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/youtube/channel', costPerRequest, { [targetParamKey]: targetParamValue }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -2197,11 +2247,12 @@ app.get('/v1/youtube/channel', authMiddleware, async (req, res) => {
         const errorMessage = error.message || "Internal Server Error";
         const isTimeout = error.name === 'TimeoutError';
         const finalStatus = isTimeout ? 504 : (error.statusCode || 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to respond." 
+            ? "504 Gateway Timeout: The extraction server took too long to respond." 
             : errorMessage;
 
-        // Discord Alert for tracking upstream stability
         if (finalStatus >= 500 || finalStatus === 403 || finalStatus === 429) {
             if (typeof notifyFailure === 'function') {
                 notifyFailure({
@@ -2213,6 +2264,9 @@ app.get('/v1/youtube/channel', authMiddleware, async (req, res) => {
             }
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/youtube/channel', 0, { [targetParamKey]: targetParamValue }, finalStatus);
+
         return res.status(finalStatus).json({
             success: false,
             error: finalErrorMsg
@@ -2220,6 +2274,8 @@ app.get('/v1/youtube/channel', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: YOUTUBE CHANNEL VIDEOS ---
 app.get('/v1/youtube/channel/videos', authMiddleware, async (req, res) => {
     const { 
         channelId, 
@@ -2230,7 +2286,6 @@ app.get('/v1/youtube/channel/videos', authMiddleware, async (req, res) => {
         includeExtras 
     } = req.query;
 
-    // 1. Validation: Must have at least one identifier
     if (!channelId && !handle) {
         return res.status(400).json({
             success: false,
@@ -2238,8 +2293,6 @@ app.get('/v1/youtube/channel/videos', authMiddleware, async (req, res) => {
         });
     }
 
-    // Dynamic Pricing Logic: Base is 1 credit as per spec. 
-    // You can adjust this if includeExtras adds more cost later.
     const costPerRequest = 1;
 
     if (req.user.credits < costPerRequest) {
@@ -2250,10 +2303,10 @@ app.get('/v1/youtube/channel/videos', authMiddleware, async (req, res) => {
     }
 
     try {
-        const getAnyApiKey = process.env.GETANYAPI_KEY;
-        if (!getAnyApiKey) throw new Error("Missing GETANYAPI_KEY in environment");
+        const apiKey = process.env.GETANYAPI_KEY;
+        if (!apiKey) throw new Error("Missing extraction API key in environment");
 
-        const anyApiInput = {
+        const extractionInput = {
             ...(channelId ? { channelId: channelId.trim() } : {}),
             ...(handle ? { handle: handle.trim().startsWith('@') ? handle.trim() : `@${handle.trim()}` } : {}),
             ...(sort ? { sort } : {}),
@@ -2263,28 +2316,28 @@ app.get('/v1/youtube/channel/videos', authMiddleware, async (req, res) => {
         const response = await fetch('https://api.getanyapi.com/v1/run/youtube.channel_videos', {
             method: 'POST',
             headers: {
-                Authorization: `Bearer ${getAnyApiKey}`,
+                Authorization: `Bearer ${apiKey}`,
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify(anyApiInput),
+            body: JSON.stringify(extractionInput),
             signal: AbortSignal.timeout(35000)
         });
 
-        let upstreamPayload;
+        let payload;
         try {
-            upstreamPayload = await response.json();
+            payload = await response.json();
         } catch (parseError) {
-            throw new Error(`AnyAPI returned invalid JSON (HTTP ${response.status})`);
+            throw new Error(`Extraction server returned invalid JSON (HTTP ${response.status})`);
         }
 
         if (!response.ok) {
-            const upstreamError = upstreamPayload.error || response.statusText || 'Failed to fetch channel videos';
-            const error = new Error(`AnyAPI Error: ${upstreamError}`);
+            const serverError = payload.error || response.statusText || 'Failed to fetch channel videos';
+            const error = new Error(`Server Error: ${serverError}`);
             error.statusCode = response.status;
             throw error;
         }
 
-        const output = upstreamPayload.output || {};
+        const output = payload.output || {};
         const videosData = output.data || {};
 
         const responseData = {
@@ -2292,10 +2345,11 @@ app.get('/v1/youtube/channel/videos', authMiddleware, async (req, res) => {
             continuationToken: videosData.nextCursor || null
         };
 
-        // 5. Deduct Credits & Cache
         req.user.credits -= costPerRequest;
 
-        // 6. Return to Consumer
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/youtube/channel/videos', costPerRequest, { channelId, handle, sort, continuationToken, is_paid_promotions, includeExtras }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -2313,13 +2367,12 @@ app.get('/v1/youtube/channel/videos', authMiddleware, async (req, res) => {
             ? 504
             : (error.statusCode >= 400 && error.statusCode < 500 ? error.statusCode : 500);
         
-        // Custom timeout message, noting that includeExtras increases error rate per their docs
-        let finalErrorMsg = isTimeout ? "504 Gateway Timeout: Upstream provider took too long to respond." : errorMessage;
+        // White-labeled
+        let finalErrorMsg = isTimeout ? "504 Gateway Timeout: The extraction server took too long to respond." : errorMessage;
         if (isTimeout && includeExtras === 'true') {
             finalErrorMsg += " Note: The includeExtras flag is known to increase latency and error rates.";
         }
 
-        // Discord Failure Alert - syncs perfectly with your existing monitoring setup
         if (typeof notifyFailure === 'function') {
             notifyFailure({
                 endpoint: '/v1/youtube/channel/videos',
@@ -2329,7 +2382,9 @@ app.get('/v1/youtube/channel/videos', authMiddleware, async (req, res) => {
             });
         }
 
-        // Only refund/don't charge the user if the request failed
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/youtube/channel/videos', 0, { channelId, handle, sort, continuationToken, is_paid_promotions, includeExtras }, statusCode);
+
         return res.status(statusCode).json({
             success: false,
             error: finalErrorMsg
@@ -2337,6 +2392,8 @@ app.get('/v1/youtube/channel/videos', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: YOUTUBE CHANNEL PLAYLISTS ---
 app.get('/v1/youtube/channel/playlists', authMiddleware, async (req, res) => {
     const { 
         channelId, 
@@ -2344,7 +2401,6 @@ app.get('/v1/youtube/channel/playlists', authMiddleware, async (req, res) => {
         continuationToken 
     } = req.query;
 
-    // 1. Validation: Must have at least one identifier
     if (!channelId && !handle) {
         return res.status(400).json({
             success: false,
@@ -2352,7 +2408,6 @@ app.get('/v1/youtube/channel/playlists', authMiddleware, async (req, res) => {
         });
     }
 
-    // Dynamic Pricing Logic: Base is 1 credit as per spec.
     const costPerRequest = 2;
 
     if (req.user.credits < costPerRequest) {
@@ -2362,55 +2417,44 @@ app.get('/v1/youtube/channel/playlists', authMiddleware, async (req, res) => {
         });
     }
 
-    // Cache key includes the identifier and token
-    const identifier = channelId || handle;
-
     try {
-        // 1. Cache Check
-   
-
-        // 2. Fetch from ScrapeCreators
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API key in environment");
 
         const targetUrl = new URL('https://api.scrapecreators.com/v1/youtube/channel/playlists');
         
-        // Append dynamic params
         if (channelId) targetUrl.searchParams.append('channelId', channelId);
         if (handle) targetUrl.searchParams.append('handle', handle);
         if (continuationToken) targetUrl.searchParams.append('continuationToken', continuationToken);
 
-        // 35-second timeout safeguard
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: {
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(35000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 3. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch channel playlists'}`);
+        if (!response.ok || !payload.success) {
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to fetch channel playlists'}`);
         }
 
-        // 4. Safely extract data
-        const playlists = upstreamPayload.playlists || [];
-        const nextToken = upstreamPayload.continuationToken || null;
+        const playlists = payload.playlists || [];
+        const nextToken = payload.continuationToken || null;
 
         const responseData = {
             playlists: playlists,
             continuationToken: nextToken
         };
 
-        // 5. Deduct Credits & Cache
         req.user.credits -= costPerRequest;
-        // mockRedisCache[cacheKey] = responseData;
 
-        // 6. Return to Consumer
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/youtube/channel/playlists', costPerRequest, { channelId, handle, continuationToken }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -2423,9 +2467,10 @@ app.get('/v1/youtube/channel/playlists', authMiddleware, async (req, res) => {
         
         const isTimeout = error.name === 'TimeoutError';
         const statusCode = isTimeout ? 504 : 500;
-        const finalErrorMsg = isTimeout ? "504 Gateway Timeout: Upstream provider took too long to respond." : errorMessage;
+        
+        // White-labeled
+        const finalErrorMsg = isTimeout ? "504 Gateway Timeout: The extraction server took too long to respond." : errorMessage;
 
-        // Discord Failure Alert
         if (typeof notifyFailure === 'function') {
             notifyFailure({
                 endpoint: '/v1/youtube/channel/playlists',
@@ -2435,7 +2480,9 @@ app.get('/v1/youtube/channel/playlists', authMiddleware, async (req, res) => {
             });
         }
 
-        // Only refund/don't charge the user if the request failed
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/youtube/channel/playlists', 0, { channelId, handle, continuationToken }, statusCode);
+
         return res.status(statusCode).json({
             success: false,
             error: finalErrorMsg
@@ -2443,6 +2490,8 @@ app.get('/v1/youtube/channel/playlists', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: YOUTUBE CHANNEL LIVES ---
 app.get('/v1/youtube/channel/lives', authMiddleware, async (req, res) => {
     const { 
         channelId, 
@@ -2450,7 +2499,6 @@ app.get('/v1/youtube/channel/lives', authMiddleware, async (req, res) => {
         continuationToken 
     } = req.query;
 
-    // 1. Validation: Must have at least one identifier
     if (!channelId && !handle) {
         return res.status(400).json({
             success: false,
@@ -2458,7 +2506,6 @@ app.get('/v1/youtube/channel/lives', authMiddleware, async (req, res) => {
         });
     }
 
-    // Dynamic Pricing Logic: Base is 1 credit as per spec.
     const costPerRequest = 2;
 
     if (req.user.credits < costPerRequest) {
@@ -2468,55 +2515,44 @@ app.get('/v1/youtube/channel/lives', authMiddleware, async (req, res) => {
         });
     }
 
-    // Cache key includes the identifier and token to protect your profit margins
-    const identifier = channelId || handle;
-
     try {
-     
-
-        // 2. Fetch from ScrapeCreators
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API key in environment");
 
         const targetUrl = new URL('https://api.scrapecreators.com/v1/youtube/channel/lives');
         
-        // Append dynamic params
         if (channelId) targetUrl.searchParams.append('channelId', channelId);
         if (handle) targetUrl.searchParams.append('handle', handle);
         if (continuationToken) targetUrl.searchParams.append('continuationToken', continuationToken);
 
-        // 35-second timeout safeguard
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: {
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(35000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 3. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch channel lives'}`);
+        if (!response.ok || !payload.success) {
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to fetch channel lives'}`);
         }
 
-        // 4. Safely extract data
-        const lives = upstreamPayload.lives || [];
-        const nextToken = upstreamPayload.continuationToken || null;
+        const lives = payload.lives || [];
+        const nextToken = payload.continuationToken || null;
 
         const responseData = {
             lives: lives,
             continuationToken: nextToken
         };
 
-        // 5. Deduct Credits & Cache
         req.user.credits -= costPerRequest;
         
-        // Cache lives for a reasonable time (e.g., 5-15 mins) to maximize margin on popular channels
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/youtube/channel/lives', costPerRequest, { channelId, handle, continuationToken }, 200);
 
-        // 6. Return to Consumer
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -2529,9 +2565,10 @@ app.get('/v1/youtube/channel/lives', authMiddleware, async (req, res) => {
         
         const isTimeout = error.name === 'TimeoutError';
         const statusCode = isTimeout ? 504 : 500;
-        const finalErrorMsg = isTimeout ? "504 Gateway Timeout: Upstream provider took too long to respond." : errorMessage;
+        
+        // White-labeled
+        const finalErrorMsg = isTimeout ? "504 Gateway Timeout: The extraction server took too long to respond." : errorMessage;
 
-        // Discord Failure Alert
         if (typeof notifyFailure === 'function') {
             notifyFailure({
                 endpoint: '/v1/youtube/channel/lives',
@@ -2541,7 +2578,9 @@ app.get('/v1/youtube/channel/lives', authMiddleware, async (req, res) => {
             });
         }
 
-        // Refund/don't charge the user if the request failed
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/youtube/channel/lives', 0, { channelId, handle, continuationToken }, statusCode);
+
         return res.status(statusCode).json({
             success: false,
             error: finalErrorMsg
@@ -2549,6 +2588,7 @@ app.get('/v1/youtube/channel/lives', authMiddleware, async (req, res) => {
     }
 });
 
+// --- EXPRESS ROUTE: YOUTUBE CHANNEL COMMUNITY POSTS ---
 app.get('/v1/youtube/channel/community-posts', authMiddleware, async (req, res) => {
     const { 
         channelId, 
@@ -2556,7 +2596,6 @@ app.get('/v1/youtube/channel/community-posts', authMiddleware, async (req, res) 
         continuationToken 
     } = req.query;
 
-    // 1. Validation: Must have at least one identifier
     if (!channelId && !handle) {
         return res.status(400).json({
             success: false,
@@ -2564,7 +2603,6 @@ app.get('/v1/youtube/channel/community-posts', authMiddleware, async (req, res) 
         });
     }
 
-    // Dynamic Pricing Logic: Base is 1 credit as per spec.
     const costPerRequest = 1;
 
     if (req.user.credits < costPerRequest) {
@@ -2574,57 +2612,44 @@ app.get('/v1/youtube/channel/community-posts', authMiddleware, async (req, res) 
         });
     }
 
-    // Cache key explicitly flags community posts to prevent data bleed
-    const identifier = channelId || handle;
-    // Encode the identifier to ensure it's safe for use in a cache key
-
     try {
-        // 1. Cache Check - Your profit margin protector
-       
-
-        // 2. Fetch from ScrapeCreators
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API key in environment");
 
         const targetUrl = new URL('https://api.scrapecreators.com/v1/youtube/channel/community-posts');
         
-        // Append dynamic params
         if (channelId) targetUrl.searchParams.append('channelId', channelId);
         if (handle) targetUrl.searchParams.append('handle', handle);
         if (continuationToken) targetUrl.searchParams.append('continuationToken', continuationToken);
 
-        // 35-second timeout safeguard - Community posts can be payload-heavy with nested video/image objects
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: {
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(35000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 3. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch community posts'}`);
+        if (!response.ok || !payload.success) {
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to fetch community posts'}`);
         }
 
-        // 4. Safely extract data
-        const posts = upstreamPayload.posts || [];
-        const nextToken = upstreamPayload.continuationToken || null;
+        const posts = payload.posts || [];
+        const nextToken = payload.continuationToken || null;
 
         const responseData = {
             posts: posts,
             continuationToken: nextToken
         };
 
-        // 5. Deduct Credits & Cache
         req.user.credits -= costPerRequest;
         
-        // Cache community posts; they update less frequently than comments or live streams
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/youtube/channel/community-posts', costPerRequest, { channelId, handle, continuationToken }, 200);
 
-        // 6. Return to Consumer
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -2637,9 +2662,12 @@ app.get('/v1/youtube/channel/community-posts', authMiddleware, async (req, res) 
         
         const isTimeout = error.name === 'TimeoutError';
         const statusCode = isTimeout ? 504 : 500;
-        const finalErrorMsg = isTimeout ? "504 Gateway Timeout: Upstream provider took too long to respond." : errorMessage;
+        
+        // White-labeled
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction server took too long to respond." 
+            : errorMessage;
 
-        // Discord Failure Alert - essential for monitoring upstream reliability
         if (typeof notifyFailure === 'function') {
             notifyFailure({
                 endpoint: '/v1/youtube/channel/community-posts',
@@ -2649,7 +2677,9 @@ app.get('/v1/youtube/channel/community-posts', authMiddleware, async (req, res) 
             });
         }
 
-        // Only refund/don't charge the user if the request failed
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/youtube/channel/community-posts', 0, { channelId, handle, continuationToken }, statusCode);
+
         return res.status(statusCode).json({
             success: false,
             error: finalErrorMsg
@@ -2657,6 +2687,8 @@ app.get('/v1/youtube/channel/community-posts', authMiddleware, async (req, res) 
     }
 });
 
+
+// --- EXPRESS ROUTE: YOUTUBE CHANNEL SHORTS ---
 app.get('/v1/youtube/channel/shorts', authMiddleware, async (req, res) => {
     const { 
         channelId, 
@@ -2665,7 +2697,6 @@ app.get('/v1/youtube/channel/shorts', authMiddleware, async (req, res) => {
         continuationToken 
     } = req.query;
 
-    // 1. Validation: Must have at least one identifier
     if (!channelId && !handle) {
         return res.status(400).json({
             success: false,
@@ -2673,8 +2704,6 @@ app.get('/v1/youtube/channel/shorts', authMiddleware, async (req, res) => {
         });
     }
 
-
-    // Dynamic Pricing Logic: Base is 2 credits.
     const costPerRequest = 2;
 
     if (req.user.credits < costPerRequest) {
@@ -2684,56 +2713,45 @@ app.get('/v1/youtube/channel/shorts', authMiddleware, async (req, res) => {
         });
     }
 
-    // Cache key explicitly flags shorts and sorting to prevent data bleed
-    const identifier = channelId || handle;
-
     try {
-
-
-        // 2. Fetch from ScrapeCreators
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API key in environment");
 
         const targetUrl = new URL('https://api.scrapecreators.com/v1/youtube/channel/shorts');
         
-        // Append dynamic params
         if (channelId) targetUrl.searchParams.append('channelId', channelId);
         if (handle) targetUrl.searchParams.append('handle', handle);
         if (sort) targetUrl.searchParams.append('sort', sort);
         if (continuationToken) targetUrl.searchParams.append('continuationToken', continuationToken);
 
-        // 35-second timeout safeguard
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: {
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(35000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 3. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch shorts'}`);
+        if (!response.ok || !payload.success) {
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to fetch shorts'}`);
         }
 
-        // 4. Safely extract data (the server returns multiple empty arrays, we only care about 'shorts')
-        const shorts = upstreamPayload.shorts || [];
-        const nextToken = upstreamPayload.continuationToken || null;
+        const shorts = payload.shorts || [];
+        const nextToken = payload.continuationToken || null;
 
         const responseData = {
             shorts: shorts,
             continuationToken: nextToken
         };
 
-        // 5. Deduct Credits & Cache
         req.user.credits -= costPerRequest;
         
-        // Cache shorts; they are highly requested, maximizing margin on popular creators
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/youtube/channel/shorts', costPerRequest, { channelId, handle, sort, continuationToken }, 200);
 
-        // 6. Return to Consumer
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -2746,9 +2764,12 @@ app.get('/v1/youtube/channel/shorts', authMiddleware, async (req, res) => {
         
         const isTimeout = error.name === 'TimeoutError';
         const statusCode = isTimeout ? 504 : 500;
-        const finalErrorMsg = isTimeout ? "504 Gateway Timeout: Upstream provider took too long to respond." : errorMessage;
+        
+        // White-labeled
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction server took too long to respond." 
+            : errorMessage;
 
-        // Discord Failure Alert - essential for monitoring upstream reliability
         if (typeof notifyFailure === 'function') {
             notifyFailure({
                 endpoint: '/v1/youtube/channel/shorts',
@@ -2758,7 +2779,9 @@ app.get('/v1/youtube/channel/shorts', authMiddleware, async (req, res) => {
             });
         }
 
-        // Only refund/don't charge the user if the request failed
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/youtube/channel/shorts', 0, { channelId, handle, sort, continuationToken }, statusCode);
+
         return res.status(statusCode).json({
             success: false,
             error: finalErrorMsg
@@ -2767,7 +2790,7 @@ app.get('/v1/youtube/channel/shorts', authMiddleware, async (req, res) => {
 });
 
 
-
+// --- EXPRESS ROUTE: YOUTUBE SINGLE VIDEO ---
 app.get('/v1/youtube/video', authMiddleware, async (req, res) => {
     const { url, language, cache_max_age } = req.query;
 
@@ -2788,38 +2811,40 @@ app.get('/v1/youtube/video', authMiddleware, async (req, res) => {
     }
 
     try {
-        const upstreamUrl = new URL('https://api.scrapecreators.com/v1/youtube/video');
-        upstreamUrl.searchParams.append('url', url);
-        
-        if (language) upstreamUrl.searchParams.append('language', language);
-        
-        // Forward to upstream if provided, but local middleware intercepts first if cached locally
-        if (cache_max_age) upstreamUrl.searchParams.append('cache_max_age', cache_max_age);
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API key in environment");
 
-        const response = await fetch(upstreamUrl.toString(), {
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/youtube/video');
+        targetUrl.searchParams.append('url', url);
+        
+        if (language) targetUrl.searchParams.append('language', language);
+        if (cache_max_age) targetUrl.searchParams.append('cache_max_age', cache_max_age);
+
+        const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: {
-                'x-api-key': process.env.SCRAPE_CREATORS_API_KEY,
+                'x-api-key': apiKey,
                 'Accept': 'application/json'
             },
-            signal: AbortSignal.timeout(20000) // Added timeout for stability
+            signal: AbortSignal.timeout(20000) 
         });
 
         const data = await response.json();
 
         if (!response.ok || !data.success) {
-            const errorMessage = data.error || data.reason || "Upstream extraction failed.";
+            const errorMessage = data.error || data.reason || "Extraction failed.";
             const statusCode = response.status === 200 ? 500 : response.status; 
             
-            throw new Error(`${statusCode} API Error: ${errorMessage}`);
+            throw new Error(`${statusCode} Server Error: ${errorMessage}`);
         }
 
-        // Destructure to prevent upstream credit balances or success flags from leaking
         const { success, credits_remaining, credits_charged, ...videoData } = data;
 
         req.user.credits -= costPerRequest;
 
-        // The universalCacheMiddleware automatically captures this response and saves it
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/youtube/video', costPerRequest, { url, language, cache_max_age }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -2829,8 +2854,10 @@ app.get('/v1/youtube/video', authMiddleware, async (req, res) => {
 
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message === 'TimeoutError';
+        
+        // White-labeled
         const errorMessage = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to respond." 
+            ? "504 Gateway Timeout: The extraction server took too long to respond." 
             : (error.message || "500 Internal Server Error");
         
         const statusCodeMatch = errorMessage.match(/^(\d{3})/);
@@ -2845,6 +2872,9 @@ app.get('/v1/youtube/video', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/youtube/video', 0, { url, language, cache_max_age }, statusCode);
+
         return res.status(statusCode).json({
             success: false,
             error: errorMessage
@@ -2852,10 +2882,10 @@ app.get('/v1/youtube/video', authMiddleware, async (req, res) => {
     }
 });
 
+// --- EXPRESS ROUTE: YOUTUBE TRANSCRIPT ---
 app.get('/v1/youtube/transcript', authMiddleware, async (req, res) => {
     const { url, language, cache_max_age } = req.query;
 
-    // 1. Validation
     if (!url) {
         return res.status(400).json({
             success: false,
@@ -2863,7 +2893,6 @@ app.get('/v1/youtube/transcript', authMiddleware, async (req, res) => {
         });
     }
 
-    // Dynamic Pricing Logic: Premium endpoint, charging 2 credits for a 2x markup.
     const costPerRequest = 1;
 
     if (req.user.credits < costPerRequest) {
@@ -2874,55 +2903,47 @@ app.get('/v1/youtube/transcript', authMiddleware, async (req, res) => {
     }
 
     try {
-        // 2. Fetch from ScrapeCreators
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API key in environment");
 
         const targetUrl = new URL('https://api.scrapecreators.com/v1/youtube/video/transcript');
         targetUrl.searchParams.append('url', url);
         
         if (language) targetUrl.searchParams.append('language', language);
-        
-        // Forward cache_max_age upstream to save costs if they cache it, 
-        // but our local middleware will intercept it first if we already have it.
         if (cache_max_age) targetUrl.searchParams.append('cache_max_age', cache_max_age);
 
-        // 35-second timeout safeguard (transcripts can be heavy for 3-hour podcasts)
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: {
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(35000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 3. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
-            // Check for the specific case where a video simply has no captions
-            const errorMsg = upstreamPayload.error || response.statusText;
+        if (!response.ok || !payload.success) {
+            const errorMsg = payload.error || response.statusText;
             const statusCode = response.status;
             
-            if (statusCode === 404 || errorMsg.toLowerCase().includes('not available')) {
+            if (statusCode === 404 || (errorMsg && errorMsg.toLowerCase().includes('not available'))) {
                  throw new Error("404 Not Found: No transcript or captions available for this video.");
             }
 
-            throw new Error(`Upstream API Error: ${errorMsg || 'Failed to fetch transcript'}`);
+            throw new Error(`Server Error: ${errorMsg || 'Failed to fetch transcript'}`);
         }
 
-        // 4. Extract data and sanitize upstream billing fields
-        const responseData = { ...upstreamPayload };
+        const responseData = { ...payload };
         delete responseData.success;
         delete responseData.credits_remaining;
         delete responseData.credits_charged;
 
-        // 5. Deduct Credits
         req.user.credits -= costPerRequest;
 
-        // 6. Return to Consumer
-        // The universalCacheMiddleware automatically intercepts and caches this response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/youtube/transcript', costPerRequest, { url, language, cache_max_age }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -2935,9 +2956,12 @@ app.get('/v1/youtube/transcript', authMiddleware, async (req, res) => {
         
         const isTimeout = error.name === 'TimeoutError';
         const statusCode = errorMessage.includes('404') ? 404 : (isTimeout ? 504 : 500);
-        const finalErrorMsg = isTimeout ? "504 Gateway Timeout: Upstream provider took too long to respond." : errorMessage;
+        
+        // White-labeled
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction server took too long to respond." 
+            : errorMessage;
 
-        // Discord Failure Alert
         if (typeof notifyFailure === 'function') {
             notifyFailure({
                 endpoint: '/v1/youtube/transcript',
@@ -2947,6 +2971,9 @@ app.get('/v1/youtube/transcript', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/youtube/transcript', 0, { url, language, cache_max_age }, statusCode);
+
         return res.status(statusCode).json({
             success: false,
             error: finalErrorMsg
@@ -2954,6 +2981,8 @@ app.get('/v1/youtube/transcript', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: YOUTUBE SEARCH ---
 app.get('/v1/youtube/search', authMiddleware, async (req, res) => {
     const { 
         query, 
@@ -2966,7 +2995,6 @@ app.get('/v1/youtube/search', authMiddleware, async (req, res) => {
         includeExtras
     } = req.query;
 
-    // 1. Validation
     if (!query) {
         return res.status(400).json({
             success: false,
@@ -2974,7 +3002,6 @@ app.get('/v1/youtube/search', authMiddleware, async (req, res) => {
         });
     }
 
-    // Dynamic Pricing Logic: Base is 1 credit.
     const costPerRequest = 1;
 
     if (req.user.credits < costPerRequest) {
@@ -2985,10 +3012,10 @@ app.get('/v1/youtube/search', authMiddleware, async (req, res) => {
     }
 
     try {
-        const getAnyApiKey = process.env.GETANYAPI_KEY;
-        if (!getAnyApiKey) throw new Error("Missing GETANYAPI_KEY in environment");
+        const apiKey = process.env.GETANYAPI_KEY;
+        if (!apiKey) throw new Error("Missing extraction API key in environment");
 
-        const anyApiInput = {
+        const extractionInput = {
             query: query.trim(),
             ...(uploadDate ? { uploadDate } : {}),
             ...(sortBy ? { sortBy } : {}),
@@ -2998,28 +3025,28 @@ app.get('/v1/youtube/search', authMiddleware, async (req, res) => {
         const response = await fetch('https://api.getanyapi.com/v1/run/youtube.search', {
             method: 'POST',
             headers: {
-                Authorization: `Bearer ${getAnyApiKey}`,
+                Authorization: `Bearer ${apiKey}`,
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify(anyApiInput),
+            body: JSON.stringify(extractionInput),
             signal: AbortSignal.timeout(35000)
         });
 
-        let upstreamPayload;
+        let payload;
         try {
-            upstreamPayload = await response.json();
+            payload = await response.json();
         } catch (parseError) {
-            throw new Error(`AnyAPI returned invalid JSON (HTTP ${response.status})`);
+            throw new Error(`Extraction server returned invalid JSON (HTTP ${response.status})`);
         }
 
         if (!response.ok) {
-            const upstreamError = upstreamPayload.error || response.statusText || 'Failed to fetch search results';
-            const error = new Error(`AnyAPI Error: ${upstreamError}`);
+            const serverError = payload.error || response.statusText || 'Failed to fetch search results';
+            const error = new Error(`Server Error: ${serverError}`);
             error.statusCode = response.status;
             throw error;
         }
 
-        const output = upstreamPayload.output || {};
+        const output = payload.output || {};
         const searchData = output.data || {};
 
         const responseData = {
@@ -3032,12 +3059,11 @@ app.get('/v1/youtube/search', authMiddleware, async (req, res) => {
             continuationToken: searchData.nextCursor || null
         };
 
-        // 5. Deduct Credits & Cache
         req.user.credits -= costPerRequest;
-        
-        // Cache lifetime can be tuned based on query velocity. Trending searches cache well.
 
-        // 6. Return to Consumer
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/youtube/search', costPerRequest, { query, uploadDate, sortBy, type, duration, region, continuationToken, includeExtras }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -3054,13 +3080,14 @@ app.get('/v1/youtube/search', authMiddleware, async (req, res) => {
         const statusCode = isTimeout
             ? 504
             : (error.statusCode >= 400 && error.statusCode < 500 ? error.statusCode : 500);
-        let finalErrorMsg = isTimeout ? "504 Gateway Timeout: Upstream provider took too long to respond." : errorMessage;
+        
+        // White-labeled
+        let finalErrorMsg = isTimeout ? "504 Gateway Timeout: The extraction server took too long to respond." : errorMessage;
 
         if (isTimeout && includeExtras === 'true') {
             finalErrorMsg += " Note: The 'includeExtras' flag requires additional scraping and increases latency.";
         }
 
-        // Discord Failure Alert - essential for monitoring upstream reliability and timeout frequency
         if (typeof notifyFailure === 'function') {
             notifyFailure({
                 endpoint: '/v1/youtube/search',
@@ -3070,7 +3097,9 @@ app.get('/v1/youtube/search', authMiddleware, async (req, res) => {
             });
         }
 
-        // Only refund/don't charge the user if the request failed
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/youtube/search', 0, { query, uploadDate, sortBy, type, duration, region, continuationToken, includeExtras }, statusCode);
+
         return res.status(statusCode).json({
             success: false,
             error: finalErrorMsg
@@ -3078,6 +3107,8 @@ app.get('/v1/youtube/search', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: YOUTUBE VIDEO COMMENTS ---
 app.get('/v1/youtube/video/comments', authMiddleware, async (req, res) => {
     const { 
         url, 
@@ -3085,7 +3116,6 @@ app.get('/v1/youtube/video/comments', authMiddleware, async (req, res) => {
         order 
     } = req.query;
 
-    // 1. Validation
     if (!url) {
         return res.status(400).json({
             success: false,
@@ -3093,7 +3123,6 @@ app.get('/v1/youtube/video/comments', authMiddleware, async (req, res) => {
         });
     }
 
-    // Dynamic Pricing Logic: Base is 1 credit.
     const costPerRequest = 1;
 
     if (req.user.credits < costPerRequest) {
@@ -3103,55 +3132,44 @@ app.get('/v1/youtube/video/comments', authMiddleware, async (req, res) => {
         });
     }
 
-    // Cache key explicitly flags URL, sorting order, and pagination token to prevent data bleed
-
     try {
-
-
-        // 2. Fetch from ScrapeCreators
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API key in environment");
 
         const targetUrl = new URL('https://api.scrapecreators.com/v1/youtube/video/comments');
         targetUrl.searchParams.append('url', url);
         
-        // Append dynamic pagination and sorting params
         if (continuationToken) targetUrl.searchParams.append('continuationToken', continuationToken);
         if (order) targetUrl.searchParams.append('order', order);
 
-        // 35-second timeout safeguard - comment parsing can be heavy
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: {
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(35000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 3. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
-            // Watch out for 403s on videos where the creator has disabled comments entirely
-            if (response.status === 403 || (upstreamPayload.error && upstreamPayload.error.toLowerCase().includes('disabled'))) {
+        if (!response.ok || !payload.success) {
+            if (response.status === 403 || (payload.error && payload.error.toLowerCase().includes('disabled'))) {
                 throw new Error("403 Forbidden: Comments are disabled for this video.");
             }
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch comments'}`);
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to fetch comments'}`);
         }
 
-        // 4. Safely extract comments and the next pagination token
         const responseData = {
-            comments: upstreamPayload.comments || [],
-            continuationToken: upstreamPayload.continuationToken || null
+            comments: payload.comments || [],
+            continuationToken: payload.continuationToken || null
         };
 
-        // 5. Deduct Credits & Cache
         req.user.credits -= costPerRequest;
-        
-        // Cache lifetime should be short (e.g. 5-10 mins) since comments update rapidly
 
-        // 6. Return to Consumer
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/youtube/video/comments', costPerRequest, { url, continuationToken, order }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -3163,12 +3181,13 @@ app.get('/v1/youtube/video/comments', authMiddleware, async (req, res) => {
         const errorMessage = error.message || "Internal Server Error";
         
         const isTimeout = error.name === 'TimeoutError';
-        
-        // Ensure 403s for disabled comments bubble up cleanly to the user
         const statusCode = errorMessage.includes('403') ? 403 : (isTimeout ? 504 : 500);
-        const finalErrorMsg = isTimeout ? "504 Gateway Timeout: Upstream provider took too long to respond." : errorMessage;
+        
+        // White-labeled
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction server took too long to respond." 
+            : errorMessage;
 
-        // Discord Failure Alert - crucial for monitoring this endpoint
         if (typeof notifyFailure === 'function') {
             notifyFailure({
                 endpoint: '/v1/youtube/video/comments',
@@ -3178,7 +3197,9 @@ app.get('/v1/youtube/video/comments', authMiddleware, async (req, res) => {
             });
         }
 
-        // Only refund/don't charge the user if the request failed
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/youtube/video/comments', 0, { url, continuationToken, order }, statusCode);
+
         return res.status(statusCode).json({
             success: false,
             error: finalErrorMsg
@@ -3186,6 +3207,7 @@ app.get('/v1/youtube/video/comments', authMiddleware, async (req, res) => {
     }
 });
 
+// --- EXPRESS ROUTE: GOOGLE SEARCH ---
 app.get('/v1/google/search', authMiddleware, async (req, res) => {
     const { 
         query, 
@@ -3194,7 +3216,6 @@ app.get('/v1/google/search', authMiddleware, async (req, res) => {
         page 
     } = req.query;
 
-    // 1. Validation
     if (!query) {
         return res.status(400).json({
             success: false,
@@ -3202,7 +3223,6 @@ app.get('/v1/google/search', authMiddleware, async (req, res) => {
         });
     }
 
-    // Intercept invalid page requests before they hit the server
     const pageNum = parseInt(page || 1, 10);
     if (pageNum < 1 || pageNum > 11) {
         return res.status(400).json({
@@ -3211,7 +3231,6 @@ app.get('/v1/google/search', authMiddleware, async (req, res) => {
         });
     }
 
-    // Dynamic Pricing Logic: Base is 1 credit.
     const costPerRequest = 1;
 
     if (req.user.credits < costPerRequest) {
@@ -3221,51 +3240,41 @@ app.get('/v1/google/search', authMiddleware, async (req, res) => {
         });
     }
 
-    // Cache key explicitly incorporates all filters
-
     try {
-
-
-        // 2. Fetch from ScrapeCreators
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API Key in environment");
 
         const targetUrl = new URL('https://api.scrapecreators.com/v1/google/search');
         targetUrl.searchParams.append('query', query);
         
-        // Append optional dynamic params
         if (region) targetUrl.searchParams.append('region', region);
         if (date_posted) targetUrl.searchParams.append('date_posted', date_posted);
         if (page) targetUrl.searchParams.append('page', page);
 
-        // 25-second timeout safeguard (Google search via APIs is typically faster than social media)
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: {
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(25000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 3. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch search results'}`);
+        if (!response.ok || !payload.success) {
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to fetch search results'}`);
         }
 
-        // 4. Safely extract results and sanitize upstream billing data
         const responseData = {
-            results: upstreamPayload.results || []
+            results: payload.results || []
         };
 
-        // 5. Deduct Credits & Cache
         req.user.credits -= costPerRequest;
-        
-        // Cache lifetime can be longer for generic searches, protecting your margin
 
-        // 6. Return to Consumer
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/google/search', costPerRequest, { query, region, date_posted, page }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -3278,9 +3287,12 @@ app.get('/v1/google/search', authMiddleware, async (req, res) => {
         
         const isTimeout = error.name === 'TimeoutError';
         const statusCode = isTimeout ? 504 : 500;
-        const finalErrorMsg = isTimeout ? "504 Gateway Timeout: Upstream provider took too long to respond." : errorMessage;
+        
+        // White-labeled
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction server took too long to respond." 
+            : errorMessage;
 
-        // Discord Failure Alert - monitors Google API health
         if (typeof notifyFailure === 'function') {
             notifyFailure({
                 endpoint: '/v1/google/search',
@@ -3290,7 +3302,9 @@ app.get('/v1/google/search', authMiddleware, async (req, res) => {
             });
         }
 
-        // Only refund/don't charge the user if the request failed
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/google/search', 0, { query, region, date_posted, page }, statusCode);
+
         return res.status(statusCode).json({
             success: false,
             error: finalErrorMsg
@@ -3299,10 +3313,10 @@ app.get('/v1/google/search', authMiddleware, async (req, res) => {
 });
 
 
+// --- EXPRESS ROUTE: TIKTOK KEYWORD SEARCH ---
 app.get('/v1/tiktok/search/keyword', authMiddleware, async (req, res) => {
     const { query, date_posted, sort_by, region, cursor, trim } = req.query;
 
-    // 1. Validation
     if (!query || query.trim() === '') {
         return res.status(400).json({ 
             success: false, 
@@ -3310,7 +3324,6 @@ app.get('/v1/tiktok/search/keyword', authMiddleware, async (req, res) => {
         });
     }
 
-    // 2. Pre-flight Credit Check (Flat 1 Credit)
     const costPerRequest = 1;
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({ 
@@ -3319,19 +3332,9 @@ app.get('/v1/tiktok/search/keyword', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-    const identifier = encodeURIComponent(query.toLowerCase().trim());
-    const safeCursor = cursor || '0';
-    const safeDate = date_posted || 'all';
-    const safeSort = sort_by || 'relevance';
-    const cacheKey = `tiktok_search_keyword_${identifier}_${safeDate}_${safeSort}_${safeCursor}`;
-
     try {
-
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API Key in environment");
 
         const targetUrl = new URL('https://api.scrapecreators.com/v1/tiktok/search/keyword');
         targetUrl.searchParams.append('query', query.trim());
@@ -3342,25 +3345,22 @@ app.get('/v1/tiktok/search/keyword', authMiddleware, async (req, res) => {
         if (cursor) targetUrl.searchParams.append('cursor', cursor);
         if (trim) targetUrl.searchParams.append('trim', trim);
 
-        // 6. Execute Request
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(20000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        if (!response.ok || !upstreamPayload.success) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to search keyword'}`);
+        if (!response.ok || !payload.success) {
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to search keyword'}`);
         }
 
-        // 7. Data Trimming & Extraction
-        // Strip out the massive TikTok internal JSON payload and keep only the essentials.
-        const rawVideoList = Array.isArray(upstreamPayload.search_item_list) ? upstreamPayload.search_item_list : [];
+        const rawVideoList = Array.isArray(payload.search_item_list) ? payload.search_item_list : [];
         
         const trimmedVideos = rawVideoList.map(item => {
             const video = item.aweme_info || {};
@@ -3395,15 +3395,16 @@ app.get('/v1/tiktok/search/keyword', authMiddleware, async (req, res) => {
         });
 
         const responseData = {
-            cursor: upstreamPayload.cursor ?? null,
-            has_more: !!upstreamPayload.has_more,
+            cursor: payload.cursor ?? null,
+            has_more: !!payload.has_more,
             videos: trimmedVideos
         };
 
-        // 8. Strict Flat-Rate Billing & Caching
         req.user.credits -= costPerRequest;
 
-        // 9. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/tiktok/search/keyword', costPerRequest, { query, date_posted, sort_by, region, cursor, trim }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -3414,7 +3415,11 @@ app.get('/v1/tiktok/search/keyword', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
-        const finalErrorMsg = isTimeout ? "504 Gateway Timeout: Upstream provider took too long to respond." : error.message;
+        
+        // White-labeled
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction server took too long to respond." 
+            : error.message;
         
         if (typeof notifyFailure === 'function') {
             notifyFailure({ 
@@ -3425,6 +3430,9 @@ app.get('/v1/tiktok/search/keyword', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/tiktok/search/keyword', 0, { query, date_posted, sort_by, region, cursor, trim }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -3432,10 +3440,11 @@ app.get('/v1/tiktok/search/keyword', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: TIKTOK USERS SEARCH ---
 app.get('/v1/tiktok/search/users', authMiddleware, async (req, res) => {
     const { query, cursor, trim } = req.query;
 
-    // 1. Validation
     if (!query || query.trim() === '') {
         return res.status(400).json({ 
             success: false, 
@@ -3443,7 +3452,6 @@ app.get('/v1/tiktok/search/users', authMiddleware, async (req, res) => {
         });
     }
 
-    // 2. Pre-flight Credit Check (Strictly 1 Credit)
     const costPerRequest = 1;
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({ 
@@ -3452,16 +3460,9 @@ app.get('/v1/tiktok/search/users', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-    const identifier = encodeURIComponent(query.toLowerCase().trim());
-    const safeCursor = cursor || '0';
-    const safeTrim = trim === 'true' ? 'true' : 'false';
-
     try {
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API Key in environment");
 
         const targetUrl = new URL('https://api.scrapecreators.com/v1/tiktok/search/users');
         targetUrl.searchParams.append('query', query.trim());
@@ -3469,25 +3470,22 @@ app.get('/v1/tiktok/search/users', authMiddleware, async (req, res) => {
         if (cursor) targetUrl.searchParams.append('cursor', cursor);
         if (trim) targetUrl.searchParams.append('trim', trim);
 
-        // 6. Execute Request
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(20000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        if (!response.ok || !upstreamPayload.success) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to search users'}`);
+        if (!response.ok || !payload.success) {
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to search users'}`);
         }
 
-        // 7. Data Trimming & Extraction
-        // Strip out the 500 lines of TikTok internal junk and keep only the gold.
-        const rawUserList = Array.isArray(upstreamPayload.user_list) ? upstreamPayload.user_list : [];
+        const rawUserList = Array.isArray(payload.user_list) ? payload.user_list : [];
         
         const trimmedUsers = rawUserList.map(item => {
             const u = item.user_info || {};
@@ -3508,15 +3506,16 @@ app.get('/v1/tiktok/search/users', authMiddleware, async (req, res) => {
         });
 
         const responseData = {
-            cursor: upstreamPayload.cursor ?? null,
-            has_more: !!upstreamPayload.has_more,
+            cursor: payload.cursor ?? null,
+            has_more: !!payload.has_more,
             users: trimmedUsers
         };
 
-        // 8. Strict Flat-Rate Billing & Caching
         req.user.credits -= costPerRequest;
 
-        // 9. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/tiktok/search/users', costPerRequest, { query, cursor, trim }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -3527,7 +3526,11 @@ app.get('/v1/tiktok/search/users', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
-        const finalErrorMsg = isTimeout ? "504 Gateway Timeout: Upstream provider took too long to respond." : error.message;
+        
+        // White-labeled
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction server took too long to respond." 
+            : error.message;
         
         if (typeof notifyFailure === 'function') {
             notifyFailure({ 
@@ -3537,6 +3540,9 @@ app.get('/v1/tiktok/search/users', authMiddleware, async (req, res) => {
                 errorMsg: finalErrorMsg 
             });
         }
+
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/tiktok/search/users', 0, { query, cursor, trim }, statusCode);
 
         return res.status(statusCode).json({ 
             success: false, 
