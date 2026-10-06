@@ -265,163 +265,148 @@ app.use('/v1', authMiddleware);
 // Apply the global cache middleware to all routes under '/v1'
 app.use('/v1', universalCacheMiddleware);
 
+// --- EXPRESS ROUTE: REDDIT SUBREDDIT DETAILS ---
 app.get('/v1/reddit/subreddit/details', authMiddleware, async (req, res) => {
-    const rawInput = req.query.subreddit || req.query.name;
-    const cacheMaxAge = req.query.cache_max_age || '7d';
+    const { url, subreddit, name, cache_max_age } = req.query;
 
-    if (!rawInput) {
+    // 1. Parameter Validation
+    // Accept url, subreddit, or name (for backward compatibility)
+    if (!url && !subreddit && !name) {
         return res.status(400).json({
             success: false,
-            error: "400 Bad Request: Missing required parameter 'subreddit' or 'name'"
+            error: "400 Bad Request: Missing required parameter. Provide either 'subreddit' or 'url'."
         });
     }
 
-    let cleanSubreddit = rawInput.trim().split('?')[0].replace(/\/$/, '');
-    if (cleanSubreddit.includes('reddit.com/r/')) {
-        cleanSubreddit = cleanSubreddit.split('reddit.com/r/')[1].split('/')[0];
-    } else if (cleanSubreddit.startsWith('r/')) {
-        cleanSubreddit = cleanSubreddit.replace(/^r\//, '');
-    }
+    const baseCostToUser = 1;
 
-    const costPerRequest = 1;
-
-    if (req.user.credits < costPerRequest) {
+    // 2. Pre-flight Credit Check
+    if (req.user.credits < baseCostToUser) {
         return res.status(403).json({
             success: false,
-            error: `403 Forbidden: Insufficient credits. This request requires ${costPerRequest} credit(s).`
+            error: `403 Forbidden: Insufficient credits. This request requires up to ${baseCostToUser} credit(s).`
         });
     }
 
-    let upstreamPayload = null;
-    let primaryErrorMsg = "";
+    // Safely parse the subreddit name from various possible user inputs
+    let cleanSubreddit = null;
+    let cleanUrl = null;
+
+    if (url) {
+        cleanUrl = url.trim().split('?')[0];
+    } else {
+        const rawInput = subreddit || name;
+        cleanSubreddit = rawInput.trim().split('?')[0].replace(/\/$/, '');
+        if (cleanSubreddit.includes('reddit.com/r/')) {
+            cleanSubreddit = cleanSubreddit.split('reddit.com/r/')[1].split('/')[0];
+        } else if (cleanSubreddit.startsWith('r/')) {
+            cleanSubreddit = cleanSubreddit.replace(/^r\//, '');
+        }
+    }
 
     try {
-        // --- PRIMARY ATTEMPT ---
-        const getAnyApiKey = process.env.GETANYAPI_KEY;
-        if (!getAnyApiKey) throw new Error("Missing primary API key");
+        // 3. Build Extraction Request
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API Key in environment configuration");
 
-        const primaryResponse = await fetch('https://api.getanyapi.com/v1/run/reddit.subreddit_details', {
-            method: 'POST',
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/reddit/subreddit/details');
+        
+        if (cleanUrl) targetUrl.searchParams.append('url', cleanUrl);
+        if (cleanSubreddit) targetUrl.searchParams.append('subreddit', cleanSubreddit); // Note: Case Sensitive!
+        if (cache_max_age) targetUrl.searchParams.append('cache_max_age', cache_max_age);
+
+        // 4. Execute Request (20s timeout)
+        const response = await fetch(targetUrl.toString(), {
+            method: 'GET',
             headers: {
-                'Authorization': `Bearer ${getAnyApiKey}`,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify({ subreddit: cleanSubreddit }),
-            signal: AbortSignal.timeout(8000)
+            signal: AbortSignal.timeout(20000)
         });
 
-        if (!primaryResponse.ok) {
-            throw new Error(`HTTP ${primaryResponse.status}`);
+        const payload = await response.json();
+
+        // 5. Handle Upstream Errors 
+        if (!response.ok || !payload.success) {
+            const apiErr = payload.error ? payload.error.toLowerCase() : "";
+            if (response.status === 404 || apiErr.includes('not found')) {
+                throw new Error("404 Not Found: The requested subreddit does not exist, is banned, or is private.");
+            }
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to extract subreddit data'}`);
         }
 
-        const primaryData = await primaryResponse.json();
+        // 6. Payload Construction & Strict Mapping
+        const responseData = {
+            subreddit_id: payload.subreddit_id || null,
+            display_name: payload.display_name || cleanSubreddit,
+            subscribers: payload.subscribers || 0,
+            weekly_active_users: payload.weekly_active_users || 0,
+            weekly_contributions: payload.weekly_contributions || 0,
+            description: payload.description || "",
+            rules: payload.rules || "",
+            icon_img: payload.icon_img || null,
+            header_img: payload.header_img || null,
+            advertiser_category: payload.advertiser_category || "",
+            created_at: payload.created_at || null,
+            submit_text: payload.submit_text || "",
+            cached: payload.cached || false,
+            cached_at: payload.cached_at || null
+        };
 
-        if (primaryData.output && primaryData.output.found) {
-            const data = primaryData.output.data;
-            upstreamPayload = {
-                success: true,
-                subreddit_id: data.id,
-                display_name: data.name,
-                weekly_active_users: data.weeklyActiveUsers,
-                description: data.description,
-                icon_img: data.iconUrl,
-                advertiser_category: data.advertiserCategory,
-                created_at: data.createdUtc
-            };
-        } else {
-            throw new Error("404 Not Found");
-        }
-    } catch (primaryError) {
-        primaryErrorMsg = primaryError.message;
+        // 7. Dynamic Billing Deduction
+        // If upstream served from cache, they charged 0. We pass that savings to the user.
+        const actualCost = payload.credits_charged === 0 ? 0 : baseCostToUser;
+        req.user.credits -= actualCost;
+
+        const requestParamsLog = { url: cleanUrl, subreddit: cleanSubreddit, cache_max_age };
+
+        // [NEW] 8. LOG THE SUCCESS
+        await logApiRequest(req, '/v1/reddit/subreddit/details', actualCost, requestParamsLog, 200);
+
+        return res.status(200).json({
+            success: true,
+            credits_remaining: req.user.credits,
+            credits_charged: actualCost,
+            ...responseData 
+        });
+
+    } catch (error) {
+        const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
+        const isNotFound = error.message.includes('404');
         
-        // --- FALLBACK ATTEMPT ---
-        try {
-            const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-            if (!upstreamApiKey) throw new Error("Missing fallback API key");
+        let statusCode = 500;
+        let finalErrorMsg = "Internal Server Error: Failed to extract subreddit data at this time.";
 
-            const targetUrl = new URL('https://api.scrapecreators.com/v1/reddit/subreddit/details');
-            targetUrl.searchParams.append('subreddit', cleanSubreddit);
-            targetUrl.searchParams.append('cache_max_age', cacheMaxAge);
+        if (isNotFound) {
+            statusCode = 404;
+            finalErrorMsg = "404 Not Found: The requested subreddit does not exist, is banned, or is private.";
+        } else if (isTimeout) {
+            statusCode = 504;
+            finalErrorMsg = "504 Gateway Timeout: Data extraction took too long to complete. Please try again.";
+        } else if (error.message) {
+            finalErrorMsg = error.message;
+        }
 
-            const fallbackResponse = await fetch(targetUrl.toString(), {
-                method: 'GET',
-                headers: {
-                    'x-api-key': upstreamApiKey,
-                    'Content-Type': 'application/json'
-                },
-                signal: AbortSignal.timeout(10000)
-            });
+        const requestParamsLog = { url: cleanUrl, subreddit: cleanSubreddit, cache_max_age };
 
-            upstreamPayload = await fallbackResponse.json();
-
-            if (!fallbackResponse.ok || upstreamPayload.success === false) {
-                const apiErr = upstreamPayload.error ? upstreamPayload.error.toLowerCase() : "";
-                if (fallbackResponse.status === 404 || apiErr.includes('not found')) {
-                    throw new Error("404 Not Found");
-                }
-                throw new Error(upstreamPayload.error || `HTTP ${fallbackResponse.status}`);
-            }
-
-        } catch (fallbackError) {
-            const isTimeout = fallbackError.name === 'TimeoutError' || primaryError.name === 'TimeoutError';
-            const isNotFound = fallbackError.message.includes('404') || primaryErrorMsg.includes('404');
-            
-            let statusCode = 500;
-            let clientErrorMsg = "Internal Server Error: Failed to extract subreddit data at this time.";
-
-            if (isNotFound) {
-                statusCode = 404;
-                clientErrorMsg = "404 Not Found: The requested subreddit does not exist, is banned, or is private.";
-            } else if (isTimeout) {
-                statusCode = 504;
-                clientErrorMsg = "504 Gateway Timeout: Data extraction took too long to complete. Please try again.";
-            }
-
-            if (typeof notifyFailure === 'function') {
-                notifyFailure({
-                    endpoint: '/v1/reddit/subreddit/details',
-                    params: { subreddit: cleanSubreddit },
-                    statusCode: statusCode,
-                    errorMsg: `Primary: ${primaryErrorMsg} | Fallback: ${fallbackError.message}`
-                });
-            }
-
-            // [NEW] 1. LOG THE FAILURE (Cost = 0)
-            await logApiRequest(req, '/v1/reddit/subreddit/details', 0, { subreddit: cleanSubreddit }, statusCode);
-
-            return res.status(statusCode).json({
-                success: false,
-                error: clientErrorMsg
+        if (typeof notifyFailure === 'function') {
+            notifyFailure({
+                endpoint: '/v1/reddit/subreddit/details',
+                params: requestParamsLog,
+                statusCode: statusCode,
+                errorMsg: finalErrorMsg
             });
         }
+
+        // [NEW] LOG THE FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/reddit/subreddit/details', 0, requestParamsLog, statusCode);
+
+        return res.status(statusCode).json({
+            success: false,
+            error: finalErrorMsg
+        });
     }
-
-    const responseData = {
-        subreddit_id: upstreamPayload.subreddit_id || null,
-        display_name: upstreamPayload.display_name || cleanSubreddit,
-        subscribers: upstreamPayload.subscribers || 0,
-        weekly_active_users: upstreamPayload.weekly_active_users || 0,
-        weekly_contributions: upstreamPayload.weekly_contributions || 0,
-        description: upstreamPayload.description || "",
-        rules: upstreamPayload.rules || "",
-        icon_img: upstreamPayload.icon_img || null,
-        header_img: upstreamPayload.header_img || null,
-        advertiser_category: upstreamPayload.advertiser_category || "",
-        created_at: upstreamPayload.created_at || null,
-        submit_text: upstreamPayload.submit_text || ""
-    };
-
-    req.user.credits -= costPerRequest;
-
-    // [NEW] 2. LOG THE SUCCESS (Cost = 1)
-    await logApiRequest(req, '/v1/reddit/subreddit/details', costPerRequest, { subreddit: cleanSubreddit }, 200);
-
-    return res.status(200).json({
-        success: true,
-        credits_remaining: req.user.credits,
-        credits_charged: costPerRequest,
-        ...responseData 
-    });
 });
 
 // --- 2. UPDATED EXPRESS ROUTE ---
@@ -2135,12 +2120,9 @@ app.get('/v1/instagram/post/comments', authMiddleware, async (req, res) => {
 
 // --- 2. EXPRESS ROUTE ---
 // --- EXPRESS ROUTE: YOUTUBE CHANNEL INFO ---
+// --- EXPRESS ROUTE: YOUTUBE CHANNEL INFO ---
 app.get('/v1/youtube/channel', authMiddleware, async (req, res) => {
-    const channelId = req.query.channelId;
-    const handle = req.query.handle;
-    const url = req.query.url;
-    const q = req.query.q; 
-    const cacheMaxAge = req.query.cache_max_age || '7d';
+    const { channelId, handle, url, q, cache_max_age } = req.query;
 
     let targetParamKey = null;
     let targetParamValue = null;
@@ -2175,116 +2157,92 @@ app.get('/v1/youtube/channel', authMiddleware, async (req, res) => {
         });
     }
 
-    const costPerRequest = 1;
+    const baseCostToUser = 1;
 
-    if (req.user.credits < costPerRequest) {
+    if (req.user.credits < baseCostToUser) {
         return res.status(403).json({
             success: false,
-            error: `403 Forbidden: Insufficient credits. This request requires ${costPerRequest} credits.`
-        });
-    }
-
-    let extractionInput;
-    if (targetParamKey === 'channelId' || targetParamKey === 'handle') {
-        extractionInput = { [targetParamKey]: targetParamValue };
-    } else {
-        try {
-            const parsedUrl = new URL(targetParamValue);
-            const pathParts = parsedUrl.pathname.split('/').filter(Boolean);
-            const channelPathIndex = pathParts.indexOf('channel');
-
-            if (channelPathIndex >= 0 && pathParts[channelPathIndex + 1]) {
-                extractionInput = { channelId: pathParts[channelPathIndex + 1] };
-            } else if (pathParts[0]?.startsWith('@')) {
-                extractionInput = { handle: pathParts[0] };
-            } else if (pathParts[0] === 'user' || pathParts[0] === 'c') {
-                extractionInput = { handle: `@${pathParts[1] || ''}` };
-            }
-        } catch (error) {
-            return res.status(400).json({
-                success: false,
-                error: "400 Bad Request: Invalid YouTube URL."
-            });
-        }
-    }
-
-    if (!extractionInput || Object.values(extractionInput)[0] === '') {
-        return res.status(400).json({
-            success: false,
-            error: "400 Bad Request: Could not determine a YouTube handle or channel ID."
+            error: `403 Forbidden: Insufficient credits. This request requires up to ${baseCostToUser} credit(s).`
         });
     }
 
     try {
-        const apiKey = process.env.GETANYAPI_KEY;
-        if (!apiKey) throw new Error("Missing extraction API key in environment");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
+        }
 
-        const response = await fetch('https://api.getanyapi.com/v1/run/youtube.channel', {
-            method: 'POST',
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/youtube/channel');
+        targetUrl.searchParams.append(targetParamKey, targetParamValue);
+        
+        if (cache_max_age) targetUrl.searchParams.append('cache_max_age', cache_max_age);
+
+        const response = await fetch(targetUrl.toString(), {
+            method: 'GET',
             headers: {
-                Authorization: `Bearer ${apiKey}`,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify(extractionInput),
-            signal: AbortSignal.timeout(15000)
+            signal: AbortSignal.timeout(20000)
         });
 
-        let payload;
-        try {
-            payload = await response.json();
-        } catch (parseError) {
-            throw new Error(`Extraction server returned invalid JSON (HTTP ${response.status})`);
+        const payload = await response.json();
+
+        if (!response.ok || !payload.success) {
+            throw new Error(
+                `Server Error: ${payload.error || response.statusText || 'Failed to fetch YouTube channel info'}`
+            );
         }
 
-        if (!response.ok) {
-            const serverError = payload.error || response.statusText || 'Failed to fetch YouTube channel info';
-            const error = new Error(`Server Error: ${serverError}`);
-            error.statusCode = response.status;
-            throw error;
-        }
+        // Separate billing/cache metadata from the raw channel data
+        const { success, credits_remaining, credits_charged, cached, cached_at, ...channelData } = payload;
 
-        const output = payload.output || {};
-        const channelData = output.data || {};
+        const responseData = {
+            cached: cached || false,
+            cached_at: cached_at || null,
+            ...channelData
+        };
 
-        req.user.credits -= costPerRequest;
+        // Pass 0-cost savings to the user if it was a cache hit upstream
+        const actualCost = credits_charged === 0 ? 0 : baseCostToUser;
+        req.user.credits -= actualCost;
+
+        const requestParamsLog = { [targetParamKey]: targetParamValue, cache_max_age };
 
         // [NEW] LOG SUCCESS
-        await logApiRequest(req, '/v1/youtube/channel', costPerRequest, { [targetParamKey]: targetParamValue }, 200);
+        await logApiRequest(req, '/v1/youtube/channel', actualCost, requestParamsLog, 200);
 
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
-            credits_charged: costPerRequest,
-            found: output.found ?? false,
-            ...channelData,
-            ...(output.reason ? { reason: output.reason } : {})
+            credits_charged: actualCost,
+            ...responseData
         });
 
     } catch (error) {
-        const errorMessage = error.message || "Internal Server Error";
-        const isTimeout = error.name === 'TimeoutError';
-        const finalStatus = isTimeout ? 504 : (error.statusCode || 500);
+        const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
+        const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
         
         // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: The extraction server took too long to respond." 
-            : errorMessage;
+            ? "504 Gateway Timeout: The extraction server took too long to fetch the channel data." 
+            : error.message;
 
-        if (finalStatus >= 500 || finalStatus === 403 || finalStatus === 429) {
-            if (typeof notifyFailure === 'function') {
-                notifyFailure({
-                    endpoint: '/v1/youtube/channel',
-                    params: { [targetParamKey]: targetParamValue },
-                    statusCode: finalStatus,
-                    errorMsg: finalErrorMsg
-                });
-            }
+        const requestParamsLog = { [targetParamKey]: targetParamValue, cache_max_age };
+
+        if (typeof notifyFailure === 'function') {
+            notifyFailure({
+                endpoint: '/v1/youtube/channel',
+                params: requestParamsLog,
+                statusCode: statusCode,
+                errorMsg: finalErrorMsg
+            });
         }
 
         // [NEW] LOG FAILURE (Cost = 0)
-        await logApiRequest(req, '/v1/youtube/channel', 0, { [targetParamKey]: targetParamValue }, finalStatus);
+        await logApiRequest(req, '/v1/youtube/channel', 0, requestParamsLog, statusCode);
 
-        return res.status(finalStatus).json({
+        return res.status(statusCode).json({
             success: false,
             error: finalErrorMsg
         });
@@ -4533,10 +4491,10 @@ app.get('/v1/tiktok/collection/videos', authMiddleware, async (req, res) => {
     }
 });
 
+// --- EXPRESS ROUTE: LINKEDIN PROFILE ---
 app.get('/v1/linkedin/profile', authMiddleware, async (req, res) => {
     const { url, handle } = req.query;
 
-    // 1. Handle & URL Normalization
     let targetLinkedInUrl = url || handle;
 
     if (!targetLinkedInUrl || typeof targetLinkedInUrl !== 'string' || targetLinkedInUrl.trim() === '') {
@@ -4548,13 +4506,11 @@ app.get('/v1/linkedin/profile', authMiddleware, async (req, res) => {
 
     targetLinkedInUrl = targetLinkedInUrl.trim();
 
-    // Auto-convert standalone handles or "in/username" formats to full URLs
     if (!targetLinkedInUrl.startsWith('http://') && !targetLinkedInUrl.startsWith('https://')) {
         const cleanHandle = targetLinkedInUrl.replace(/^@/, '').replace(/^in\//, '').replace(/\/$/, '');
         targetLinkedInUrl = `https://www.linkedin.com/in/${cleanHandle}`;
     }
 
-    // Clean trailing slashes for consistent caching
     try {
         const parsedUrl = new URL(targetLinkedInUrl);
         targetLinkedInUrl = `${parsedUrl.origin}${parsedUrl.pathname.replace(/\/$/, '')}`;
@@ -4565,7 +4521,6 @@ app.get('/v1/linkedin/profile', authMiddleware, async (req, res) => {
         });
     }
 
-    // 2. Pre-flight Credit Check (Charges 2 Credits to double upstream cost)
     const costToUser = 2;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
@@ -4574,47 +4529,38 @@ app.get('/v1/linkedin/profile', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-
     try {
-
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API Key in environment");
 
         const targetUrl = new URL('https://api.scrapecreators.com/v1/linkedin/profile');
         targetUrl.searchParams.append('url', targetLinkedInUrl);
 
-        // 6. Execute Request (25s timeout for LinkedIn page loads)
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(25000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 7. Handle Upstream Errors
-        if (!response.ok || !upstreamPayload.success) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch LinkedIn profile'}`);
+        if (!response.ok || !payload.success) {
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to fetch LinkedIn profile'}`);
         }
 
-        // 8. Trim & Sanitize Payload
-        // Strips out obscured text, redacted experience descriptions, and useless metadata
         const trimmedProfile = {
-            name: upstreamPayload.name || null,
-            image: upstreamPayload.image || null,
-            location: upstreamPayload.location || null,
-            followers: upstreamPayload.followers || 0,
-            connections: upstreamPayload.connections || null,
-            about: upstreamPayload.about || null,
+            name: payload.name || null,
+            image: payload.image || null,
+            location: payload.location || null,
+            followers: payload.followers || 0,
+            connections: payload.connections || null,
+            about: payload.about || null,
             url: targetLinkedInUrl,
-            recentPosts: Array.isArray(upstreamPayload.recentPosts) 
-                ? upstreamPayload.recentPosts.map(post => ({
+            recentPosts: Array.isArray(payload.recentPosts) 
+                ? payload.recentPosts.map(post => ({
                     title: post.title || "",
                     activityType: post.activityType || "",
                     link: post.link || "",
@@ -4622,38 +4568,38 @@ app.get('/v1/linkedin/profile', authMiddleware, async (req, res) => {
                 })) 
                 : [],
 
-            experience: Array.isArray(upstreamPayload.experience)
-                ? upstreamPayload.experience.map(exp => ({
+            experience: Array.isArray(payload.experience)
+                ? payload.experience.map(exp => ({
                     company: exp.name || null,
                     url: exp.url || null,
                     location: exp.location || null
                 }))
                 : [],
-            education: Array.isArray(upstreamPayload.education)
-                ? upstreamPayload.education.map(edu => ({
+            education: Array.isArray(payload.education)
+                ? payload.education.map(edu => ({
                     school: edu.name || null,
                     url: edu.url || null,
                     startYear: edu.member?.startDate || null,
                     endYear: edu.member?.endDate || null
                 }))
                 : [],
-            articles: Array.isArray(upstreamPayload.articles)
-                ? upstreamPayload.articles.map(art => ({
+            articles: Array.isArray(payload.articles)
+                ? payload.articles.map(art => ({
                     headline: art.headline || "",
                     datePublished: art.datePublished || null,
                     image: art.image || null,
                     body: art.articleBody || ""
                 }))
                 : [],
-            recommendations: Array.isArray(upstreamPayload.recommendations)
-                ? upstreamPayload.recommendations.map(rec => ({
+            recommendations: Array.isArray(payload.recommendations)
+                ? payload.recommendations.map(rec => ({
                     name: rec.name || "",
                     link: rec.link || "",
                     text: rec.text || ""
                 }))
                 : [],
-            similarProfiles: Array.isArray(upstreamPayload.similarProfiles)
-                ? upstreamPayload.similarProfiles.map(sim => ({
+            similarProfiles: Array.isArray(payload.similarProfiles)
+                ? payload.similarProfiles.map(sim => ({
                     name: sim.name || "",
                     link: sim.link || "",
                     image: sim.image || null
@@ -4661,10 +4607,11 @@ app.get('/v1/linkedin/profile', authMiddleware, async (req, res) => {
                 : []
         };
 
-        // 9. Billing Deduction & Local Caching
         req.user.credits -= costToUser;
 
-        // 10. Return Sanitized Payload
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/linkedin/profile', costToUser, { url: targetLinkedInUrl }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -4674,11 +4621,11 @@ app.get('/v1/linkedin/profile', authMiddleware, async (req, res) => {
 
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
-        
-        // If LinkedIn throws a 404, it usually means the profile doesn't exist or is completely private
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch the profile." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch the profile." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -4690,6 +4637,9 @@ app.get('/v1/linkedin/profile', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/linkedin/profile', 0, { url: targetLinkedInUrl }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -4697,6 +4647,8 @@ app.get('/v1/linkedin/profile', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: LINKEDIN EMAIL FINDER ---
 app.get('/v1/linkedin/email', authMiddleware, async (req, res) => {
     const profileUrl = req.query.profileUrl || req.query.url;
     const costToUser = 15;
@@ -4718,35 +4670,38 @@ app.get('/v1/linkedin/email', authMiddleware, async (req, res) => {
     }
 
     try {
-        const getAnyApiKey = process.env.GETANYAPI_KEY;
-        if (!getAnyApiKey) throw new Error('Missing GETANYAPI_KEY in environment');
+        const apiKey = process.env.GETANYAPI_KEY;
+        if (!apiKey) throw new Error('Missing extraction API key in environment');
 
         const response = await fetch('https://api.getanyapi.com/v1/run/linkedin.email', {
             method: 'POST',
             headers: {
-                Authorization: `Bearer ${getAnyApiKey}`,
+                Authorization: `Bearer ${apiKey}`,
                 'Content-Type': 'application/json'
             },
             body: JSON.stringify({ profileUrl: cleanProfileUrl }),
             signal: AbortSignal.timeout(25000)
         });
 
-        let upstreamPayload;
+        let payload;
         try {
-            upstreamPayload = await response.json();
+            payload = await response.json();
         } catch (parseError) {
-            throw new Error(`AnyAPI returned invalid JSON (HTTP ${response.status})`);
+            throw new Error(`Extraction server returned invalid JSON (HTTP ${response.status})`);
         }
 
         if (!response.ok) {
-            const upstreamError = upstreamPayload.error || response.statusText || 'Failed to find LinkedIn email';
-            const error = new Error(`AnyAPI Error: ${upstreamError}`);
+            const serverError = payload.error || response.statusText || 'Failed to find LinkedIn email';
+            const error = new Error(`Server Error: ${serverError}`);
             error.statusCode = response.status;
             throw error;
         }
 
-        const output = upstreamPayload.output || {};
+        const output = payload.output || {};
         req.user.credits -= costToUser;
+
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/linkedin/email', costToUser, { profileUrl: cleanProfileUrl }, 200);
 
         return res.status(200).json({
             success: true,
@@ -4761,8 +4716,10 @@ app.get('/v1/linkedin/email', authMiddleware, async (req, res) => {
         const statusCode = isTimeout
             ? 504
             : (error.statusCode >= 400 && error.statusCode < 500 ? error.statusCode : 500);
+        
+        // White-labeled
         const errorMessage = isTimeout
-            ? '504 Gateway Timeout: AnyAPI took too long to find the LinkedIn email.'
+            ? '504 Gateway Timeout: The extraction server took too long to find the LinkedIn email.'
             : error.message || 'Internal Server Error';
 
         if (typeof notifyFailure === 'function') {
@@ -4774,6 +4731,9 @@ app.get('/v1/linkedin/email', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/linkedin/email', 0, { profileUrl: cleanProfileUrl }, statusCode);
+
         return res.status(statusCode).json({
             success: false,
             error: errorMessage
@@ -4781,10 +4741,11 @@ app.get('/v1/linkedin/email', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: LINKEDIN COMPANY ---
 app.get('/v1/linkedin/company', authMiddleware, async (req, res) => {
     const { url, handle } = req.query;
 
-    // 1. Handle & URL Normalization
     let targetCompanyUrl = url || handle;
 
     if (!targetCompanyUrl || typeof targetCompanyUrl !== 'string' || targetCompanyUrl.trim() === '') {
@@ -4796,13 +4757,11 @@ app.get('/v1/linkedin/company', authMiddleware, async (req, res) => {
 
     targetCompanyUrl = targetCompanyUrl.trim();
 
-    // Auto-convert standalone handles or "company/name" formats to full URLs
     if (!targetCompanyUrl.startsWith('http://') && !targetCompanyUrl.startsWith('https://')) {
         const cleanHandle = targetCompanyUrl.replace(/^@/, '').replace(/^company\//, '').replace(/\/$/, '');
         targetCompanyUrl = `https://www.linkedin.com/company/${cleanHandle}`;
     }
 
-    // Clean trailing slashes for consistent caching
     try {
         const parsedUrl = new URL(targetCompanyUrl);
         targetCompanyUrl = `${parsedUrl.origin}${parsedUrl.pathname.replace(/\/$/, '')}`;
@@ -4813,7 +4772,6 @@ app.get('/v1/linkedin/company', authMiddleware, async (req, res) => {
         });
     }
 
-    // 2. Pre-flight Credit Check (Charges 2 Credits)
     const costToUser = 2;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
@@ -4822,88 +4780,80 @@ app.get('/v1/linkedin/company', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-
     try {
-
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API Key in environment");
 
         const targetUrl = new URL('https://api.scrapecreators.com/v1/linkedin/company');
         targetUrl.searchParams.append('url', targetCompanyUrl);
 
-        // 6. Execute Request (25s timeout for LinkedIn page loads)
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(25000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 7. Handle Upstream Errors
-        if (!response.ok || !upstreamPayload.success) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch LinkedIn company page'}`);
+        if (!response.ok || !payload.success) {
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to fetch LinkedIn company page'}`);
         }
 
-        // 8. Trim & Sanitize Payload
         const trimmedCompany = {
-            id: upstreamPayload.id || null,
-            name: upstreamPayload.name || "",
-            slogan: upstreamPayload.slogan || null,
-            description: upstreamPayload.description || "",
-            website: upstreamPayload.website || null,
-            logo: upstreamPayload.logo || null,
-            cover_image: upstreamPayload.coverImage || null,
-            industry: upstreamPayload.industry || null,
-            size: upstreamPayload.size || null,
-            employee_count: upstreamPayload.employeeCount || 0,
-            founded: upstreamPayload.founded || null,
-            headquarters: upstreamPayload.headquarters || null,
-            type: upstreamPayload.type || null,
-            location: upstreamPayload.location ? {
-                city: upstreamPayload.location.city || "",
-                state: upstreamPayload.location.state || "",
-                country: upstreamPayload.location.country || ""
+            id: payload.id || null,
+            name: payload.name || "",
+            slogan: payload.slogan || null,
+            description: payload.description || "",
+            website: payload.website || null,
+            logo: payload.logo || null,
+            cover_image: payload.coverImage || null,
+            industry: payload.industry || null,
+            size: payload.size || null,
+            employee_count: payload.employeeCount || 0,
+            founded: payload.founded || null,
+            headquarters: payload.headquarters || null,
+            type: payload.type || null,
+            location: payload.location ? {
+                city: payload.location.city || "",
+                state: payload.location.state || "",
+                country: payload.location.country || ""
             } : null,
-            specialties: Array.isArray(upstreamPayload.specialties) ? upstreamPayload.specialties : [],
-            funding: upstreamPayload.funding ? {
-                number_of_rounds: upstreamPayload.funding.numberOfRounds || 0,
-                last_round: upstreamPayload.funding.lastRound ? {
-                    type: upstreamPayload.funding.lastRound.type || "",
-                    date: upstreamPayload.funding.lastRound.date || null,
-                    amount: upstreamPayload.funding.lastRound.amount || ""
+            specialties: Array.isArray(payload.specialties) ? payload.specialties : [],
+            funding: payload.funding ? {
+                number_of_rounds: payload.funding.numberOfRounds || 0,
+                last_round: payload.funding.lastRound ? {
+                    type: payload.funding.lastRound.type || "",
+                    date: payload.funding.lastRound.date || null,
+                    amount: payload.funding.lastRound.amount || ""
                 } : null,
-                investors: Array.isArray(upstreamPayload.funding.investors)
-                    ? upstreamPayload.funding.investors.map(inv => ({
+                investors: Array.isArray(payload.funding.investors)
+                    ? payload.funding.investors.map(inv => ({
                         name: inv.name || "",
                         crunchbase_url: inv.crunchbaseUrl || "",
                         image: inv.image || null
                     }))
                     : []
             } : null,
-            employees: Array.isArray(upstreamPayload.employees)
-                ? upstreamPayload.employees.map(emp => ({
+            employees: Array.isArray(payload.employees)
+                ? payload.employees.map(emp => ({
                     name: emp.name || "",
                     title: emp.title || "",
                     link: emp.link || "",
                     image: emp.image || null
                 }))
                 : [],
-            posts: Array.isArray(upstreamPayload.posts)
-                ? upstreamPayload.posts.map(post => ({
+            posts: Array.isArray(payload.posts)
+                ? payload.posts.map(post => ({
                     url: post.url || "",
                     date_published: post.datePublished || null,
                     text: post.text || ""
                 }))
                 : [],
-            similar_pages: Array.isArray(upstreamPayload.similarPages)
-                ? upstreamPayload.similarPages.map(page => ({
+            similar_pages: Array.isArray(payload.similarPages)
+                ? payload.similarPages.map(page => ({
                     name: page.name || "",
                     link: page.link || "",
                     image: page.image || null
@@ -4911,10 +4861,11 @@ app.get('/v1/linkedin/company', authMiddleware, async (req, res) => {
                 : []
         };
 
-        // 9. Billing Deduction & Local Caching
         req.user.credits -= costToUser;
 
-        // 10. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/linkedin/company', costToUser, { url: targetCompanyUrl }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -4925,8 +4876,10 @@ app.get('/v1/linkedin/company', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch company details." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch company details." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -4938,6 +4891,9 @@ app.get('/v1/linkedin/company', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/linkedin/company', 0, { url: targetCompanyUrl }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -4945,10 +4901,10 @@ app.get('/v1/linkedin/company', authMiddleware, async (req, res) => {
     }
 });
 
+// --- EXPRESS ROUTE: LINKEDIN COMPANY POSTS ---
 app.get('/v1/linkedin/company/posts', authMiddleware, async (req, res) => {
     const { url, handle, page } = req.query;
 
-    // 1. Handle & URL Normalization
     let targetCompanyUrl = url || handle;
 
     if (!targetCompanyUrl || typeof targetCompanyUrl !== 'string' || targetCompanyUrl.trim() === '') {
@@ -4960,13 +4916,11 @@ app.get('/v1/linkedin/company/posts', authMiddleware, async (req, res) => {
 
     targetCompanyUrl = targetCompanyUrl.trim();
 
-    // Auto-convert standalone handles to full URLs
     if (!targetCompanyUrl.startsWith('http://') && !targetCompanyUrl.startsWith('https://')) {
         const cleanHandle = targetCompanyUrl.replace(/^@/, '').replace(/^company\//, '').replace(/\/$/, '');
         targetCompanyUrl = `https://www.linkedin.com/company/${cleanHandle}`;
     }
 
-    // Clean trailing slashes for consistent caching
     try {
         const parsedUrl = new URL(targetCompanyUrl);
         targetCompanyUrl = `${parsedUrl.origin}${parsedUrl.pathname.replace(/\/$/, '')}`;
@@ -4977,16 +4931,14 @@ app.get('/v1/linkedin/company/posts', authMiddleware, async (req, res) => {
         });
     }
 
-    // Validate Page Pagination (LinkedIn max is 7)
     const pageNum = parseInt(page, 10) || 1;
     if (pageNum < 1 || pageNum > 7) {
         return res.status(400).json({
             success: false,
-            error: "400 Bad Request: 'page' parameter must be between 1 and 7 due to LinkedIn's public pagination limits."
+            error: "400 Bad Request: 'page' parameter must be between 1 and 7 due to public pagination limits."
         });
     }
 
-    // 2. Pre-flight Credit Check (Charges 3 Credits as requested)
     const costToUser = 2;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
@@ -4995,39 +4947,31 @@ app.get('/v1/linkedin/company/posts', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-
     try {
-
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment configuration");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API Key in environment configuration");
 
         const targetUrl = new URL('https://api.scrapecreators.com/v1/linkedin/company/posts');
         targetUrl.searchParams.append('url', targetCompanyUrl);
         if (page) targetUrl.searchParams.append('page', pageNum.toString());
 
-        // 6. Execute Request (25s timeout for LinkedIn's heavy scroll rendering)
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(25000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 7. Handle Upstream Errors
-        if (!response.ok || !upstreamPayload.success) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch LinkedIn company posts'}`);
+        if (!response.ok || !payload.success) {
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to fetch LinkedIn company posts'}`);
         }
 
-        // 8. Trim & Sanitize Payload
-        const trimmedPosts = Array.isArray(upstreamPayload.posts) 
-            ? upstreamPayload.posts.map(post => ({
+        const trimmedPosts = Array.isArray(payload.posts) 
+            ? payload.posts.map(post => ({
                 id: post.id || "",
                 url: post.url || "",
                 date_published: post.datePublished || null,
@@ -5041,10 +4985,11 @@ app.get('/v1/linkedin/company/posts', authMiddleware, async (req, res) => {
             posts: trimmedPosts
         };
 
-        // 9. Billing Deduction & Local Caching
         req.user.credits -= costToUser;
 
-        // 10. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/linkedin/company/posts', costToUser, { url: targetCompanyUrl, page: pageNum }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -5054,21 +4999,24 @@ app.get('/v1/linkedin/company/posts', authMiddleware, async (req, res) => {
 
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
-        
-        // 404 usually means the page doesn't exist or is completely private
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch company posts." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch company posts." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
             notifyFailure({ 
                 endpoint: '/v1/linkedin/company/posts', 
-                params: { targetCompanyUrl, page: pageNum }, 
+                params: { url: targetCompanyUrl, page: pageNum }, 
                 statusCode: statusCode, 
                 errorMsg: finalErrorMsg 
             });
         }
+
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/linkedin/company/posts', 0, { url: targetCompanyUrl, page: pageNum }, statusCode);
 
         return res.status(statusCode).json({ 
             success: false, 
@@ -5077,10 +5025,11 @@ app.get('/v1/linkedin/company/posts', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: LINKEDIN SEARCH POSTS ---
 app.get('/v1/linkedin/search/posts', authMiddleware, async (req, res) => {
     const { query, date_posted, cursor, trim } = req.query;
 
-    // 1. Parameter Validation
     if (!query || typeof query !== 'string' || query.trim() === '') {
         return res.status(400).json({ 
             success: false, 
@@ -5088,7 +5037,6 @@ app.get('/v1/linkedin/search/posts', authMiddleware, async (req, res) => {
         });
     }
 
-    // Preemptively block cursors >= 12 to save upstream API calls and bandwidth
     if (cursor && parseInt(cursor, 10) >= 12) {
         return res.status(400).json({
             success: false,
@@ -5096,7 +5044,6 @@ app.get('/v1/linkedin/search/posts', authMiddleware, async (req, res) => {
         });
     }
 
-    // 2. Pre-flight Credit Check (Charges 3 Credits for a 3x Markup)
     const costToUser = 2;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
@@ -5105,19 +5052,10 @@ app.get('/v1/linkedin/search/posts', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-    const identifier = encodeURIComponent(query.toLowerCase().trim());
-    const safeDate = date_posted || 'all-time';
-    const safeCursor = cursor || '0';
-    const safeTrim = trim === 'true' ? 'true' : 'false';
-
     try {
-
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
         }
 
         const targetUrl = new URL('https://api.scrapecreators.com/v1/linkedin/search/posts');
@@ -5127,29 +5065,25 @@ app.get('/v1/linkedin/search/posts', authMiddleware, async (req, res) => {
         if (cursor) targetUrl.searchParams.append('cursor', cursor);
         if (trim) targetUrl.searchParams.append('trim', trim);
 
-        // 6. Execute Request (25s timeout for Google index + LinkedIn scrape)
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(25000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 7. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
+        if (!response.ok || !payload.success) {
             throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to search LinkedIn posts'}`
+                `Server Error: ${payload.error || response.statusText || 'Failed to search LinkedIn posts'}`
             );
         }
 
-        // 8. Trim & Sanitize Payload
-        // Enforce a strict, clean schema so users only get useful data
-        const trimmedPosts = Array.isArray(upstreamPayload.posts) 
-            ? upstreamPayload.posts.map(post => ({
+        const trimmedPosts = Array.isArray(payload.posts) 
+            ? payload.posts.map(post => ({
                 url: post.url || "",
                 date_published: post.datePublished || null,
                 text: post.description || post.text || "", 
@@ -5174,16 +5108,17 @@ app.get('/v1/linkedin/search/posts', authMiddleware, async (req, res) => {
             : [];
 
         const responseData = {
-            query: upstreamPayload.query || query,
-            cursor: upstreamPayload.cursor ?? null,
-            has_more: !!upstreamPayload.cursor && parseInt(upstreamPayload.cursor, 10) < 11,
+            query: payload.query || query,
+            cursor: payload.cursor ?? null,
+            has_more: !!payload.cursor && parseInt(payload.cursor, 10) < 11,
             posts: trimmedPosts
         };
 
-        // 9. Billing Deduction & Local Caching
         req.user.credits -= costToUser;
 
-        // 10. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/linkedin/search/posts', costToUser, { query, date_posted, cursor, trim }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -5194,8 +5129,10 @@ app.get('/v1/linkedin/search/posts', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch search results." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch search results." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -5207,6 +5144,9 @@ app.get('/v1/linkedin/search/posts', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/linkedin/search/posts', 0, { query, date_posted, cursor, trim }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -5214,10 +5154,11 @@ app.get('/v1/linkedin/search/posts', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: LINKEDIN SINGLE POST ---
 app.get('/v1/linkedin/post', authMiddleware, async (req, res) => {
     const { url } = req.query;
 
-    // 1. Parameter Validation
     if (!url || typeof url !== 'string' || url.trim() === '') {
         return res.status(400).json({ 
             success: false, 
@@ -5225,10 +5166,8 @@ app.get('/v1/linkedin/post', authMiddleware, async (req, res) => {
         });
     }
 
-    // 2. URL Normalization
     let targetPostUrl = url.trim();
     try {
-        // Strip tracking parameters (e.g., ?utm_source=...) so cache hits are perfectly accurate
         const parsedUrl = new URL(targetPostUrl);
         targetPostUrl = `${parsedUrl.origin}${parsedUrl.pathname.replace(/\/$/, '')}`;
     } catch (e) {
@@ -5238,7 +5177,6 @@ app.get('/v1/linkedin/post', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Pre-flight Credit Check (Strictly 1 Credit)
     const costPerRequest = 1;
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({ 
@@ -5247,62 +5185,54 @@ app.get('/v1/linkedin/post', authMiddleware, async (req, res) => {
         });
     }
 
-    // 4. Cache Key Construction
-
     try {
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API Key in environment configuration");
 
-        // 6. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment configuration");
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/linkedin/post');
+        targetUrl.searchParams.append('url', targetPostUrl);
 
-        const upstreamUrl = new URL('https://api.scrapecreators.com/v1/linkedin/post');
-        upstreamUrl.searchParams.append('url', targetPostUrl);
-
-        // 7. Execute Request (20s timeout)
-        const response = await fetch(upstreamUrl.toString(), {
+        const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(20000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 8. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
+        if (!response.ok || !payload.success) {
             throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch LinkedIn post'}`
+                `Server Error: ${payload.error || response.statusText || 'Failed to fetch LinkedIn post'}`
             );
         }
 
-        // 9. Trim & Sanitize Payload
-        // Standardizes the schema so your developers always get clean, predictable keys
         const trimmedPost = {
-            url: upstreamPayload.url || targetPostUrl,
-            title: upstreamPayload.name || "",
-            headline: upstreamPayload.headline || "",
-            text: upstreamPayload.description || "",
-            date_published: upstreamPayload.datePublished || null,
-            author: upstreamPayload.author ? {
-                name: upstreamPayload.author.name || "",
-                url: upstreamPayload.author.url || "",
-                followers: upstreamPayload.author.followers || 0
+            url: payload.url || targetPostUrl,
+            title: payload.name || "",
+            headline: payload.headline || "",
+            text: payload.description || "",
+            date_published: payload.datePublished || null,
+            author: payload.author ? {
+                name: payload.author.name || "",
+                url: payload.author.url || "",
+                followers: payload.author.followers || 0
             } : null,
             stats: {
-                likes: upstreamPayload.likeCount || 0,
-                comments: upstreamPayload.commentCount || 0
+                likes: payload.likeCount || 0,
+                comments: payload.commentCount || 0
             },
-            comments: Array.isArray(upstreamPayload.comments) 
-                ? upstreamPayload.comments.map(c => ({
+            comments: Array.isArray(payload.comments) 
+                ? payload.comments.map(c => ({
                     author: c.author || "",
                     text: c.text || "",
                     url: c.linkedinUrl || ""
                 })) 
                 : [],
-            more_articles: Array.isArray(upstreamPayload.moreArticles) 
-                ? upstreamPayload.moreArticles.map(a => ({
+            more_articles: Array.isArray(payload.moreArticles) 
+                ? payload.moreArticles.map(a => ({
                     title: a.title || "",
                     url: a.link || "",
                     date_published: a.datePublished || "",
@@ -5315,10 +5245,11 @@ app.get('/v1/linkedin/post', authMiddleware, async (req, res) => {
                 : []
         };
 
-        // 10. Strict Flat-Rate Billing & Caching
         req.user.credits -= costPerRequest;
 
-        // 11. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/linkedin/post', costPerRequest, { url: targetPostUrl }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -5329,8 +5260,10 @@ app.get('/v1/linkedin/post', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch post." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch the post." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -5342,6 +5275,9 @@ app.get('/v1/linkedin/post', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/linkedin/post', 0, { url: targetPostUrl }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -5351,10 +5287,10 @@ app.get('/v1/linkedin/post', authMiddleware, async (req, res) => {
 
 const { scrapeFacebookProfileNative,scrapeFacebookPostNative } = require('./src/scrapers/facebook.js');
 
+// --- EXPRESS ROUTE: FACEBOOK GROUP INFO ---
 app.get('/v1/facebook/group', authMiddleware, async (req, res) => {
     const { url, group_id } = req.query;
 
-    // 1. Input Validation
     if (!url && !group_id) {
         return res.status(400).json({ 
             success: false, 
@@ -5362,7 +5298,6 @@ app.get('/v1/facebook/group', authMiddleware, async (req, res) => {
         });
     }
 
-    // 2. Pre-flight Credit Check (Charges 1 credit / $1 as requested)
     const costToUser = 1;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
@@ -5371,109 +5306,98 @@ app.get('/v1/facebook/group', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Request Normalization & Cache Key Construction
-    const upstreamUrl = new URL('https://api.scrapecreators.com/v1/facebook/group');
-    let cacheIdentifier = '';
+    const targetUrl = new URL('https://api.scrapecreators.com/v1/facebook/group');
 
     if (group_id) {
-        upstreamUrl.searchParams.append('group_id', group_id.trim());
-        cacheIdentifier = `id_${group_id.trim()}`;
+        targetUrl.searchParams.append('group_id', group_id.trim());
     } else {
-        const cleanUrl = url.trim().split('?')[0]; // Strip tracking params
-        upstreamUrl.searchParams.append('url', cleanUrl);
-        cacheIdentifier = `url_${Buffer.from(cleanUrl).toString('base64')}`;
+        const cleanUrl = url.trim().split('?')[0]; 
+        targetUrl.searchParams.append('url', cleanUrl);
     }
 
-
     try {
-
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
         }
 
-        // 6. Execute Request (25s timeout)
-        const response = await fetch(upstreamUrl.toString(), {
+        const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(25000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 7. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
+        if (!response.ok || !payload.success) {
             throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch Facebook group details'}`
+                `Server Error: ${payload.error || response.statusText || 'Failed to fetch Facebook group details'}`
             );
         }
 
-        // 8. Trim & Sanitize Payload
-        // Normalizing the object structure to ensure a safe, predictable schema
         const responseData = {
-            id: upstreamPayload.id || null,
-            url: upstreamPayload.url || url || null,
-            name: upstreamPayload.name || "",
-            description: upstreamPayload.description || "",
-            privacy: upstreamPayload.privacy ? {
-                label: upstreamPayload.privacy.label || "",
-                description: upstreamPayload.privacy.description || ""
+            id: payload.id || null,
+            url: payload.url || url || null,
+            name: payload.name || "",
+            description: payload.description || "",
+            privacy: payload.privacy ? {
+                label: payload.privacy.label || "",
+                description: payload.privacy.description || ""
             } : null,
-            visibility: upstreamPayload.visibility ? {
-                label: upstreamPayload.visibility.label || "",
-                description: upstreamPayload.visibility.description || ""
+            visibility: payload.visibility ? {
+                label: payload.visibility.label || "",
+                description: payload.visibility.description || ""
             } : null,
-            categories: Array.isArray(upstreamPayload.categories) 
-                ? upstreamPayload.categories.map(c => ({ id: c.id, name: c.name })) 
+            categories: Array.isArray(payload.categories) 
+                ? payload.categories.map(c => ({ id: c.id, name: c.name })) 
                 : [],
-            created_at: upstreamPayload.created_at || null,
-            history_summary: upstreamPayload.history_summary || "",
+            created_at: payload.created_at || null,
+            history_summary: payload.history_summary || "",
             stats: {
-                member_count: upstreamPayload.member_count || 0,
-                member_count_text: upstreamPayload.member_count_text || "",
-                administrator_count: upstreamPayload.administrator_count || 0,
-                moderator_count: upstreamPayload.moderator_count || 0
+                member_count: payload.member_count || 0,
+                member_count_text: payload.member_count_text || "",
+                administrator_count: payload.administrator_count || 0,
+                moderator_count: payload.moderator_count || 0
             },
-            activity: upstreamPayload.activity ? {
-                posts_last_day: upstreamPayload.activity.posts_last_day || 0,
-                posts_last_month: upstreamPayload.activity.posts_last_month || 0,
-                new_members_text: upstreamPayload.activity.new_members_text || ""
+            activity: payload.activity ? {
+                posts_last_day: payload.activity.posts_last_day || 0,
+                posts_last_month: payload.activity.posts_last_month || 0,
+                new_members_text: payload.activity.new_members_text || ""
             } : null,
             staff: {
-                administrators: Array.isArray(upstreamPayload.administrators) ? upstreamPayload.administrators.map(admin => ({
+                administrators: Array.isArray(payload.administrators) ? payload.administrators.map(admin => ({
                     id: admin.id || "",
                     name: admin.name || "",
                     url: admin.url || "",
                     profile_picture_url: admin.profile_picture_url || null
                 })) : [],
-                moderators: Array.isArray(upstreamPayload.moderators) ? upstreamPayload.moderators.map(mod => ({
+                moderators: Array.isArray(payload.moderators) ? payload.moderators.map(mod => ({
                     id: mod.id || "",
                     name: mod.name || "",
                     url: mod.url || "",
                     profile_picture_url: mod.profile_picture_url || null
                 })) : []
             },
-            rules: Array.isArray(upstreamPayload.rules) ? upstreamPayload.rules.map(rule => ({
+            rules: Array.isArray(payload.rules) ? payload.rules.map(rule => ({
                 id: rule.id || "",
                 title: rule.title || "",
                 description: rule.description || ""
             })) : [],
-            about_info: Array.isArray(upstreamPayload.about_info) ? upstreamPayload.about_info.map(info => ({
+            about_info: Array.isArray(payload.about_info) ? payload.about_info.map(info => ({
                 type: info.type || "",
                 label: info.label || "",
                 description: info.description || ""
             })) : []
         };
 
-        // 9. Billing Deduction & Local Caching
         req.user.credits -= costToUser;
 
-        // 10. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/facebook/group', costToUser, { url, group_id }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -5484,8 +5408,10 @@ app.get('/v1/facebook/group', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch group info." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch group info." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -5497,6 +5423,9 @@ app.get('/v1/facebook/group', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/facebook/group', 0, { url, group_id }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -5504,10 +5433,11 @@ app.get('/v1/facebook/group', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: FACEBOOK GROUP POSTS ---
 app.get('/v1/facebook/group/posts', authMiddleware, async (req, res) => {
     const { url, group_id, sort_by, cursor } = req.query;
 
-    // 1. Input Validation
     if (!url && !group_id) {
         return res.status(400).json({ 
             success: false, 
@@ -5515,7 +5445,6 @@ app.get('/v1/facebook/group/posts', authMiddleware, async (req, res) => {
         });
     }
 
-    // 2. Pre-flight Credit Check (Charges 2 Credits for 50% margin)
     const costToUser = 2;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
@@ -5524,58 +5453,44 @@ app.get('/v1/facebook/group/posts', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Request Normalization & Cache Key Construction
-    const upstreamUrl = new URL('https://api.scrapecreators.com/v1/facebook/group/posts');
-    let cacheIdentifier = '';
+    const targetUrl = new URL('https://api.scrapecreators.com/v1/facebook/group/posts');
 
     if (group_id) {
-        upstreamUrl.searchParams.append('group_id', group_id.trim());
-        cacheIdentifier = `id_${group_id.trim()}`;
+        targetUrl.searchParams.append('group_id', group_id.trim());
     } else {
-        const cleanUrl = url.trim().split('?')[0]; // Strip tracking params
-        upstreamUrl.searchParams.append('url', cleanUrl);
-        cacheIdentifier = `url_${Buffer.from(cleanUrl).toString('base64')}`;
+        const cleanUrl = url.trim().split('?')[0]; 
+        targetUrl.searchParams.append('url', cleanUrl);
     }
 
     const safeSortBy = sort_by ? sort_by.trim().toUpperCase() : 'CHRONOLOGICAL';
-    if (sort_by) upstreamUrl.searchParams.append('sort_by', safeSortBy);
-    
-    if (cursor) upstreamUrl.searchParams.append('cursor', cursor);
-
-    const safeCursor = cursor ? Buffer.from(cursor).toString('base64').substring(0, 15) : '0';
+    if (sort_by) targetUrl.searchParams.append('sort_by', safeSortBy);
+    if (cursor) targetUrl.searchParams.append('cursor', cursor);
 
     try {
-
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
         }
 
-        // 6. Execute Request (30s timeout for heavy group post fetching)
-        const response = await fetch(upstreamUrl.toString(), {
+        const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(30000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 7. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
+        if (!response.ok || !payload.success) {
             throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch Facebook group posts'}`
+                `Server Error: ${payload.error || response.statusText || 'Failed to fetch Facebook group posts'}`
             );
         }
 
-        // 8. Trim & Sanitize Payload
-        // Standardizes the post schema and removes internal __typename fields
-        const trimmedPosts = Array.isArray(upstreamPayload.posts) 
-            ? upstreamPayload.posts.map(post => ({
+        const trimmedPosts = Array.isArray(payload.posts) 
+            ? payload.posts.map(post => ({
                 id: post.id || "",
                 text: post.text || null,
                 url: post.url || "",
@@ -5610,18 +5525,19 @@ app.get('/v1/facebook/group/posts', authMiddleware, async (req, res) => {
             : [];
 
         const responseData = {
-            target: group_id ? { group_id: group_id.trim() } : { url: upstreamUrl.searchParams.get('url') },
+            target: group_id ? { group_id: group_id.trim() } : { url: targetUrl.searchParams.get('url') },
             sort_by: safeSortBy,
-            cursor: upstreamPayload.cursor || null,
-            has_more: !!upstreamPayload.cursor,
+            cursor: payload.cursor || null,
+            has_more: !!payload.cursor,
             total_returned: trimmedPosts.length,
             posts: trimmedPosts
         };
 
-        // 9. Billing Deduction & Local Caching
         req.user.credits -= costToUser;
 
-        // 10. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/facebook/group/posts', costToUser, { url, group_id, sort_by, cursor }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -5632,8 +5548,10 @@ app.get('/v1/facebook/group/posts', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch group posts." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch group posts." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -5645,6 +5563,9 @@ app.get('/v1/facebook/group/posts', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/facebook/group/posts', 0, { url, group_id, sort_by, cursor }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -5652,10 +5573,11 @@ app.get('/v1/facebook/group/posts', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: FACEBOOK POST COMMENTS ---
 app.get('/v1/facebook/post/comments', authMiddleware, async (req, res) => {
     const { url, feedback_id, cursor } = req.query;
 
-    // 1. Input Validation
     if (!url && !feedback_id) {
         return res.status(400).json({ 
             success: false, 
@@ -5663,7 +5585,6 @@ app.get('/v1/facebook/post/comments', authMiddleware, async (req, res) => {
         });
     }
 
-    // 2. Pre-flight Credit Check (Charges 2 Credits to maintain 50% margin)
     const costToUser = 2;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
@@ -5672,55 +5593,42 @@ app.get('/v1/facebook/post/comments', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Request Normalization & Cache Key Construction
-    const upstreamUrl = new URL('https://api.scrapecreators.com/v1/facebook/post/comments');
-    let cacheIdentifier = '';
+    const targetUrl = new URL('https://api.scrapecreators.com/v1/facebook/post/comments');
 
     if (feedback_id) {
-        upstreamUrl.searchParams.append('feedback_id', feedback_id.trim());
-        cacheIdentifier = `fbid_${feedback_id.trim()}`;
+        targetUrl.searchParams.append('feedback_id', feedback_id.trim());
     } else {
-        let cleanUrl = url.trim().split('?')[0]; // Strip tracking params
-        upstreamUrl.searchParams.append('url', cleanUrl);
-        cacheIdentifier = `url_${Buffer.from(cleanUrl).toString('base64')}`;
+        const cleanUrl = url.trim().split('?')[0]; 
+        targetUrl.searchParams.append('url', cleanUrl);
     }
 
-    if (cursor) upstreamUrl.searchParams.append('cursor', cursor);
-    
-    const safeCursor = cursor ? Buffer.from(cursor).toString('base64').substring(0, 15) : '0';
+    if (cursor) targetUrl.searchParams.append('cursor', cursor);
 
     try {
-
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
         }
 
-        // 6. Execute Request (25s timeout)
-        const response = await fetch(upstreamUrl.toString(), {
+        const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(25000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 7. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
+        if (!response.ok || !payload.success) {
             throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch Facebook comments'}`
+                `Server Error: ${payload.error || response.statusText || 'Failed to fetch Facebook comments'}`
             );
         }
 
-        // 8. Trim & Sanitize Payload
-        // Ensures your users get a predictable, clean schema
-        const trimmedComments = Array.isArray(upstreamPayload.comments) 
-            ? upstreamPayload.comments.map(comment => ({
+        const trimmedComments = Array.isArray(payload.comments) 
+            ? payload.comments.map(comment => ({
                 id: comment.id || "",
                 text: comment.text || "",
                 created_at: comment.created_at || null,
@@ -5741,17 +5649,18 @@ app.get('/v1/facebook/post/comments', authMiddleware, async (req, res) => {
             : [];
 
         const responseData = {
-            target: feedback_id ? { feedback_id: feedback_id.trim() } : { url: upstreamUrl.searchParams.get('url') },
-            cursor: upstreamPayload.cursor || null,
-            has_more: !!upstreamPayload.has_next_page,
+            target: feedback_id ? { feedback_id: feedback_id.trim() } : { url: targetUrl.searchParams.get('url') },
+            cursor: payload.cursor || null,
+            has_more: !!payload.has_next_page,
             total_returned: trimmedComments.length,
             comments: trimmedComments
         };
 
-        // 9. Billing Deduction & Local Caching
         req.user.credits -= costToUser;
 
-        // 10. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/facebook/post/comments', costToUser, { url, feedback_id, cursor }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -5762,8 +5671,10 @@ app.get('/v1/facebook/post/comments', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch comments." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch comments." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -5775,6 +5686,9 @@ app.get('/v1/facebook/post/comments', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/facebook/post/comments', 0, { url, feedback_id, cursor }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -5782,6 +5696,7 @@ app.get('/v1/facebook/post/comments', authMiddleware, async (req, res) => {
     }
 });
 
+// --- EXPRESS ROUTE: FACEBOOK SINGLE POST ---
 app.get('/v1/facebook/post', authMiddleware, async (req, res) => {
     const { url, cache_max_age } = req.query;
 
@@ -5795,86 +5710,84 @@ app.get('/v1/facebook/post', authMiddleware, async (req, res) => {
     const cleanUrl = url.trim().split('?')[0];
 
     // Charge 2 credits to maintain a 50% profit margin
-    const baseCostToUser = 1;
-    if (req.user.credits < baseCostToUser) {
+    const costPerRequest = 2;
+    if (req.user.credits < costPerRequest) {
         return res.status(403).json({ 
             success: false, 
-            error: `403 Forbidden: Insufficient credits. This request requires up to ${baseCostToUser} credits.` 
+            error: `403 Forbidden: Insufficient credits. This request requires up to ${costPerRequest} credits.` 
         });
     }
 
     try {
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
         }
 
-        const upstreamUrl = new URL('https://api.scrapecreators.com/v1/facebook/post');
-        upstreamUrl.searchParams.append('url', cleanUrl);
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/facebook/post');
+        targetUrl.searchParams.append('url', cleanUrl);
         
-        // Forward cache_max_age upstream to save costs there; local middleware intercepts first if cached locally
-        if (cache_max_age) upstreamUrl.searchParams.append('cache_max_age', cache_max_age);
+        if (cache_max_age) targetUrl.searchParams.append('cache_max_age', cache_max_age);
 
-        // Execute Request (25s timeout)
-        const response = await fetch(upstreamUrl.toString(), {
+        const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(25000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        if (!response.ok || !upstreamPayload.success) {
+        if (!response.ok || !payload.success) {
             throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch Facebook post'}`
+                `Server Error: ${payload.error || response.statusText || 'Failed to fetch Facebook post'}`
             );
         }
 
-        // Sanitize Payload
         const responseData = {
-            post_id: upstreamPayload.post_id || null,
-            url: upstreamPayload.url || cleanUrl,
-            description: upstreamPayload.description || "",
-            creation_time: upstreamPayload.creation_time || null,
+            post_id: payload.post_id || null,
+            url: payload.url || cleanUrl,
+            description: payload.description || "",
+            creation_time: payload.creation_time || null,
             stats: {
-                likes: upstreamPayload.like_count || 0,
-                comments: upstreamPayload.comment_count || 0,
-                shares: upstreamPayload.share_count || 0,
-                views: upstreamPayload.view_count || 0
+                likes: payload.like_count || 0,
+                comments: payload.comment_count || 0,
+                shares: payload.share_count || 0,
+                views: payload.view_count || 0
             },
-            author: upstreamPayload.author ? {
-                id: upstreamPayload.author.id || "",
-                name: upstreamPayload.author.name || "",
-                url: upstreamPayload.author.url || "",
-                image: upstreamPayload.author.image || null,
-                is_verified: !!upstreamPayload.author.is_verified
+            author: payload.author ? {
+                id: payload.author.id || "",
+                name: payload.author.name || "",
+                url: payload.author.url || "",
+                image: payload.author.image || null,
+                is_verified: !!payload.author.is_verified
             } : null,
             media: {
-                image_url: upstreamPayload.image_url || null,
-                video: upstreamPayload.video ? {
-                    id: upstreamPayload.video.id || "",
-                    sd_url: upstreamPayload.video.sd_url || null,
-                    hd_url: upstreamPayload.video.hd_url || null,
-                    thumbnail: upstreamPayload.video.thumbnail || null,
-                    duration_sec: upstreamPayload.video.length_in_second || 0
+                image_url: payload.image_url || null,
+                video: payload.video ? {
+                    id: payload.video.id || "",
+                    sd_url: payload.video.sd_url || null,
+                    hd_url: payload.video.hd_url || null,
+                    thumbnail: payload.video.thumbnail || null,
+                    duration_sec: payload.video.length_in_second || 0
                 } : null
             },
-            music: upstreamPayload.music ? {
-                id: upstreamPayload.music.id || "",
-                title: upstreamPayload.music.track_title || ""
+            music: payload.music ? {
+                id: payload.music.id || "",
+                title: payload.music.track_title || ""
             } : null,
-            cached: upstreamPayload.cached || false,
-            cached_at: upstreamPayload.cached_at || null
+            cached: payload.cached || false,
+            cached_at: payload.cached_at || null
         };
 
-        // Dynamic Billing Deduction
-        const actualCost = upstreamPayload.credits_charged === 0 ? 0 : baseCostToUser;
+        const actualCost = payload.credits_charged === 0 ? 0 : costPerRequest;
         req.user.credits -= actualCost;
 
-        // Return to Consumer (Intercepted by cache middleware if successful)
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/facebook/post', actualCost, { url: cleanUrl, cache_max_age }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -5885,18 +5798,23 @@ app.get('/v1/facebook/post', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch post." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch the post." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
             notifyFailure({ 
                 endpoint: '/v1/facebook/post', 
-                params: { url: cleanUrl }, 
+                params: { url: cleanUrl, cache_max_age }, 
                 statusCode: statusCode, 
                 errorMsg: finalErrorMsg 
             });
         }
+
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/facebook/post', 0, { url: cleanUrl, cache_max_age }, statusCode);
 
         return res.status(statusCode).json({ 
             success: false, 
@@ -5905,10 +5823,11 @@ app.get('/v1/facebook/post', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: FACEBOOK PROFILE REELS ---
 app.get('/v1/facebook/profile/reels', authMiddleware, async (req, res) => {
     const { url, handle, next_page_id, cursor } = req.query;
 
-    // 1. Parameter Normalization
     const input = handle || url;
     if (!input || typeof input !== 'string' || input.trim() === '') {
         return res.status(400).json({ 
@@ -5929,7 +5848,6 @@ app.get('/v1/facebook/profile/reels', authMiddleware, async (req, res) => {
         targetPageUrl = `https://www.facebook.com/${cleanInput.replace(/\/$/, '')}`;
     }
 
-    // Clean trailing slashes for consistent caching
     try {
         const parsedUrl = new URL(targetPageUrl);
         targetPageUrl = `${parsedUrl.origin}${parsedUrl.pathname.replace(/\/$/, '')}`;
@@ -5940,7 +5858,6 @@ app.get('/v1/facebook/profile/reels', authMiddleware, async (req, res) => {
         });
     }
 
-    // 2. Pre-flight Credit Check (Charges 2 Credits to double upstream cost)
     const costToUser = 2;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
@@ -5949,47 +5866,37 @@ app.get('/v1/facebook/profile/reels', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-    const safeCursor = cursor ? Buffer.from(cursor).toString('base64').substring(0, 15) : '0';
-    const safePageId = next_page_id ? Buffer.from(next_page_id).toString('base64').substring(0, 15) : '0';
-
     try {
- 
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
         }
 
-        const upstreamUrl = new URL('https://api.scrapecreators.com/v1/facebook/profile/reels');
-        upstreamUrl.searchParams.append('url', targetPageUrl);
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/facebook/profile/reels');
+        targetUrl.searchParams.append('url', targetPageUrl);
         
-        if (next_page_id) upstreamUrl.searchParams.append('next_page_id', next_page_id);
-        if (cursor) upstreamUrl.searchParams.append('cursor', cursor);
+        if (next_page_id) targetUrl.searchParams.append('next_page_id', next_page_id);
+        if (cursor) targetUrl.searchParams.append('cursor', cursor);
 
-        // 6. Execute Request (25s timeout for video feed loads)
-        const response = await fetch(upstreamUrl.toString(), {
+        const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(25000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 7. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
+        if (!response.ok || !payload.success) {
             throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch Facebook reels'}`
+                `Server Error: ${payload.error || response.statusText || 'Failed to fetch Facebook reels'}`
             );
         }
 
-        // 8. Trim & Sanitize Payload
-        const trimmedReels = Array.isArray(upstreamPayload.reels) 
-            ? upstreamPayload.reels.map(reel => ({
+        const trimmedReels = Array.isArray(payload.reels) 
+            ? payload.reels.map(reel => ({
                 id: reel.id || "",
                 post_id: reel.post_id || "",
                 video_id: reel.video_id || "",
@@ -6021,17 +5928,18 @@ app.get('/v1/facebook/profile/reels', authMiddleware, async (req, res) => {
 
         const responseData = {
             url: targetPageUrl,
-            cursor: upstreamPayload.cursor || null,
-            next_page_id: upstreamPayload.next_page_id || null,
-            has_more: !!(upstreamPayload.cursor && upstreamPayload.next_page_id),
+            cursor: payload.cursor || null,
+            next_page_id: payload.next_page_id || null,
+            has_more: !!(payload.cursor && payload.next_page_id),
             total_returned: trimmedReels.length,
             reels: trimmedReels
         };
 
-        // 9. Billing Deduction & Local Caching
         req.user.credits -= costToUser;
 
-        // 10. Return Sanitized Payload
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/facebook/profile/reels', costToUser, { url: targetPageUrl, cursor, next_page_id }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -6042,8 +5950,10 @@ app.get('/v1/facebook/profile/reels', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch reels." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch reels." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -6055,6 +5965,9 @@ app.get('/v1/facebook/profile/reels', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/facebook/profile/reels', 0, { url: targetPageUrl, cursor, next_page_id }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -6062,10 +5975,11 @@ app.get('/v1/facebook/profile/reels', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: FACEBOOK PROFILE PHOTOS ---
 app.get('/v1/facebook/profile/photos', authMiddleware, async (req, res) => {
     const { url, handle, next_page_id, cursor } = req.query;
 
-    // 1. Parameter Normalization (Accept either url or handle)
     const input = handle || url;
     if (!input || typeof input !== 'string' || input.trim() === '') {
         return res.status(400).json({ 
@@ -6086,7 +6000,6 @@ app.get('/v1/facebook/profile/photos', authMiddleware, async (req, res) => {
         targetPageUrl = `https://www.facebook.com/${cleanInput.replace(/\/$/, '')}`;
     }
 
-    // Clean trailing slashes for consistent caching keys
     try {
         const parsedUrl = new URL(targetPageUrl);
         targetPageUrl = `${parsedUrl.origin}${parsedUrl.pathname.replace(/\/$/, '')}`;
@@ -6097,7 +6010,6 @@ app.get('/v1/facebook/profile/photos', authMiddleware, async (req, res) => {
         });
     }
 
-    // 2. Pre-flight Credit Check (Charges 2 Credits to maintain 50% margin)
     const costToUser = 2;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
@@ -6106,48 +6018,37 @@ app.get('/v1/facebook/profile/photos', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-    const safeCursor = cursor ? Buffer.from(cursor).toString('base64').substring(0, 15) : '0';
-    const safePageId = next_page_id ? Buffer.from(next_page_id).toString('base64').substring(0, 15) : '0';
-
     try {
-
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
         }
 
-        const upstreamUrl = new URL('https://api.scrapecreators.com/v1/facebook/profile/photos');
-        upstreamUrl.searchParams.append('url', targetPageUrl);
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/facebook/profile/photos');
+        targetUrl.searchParams.append('url', targetPageUrl);
         
-        if (next_page_id) upstreamUrl.searchParams.append('next_page_id', next_page_id);
-        if (cursor) upstreamUrl.searchParams.append('cursor', cursor);
+        if (next_page_id) targetUrl.searchParams.append('next_page_id', next_page_id);
+        if (cursor) targetUrl.searchParams.append('cursor', cursor);
 
-        // 6. Execute Request (25s timeout for heavy image catalog fetching)
-        const response = await fetch(upstreamUrl.toString(), {
+        const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(25000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 7. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
+        if (!response.ok || !payload.success) {
             throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch Facebook page photos'}`
+                `Server Error: ${payload.error || response.statusText || 'Failed to fetch Facebook page photos'}`
             );
         }
 
-        // 8. Trim & Sanitize Payload
-        // Strips out empty encodings, null CIX screens, and reorganizes image structures
-        const trimmedPhotos = Array.isArray(upstreamPayload.photos) 
-            ? upstreamPayload.photos.map(photo => ({
+        const trimmedPhotos = Array.isArray(payload.photos) 
+            ? payload.photos.map(photo => ({
                 id: photo.photo_id || photo.id || "",
                 url: photo.url || "",
                 caption: photo.accessibility_caption || null,
@@ -6162,17 +6063,18 @@ app.get('/v1/facebook/profile/photos', authMiddleware, async (req, res) => {
 
         const responseData = {
             url: targetPageUrl,
-            cursor: upstreamPayload.cursor || null,
-            next_page_id: upstreamPayload.next_page_id || null,
-            has_more: !!(upstreamPayload.cursor && upstreamPayload.next_page_id),
+            cursor: payload.cursor || null,
+            next_page_id: payload.next_page_id || null,
+            has_more: !!(payload.cursor && payload.next_page_id),
             total_returned: trimmedPhotos.length,
             photos: trimmedPhotos
         };
 
-        // 9. Billing Deduction & Local Caching
         req.user.credits -= costToUser;
 
-        // 10. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/facebook/profile/photos', costToUser, { url: targetPageUrl, cursor, next_page_id }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -6183,8 +6085,10 @@ app.get('/v1/facebook/profile/photos', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch photos." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch photos." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -6196,6 +6100,9 @@ app.get('/v1/facebook/profile/photos', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/facebook/profile/photos', 0, { url: targetPageUrl, cursor, next_page_id }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -6203,10 +6110,10 @@ app.get('/v1/facebook/profile/photos', authMiddleware, async (req, res) => {
     }
 });
 
+// --- EXPRESS ROUTE: FACEBOOK PROFILE POSTS ---
 app.get('/v1/facebook/profile/posts', authMiddleware, async (req, res) => {
     const { url, handle, pageId, cursor } = req.query;
 
-    // 1. Input Validation
     if (!url && !handle && !pageId) {
         return res.status(400).json({ 
             success: false, 
@@ -6214,7 +6121,6 @@ app.get('/v1/facebook/profile/posts', authMiddleware, async (req, res) => {
         });
     }
 
-    // 2. Pre-flight Credit Check (Charges 2 Credits to maintain 50% margin)
     const costToUser = 2;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
@@ -6223,17 +6129,12 @@ app.get('/v1/facebook/profile/posts', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Request Normalization & Cache Key Construction
-    const upstreamUrl = new URL('https://api.scrapecreators.com/v1/facebook/profile/posts');
-    let cacheIdentifier = '';
-
+    let targetPageUrl = "";
     if (pageId) {
-        upstreamUrl.searchParams.append('pageId', pageId.trim());
-        cacheIdentifier = `id_${pageId.trim()}`;
+        // Handled via pageId upstream
     } else {
         const input = handle || url;
         let cleanInput = input.trim().replace(/^@/, '');
-        let targetPageUrl;
 
         if (cleanInput.includes('facebook.com/')) {
             const pathPart = cleanInput.split('facebook.com/')[1].split('/')[0].split('?')[0];
@@ -6244,7 +6145,6 @@ app.get('/v1/facebook/profile/posts', authMiddleware, async (req, res) => {
             targetPageUrl = `https://www.facebook.com/${cleanInput.replace(/\/$/, '')}`;
         }
 
-        // Clean trailing slashes
         try {
             const parsedUrl = new URL(targetPageUrl);
             targetPageUrl = `${parsedUrl.origin}${parsedUrl.pathname.replace(/\/$/, '')}`;
@@ -6254,46 +6154,43 @@ app.get('/v1/facebook/profile/posts', authMiddleware, async (req, res) => {
                 error: "400 Bad Request: Invalid Facebook URL or handle provided." 
             });
         }
-        
-        upstreamUrl.searchParams.append('url', targetPageUrl);
-        cacheIdentifier = `url_${Buffer.from(targetPageUrl).toString('base64')}`;
     }
 
-    if (cursor) upstreamUrl.searchParams.append('cursor', cursor);
-    const safeCursor = cursor ? Buffer.from(cursor).toString('base64').substring(0, 15) : '0';
-
     try {
-
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
         }
 
-        // 6. Execute Request (30s timeout for heavy video/post fetching)
+        const upstreamUrl = new URL('https://api.scrapecreators.com/v1/facebook/profile/posts');
+        
+        if (pageId) {
+            upstreamUrl.searchParams.append('pageId', pageId.trim());
+        } else {
+            upstreamUrl.searchParams.append('url', targetPageUrl);
+        }
+
+        if (cursor) upstreamUrl.searchParams.append('cursor', cursor);
+
         const response = await fetch(upstreamUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(30000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 7. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
+        if (!response.ok || !payload.success) {
             throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch Facebook posts'}`
+                `Server Error: ${payload.error || response.statusText || 'Failed to fetch Facebook posts'}`
             );
         }
 
-        // 8. Trim & Sanitize Payload
-        // Ensures consistent schema and removes null/internal tags
-        const trimmedPosts = Array.isArray(upstreamPayload.posts) 
-            ? upstreamPayload.posts.map(post => ({
+        const trimmedPosts = Array.isArray(payload.posts) 
+            ? payload.posts.map(post => ({
                 id: post.id || "",
                 text: post.text || "",
                 url: post.url || "",
@@ -6327,17 +6224,18 @@ app.get('/v1/facebook/profile/posts', authMiddleware, async (req, res) => {
             : [];
 
         const responseData = {
-            target: pageId ? { page_id: pageId } : { url: upstreamUrl.searchParams.get('url') },
-            cursor: upstreamPayload.cursor || null,
-            has_more: !!upstreamPayload.cursor,
+            target: pageId ? { page_id: pageId } : { url: targetPageUrl },
+            cursor: payload.cursor || null,
+            has_more: !!payload.cursor,
             total_returned: trimmedPosts.length,
             posts: trimmedPosts
         };
 
-        // 9. Billing Deduction & Local Caching
         req.user.credits -= costToUser;
 
-        // 10. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/facebook/profile/posts', costToUser, { url, handle, pageId, cursor }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -6348,8 +6246,10 @@ app.get('/v1/facebook/profile/posts', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch posts." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch posts." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -6361,6 +6261,9 @@ app.get('/v1/facebook/profile/posts', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/facebook/profile/posts', 0, { url, handle, pageId, cursor }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -6368,10 +6271,11 @@ app.get('/v1/facebook/profile/posts', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: FACEBOOK PROFILE EVENTS ---
 app.get('/v1/facebook/profile/events', authMiddleware, async (req, res) => {
     const { url, handle, cursor } = req.query;
 
-    // 1. Parameter Normalization
     const input = handle || url;
     if (!input || typeof input !== 'string' || input.trim() === '') {
         return res.status(400).json({ 
@@ -6392,7 +6296,6 @@ app.get('/v1/facebook/profile/events', authMiddleware, async (req, res) => {
         targetPageUrl = `https://www.facebook.com/${cleanInput.replace(/\/$/, '')}`;
     }
 
-    // Clean trailing slashes for consistent caching
     try {
         const parsedUrl = new URL(targetPageUrl);
         targetPageUrl = `${parsedUrl.origin}${parsedUrl.pathname.replace(/\/$/, '')}`;
@@ -6403,7 +6306,6 @@ app.get('/v1/facebook/profile/events', authMiddleware, async (req, res) => {
         });
     }
 
-    // 2. Pre-flight Credit Check (Charges 2 Credits to double upstream cost)
     const costToUser = 2;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
@@ -6412,16 +6314,10 @@ app.get('/v1/facebook/profile/events', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-    const safeCursor = cursor ? Buffer.from(cursor).toString('base64').substring(0, 15) : '0';
-
     try {
-
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
         }
 
         const upstreamUrl = new URL('https://api.scrapecreators.com/v1/facebook/profile/events');
@@ -6429,29 +6325,25 @@ app.get('/v1/facebook/profile/events', authMiddleware, async (req, res) => {
         
         if (cursor) upstreamUrl.searchParams.append('cursor', cursor);
 
-        // 6. Execute Request (25s timeout)
         const response = await fetch(upstreamUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(25000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 7. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
+        if (!response.ok || !payload.success) {
             throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch Facebook page events'}`
+                `Server Error: ${payload.error || response.statusText || 'Failed to fetch Facebook page events'}`
             );
         }
 
-        // 8. Trim & Sanitize Payload
-        // Removes GraphQL metadata (`__typename`, `__isEntity`) for a clean developer experience
-        const trimmedEvents = Array.isArray(upstreamPayload.events) 
-            ? upstreamPayload.events.map(event => ({
+        const trimmedEvents = Array.isArray(payload.events) 
+            ? payload.events.map(event => ({
                 id: event.id || "",
                 name: event.name || "",
                 url: event.url || "",
@@ -6485,17 +6377,18 @@ app.get('/v1/facebook/profile/events', authMiddleware, async (req, res) => {
 
         const responseData = {
             url: targetPageUrl,
-            cursor: upstreamPayload.cursor || null,
-            has_next_page: !!upstreamPayload.has_next_page,
-            total_count: upstreamPayload.total_count || 0,
+            cursor: payload.cursor || null,
+            has_next_page: !!payload.has_next_page,
+            total_count: payload.total_count || 0,
             events_returned: trimmedEvents.length,
             events: trimmedEvents
         };
 
-        // 9. Billing Deduction & Local Caching
         req.user.credits -= costToUser;
 
-        // 10. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/facebook/profile/events', costToUser, { url: targetPageUrl, cursor }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -6506,8 +6399,10 @@ app.get('/v1/facebook/profile/events', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch events." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch events." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -6519,6 +6414,9 @@ app.get('/v1/facebook/profile/events', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/facebook/profile/events', 0, { url: targetPageUrl, cursor }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -6526,10 +6424,11 @@ app.get('/v1/facebook/profile/events', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: FACEBOOK POST TRANSCRIPT ---
 app.get('/v1/facebook/post/transcript', authMiddleware, async (req, res) => {
     const { url, cache_max_age } = req.query;
 
-    // 1. Parameter Validation
     if (!url || typeof url !== 'string' || url.trim() === '') {
         return res.status(400).json({ 
             success: false, 
@@ -6539,7 +6438,6 @@ app.get('/v1/facebook/post/transcript', authMiddleware, async (req, res) => {
 
     const targetUrl = url.trim();
 
-    // 2. Pre-flight Credit Check (Base cost is 2 credits for live scrapes)
     const baseCostToUser = 2;
     if (req.user.credits < baseCostToUser) {
         return res.status(403).json({ 
@@ -6549,53 +6447,47 @@ app.get('/v1/facebook/post/transcript', authMiddleware, async (req, res) => {
     }
 
     try {
-        // 3. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
         }
 
         const upstreamUrl = new URL('https://api.scrapecreators.com/v1/facebook/post/transcript');
         upstreamUrl.searchParams.append('url', targetUrl);
         
-        // Pass to upstream to save costs there; local middleware intercepts first if cached locally
         if (cache_max_age) upstreamUrl.searchParams.append('cache_max_age', cache_max_age);
 
-        // 4. Execute Request (25s timeout for video transcription rendering)
         const response = await fetch(upstreamUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(25000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 5. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
-            // Note: ScrapeCreators returns a specific error if the video is > 2 minutes
+        if (!response.ok || !payload.success) {
             throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch transcript. Video may be over 2 minutes long.'}`
+                `Server Error: ${payload.error || response.statusText || 'Failed to fetch transcript. Video may be over 2 minutes long.'}`
             );
         }
 
-        // 6. Sanitize Payload
         const responseData = {
             url: targetUrl,
-            transcript: upstreamPayload.transcript || null,
-            cached: upstreamPayload.cached || false,
-            cached_at: upstreamPayload.cached_at || null
+            transcript: payload.transcript || null,
+            cached: payload.cached || false,
+            cached_at: payload.cached_at || null
         };
 
-        // 7. Dynamic Billing Deduction
-        const actualCost = upstreamPayload.credits_charged === 0 ? 0 : baseCostToUser;
+        const actualCost = payload.credits_charged === 0 ? 0 : baseCostToUser;
         
         req.user.credits -= actualCost;
 
-        // 8. Return Response
-        // The universalCacheMiddleware automatically captures this response and saves it
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/facebook/post/transcript', actualCost, { url: targetUrl, cache_max_age }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -6606,8 +6498,10 @@ app.get('/v1/facebook/post/transcript', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to generate the transcript." 
+            ? "504 Gateway Timeout: The extraction server took too long to generate the transcript." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -6619,6 +6513,9 @@ app.get('/v1/facebook/post/transcript', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/facebook/post/transcript', 0, { url: targetUrl, cache_max_age }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -6626,6 +6523,8 @@ app.get('/v1/facebook/post/transcript', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: FACEBOOK PROFILE ---
 app.get('/v1/facebook/profile', authMiddleware, async (req, res) => {
     const { handle, url } = req.query;
 
@@ -6648,13 +6547,13 @@ app.get('/v1/facebook/profile', authMiddleware, async (req, res) => {
     const cleanInput = input.trim().replace(/^@/, '');
 
     try {
-
-
         // Execute Native Scraper
         const scraperResult = await scrapeFacebookProfileNative(cleanInput);
 
-        // Deduct 1 credit & Cache
         req.user.credits -= costPerRequest;
+
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/facebook/profile', costPerRequest, { input: cleanInput }, 200);
 
         return res.status(200).json({
             success: true,
@@ -6666,26 +6565,34 @@ app.get('/v1/facebook/profile', authMiddleware, async (req, res) => {
     } catch (error) {
         const statusCode = error.message.includes('Timeout') ? 504 : 500;
 
+        // White-labeled (Assuming scrapeFacebookProfileNative throws standard Node errors, not upstream ones)
+        const finalErrorMsg = statusCode === 504 
+            ? "504 Gateway Timeout: The extraction server took too long to respond." 
+            : error.message;
+
         if (typeof notifyFailure === 'function') {
             notifyFailure({ 
                 endpoint: '/v1/facebook/profile', 
-                params: { input }, 
+                params: { input: cleanInput }, 
                 statusCode: statusCode, 
-                errorMsg: error.message 
+                errorMsg: finalErrorMsg 
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/facebook/profile', 0, { input: cleanInput }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
-            error: error.message 
+            error: finalErrorMsg 
         });
     }
 });
 
+// --- EXPRESS ROUTE: TWITTER TWEET TRANSCRIPT ---
 app.get('/v1/twitter/tweet/transcript', authMiddleware, async (req, res) => {
     const { url, cache_max_age } = req.query;
 
-    // 1. Parameter Validation
     if (!url || typeof url !== 'string' || url.trim() === '') {
         return res.status(400).json({ 
             success: false, 
@@ -6693,9 +6600,8 @@ app.get('/v1/twitter/tweet/transcript', authMiddleware, async (req, res) => {
         });
     }
 
-    const cleanUrl = url.trim().split('?')[0]; // Strip tracking parameters
+    const cleanUrl = url.trim().split('?')[0];
 
-    // 2. Pre-flight Credit Check (Charge 2 credits to maintain 50% margin)
     const baseCostToUser = 2;
     if (req.user.credits < baseCostToUser) {
         return res.status(403).json({ 
@@ -6705,53 +6611,47 @@ app.get('/v1/twitter/tweet/transcript', authMiddleware, async (req, res) => {
     }
 
     try {
-        // 3. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
         }
 
-        const upstreamUrl = new URL('https://api.scrapecreators.com/v1/twitter/tweet/transcript');
-        upstreamUrl.searchParams.append('url', cleanUrl);
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/twitter/tweet/transcript');
+        targetUrl.searchParams.append('url', cleanUrl);
         
-        // Pass cache instruction upstream; our local middleware intercepts first if cached locally
-        if (cache_max_age) upstreamUrl.searchParams.append('cache_max_age', cache_max_age);
+        if (cache_max_age) targetUrl.searchParams.append('cache_max_age', cache_max_age);
 
-        // 4. Execute Request (60s timeout - extended because AI transcription is slow)
-        const response = await fetch(upstreamUrl.toString(), {
+        const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(60000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 5. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
+        if (!response.ok || !payload.success) {
             throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to generate tweet transcript'}`
+                `Server Error: ${payload.error || response.statusText || 'Failed to generate tweet transcript'}`
             );
         }
 
-        // 6. Payload Construction
         const responseData = {
             url: cleanUrl,
-            transcript: upstreamPayload.transcript || null,
-            cached: upstreamPayload.cached || false,
-            cached_at: upstreamPayload.cached_at || null
+            transcript: payload.transcript || null,
+            cached: payload.cached || false,
+            cached_at: payload.cached_at || null
         };
 
-        // 7. Dynamic Billing Deduction
-        // If upstream served from cache, they charged 0. We pass that savings to the user (and charge 0). 
-        // Otherwise, we charge our base cost of 2 credits.
-        const actualCost = upstreamPayload.credits_charged === 0 ? 0 : baseCostToUser;
+        const actualCost = payload.credits_charged === 0 ? 0 : baseCostToUser;
         
         req.user.credits -= actualCost;
 
-        // 8. Return Response (Intercepted and cached automatically by universalCacheMiddleware)
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/twitter/tweet/transcript', actualCost, { url: cleanUrl, cache_max_age }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -6762,8 +6662,10 @@ app.get('/v1/twitter/tweet/transcript', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream AI took too long to generate the transcript." 
+            ? "504 Gateway Timeout: The extraction server took too long to generate the transcript." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -6775,6 +6677,9 @@ app.get('/v1/twitter/tweet/transcript', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/twitter/tweet/transcript', 0, { url: cleanUrl, cache_max_age }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -6782,10 +6687,11 @@ app.get('/v1/twitter/tweet/transcript', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: TWITTER COMMUNITY ---
 app.get('/v1/twitter/community', authMiddleware, async (req, res) => {
     const { url } = req.query;
 
-    // 1. Parameter Validation
     if (!url || typeof url !== 'string' || url.trim() === '') {
         return res.status(400).json({ 
             success: false, 
@@ -6793,9 +6699,8 @@ app.get('/v1/twitter/community', authMiddleware, async (req, res) => {
         });
     }
 
-    const cleanUrl = url.trim().split('?')[0]; // Strip tracking parameters
+    const cleanUrl = url.trim().split('?')[0];
 
-    // 2. Pre-flight Credit Check (Charging exactly 1 credit as requested)
     const costToUser = 1;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
@@ -6804,51 +6709,43 @@ app.get('/v1/twitter/community', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-
     try {
-
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
         }
 
-        const upstreamUrl = new URL('https://api.scrapecreators.com/v1/twitter/community');
-        upstreamUrl.searchParams.append('url', cleanUrl);
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/twitter/community');
+        targetUrl.searchParams.append('url', cleanUrl);
 
-        // 6. Execute Request (20s timeout)
-        const response = await fetch(upstreamUrl.toString(), {
+        const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(20000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 7. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
+        if (!response.ok || !payload.success) {
             throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch Twitter community details'}`
+                `Server Error: ${payload.error || response.statusText || 'Failed to fetch Twitter community details'}`
             );
         }
 
-        // 8. Payload Construction
-        // We separate the billing metadata from upstream and pass through the raw GraphQL JSON.
-        const { success, credits_remaining, credits_charged, ...communityData } = upstreamPayload;
+        const { success, credits_remaining, credits_charged, ...communityData } = payload;
         
         const responseData = {
             ...communityData
         };
 
-        // 9. Billing Deduction & Local Caching
         req.user.credits -= costToUser;
 
-        // 10. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/twitter/community', costToUser, { url: cleanUrl }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -6859,8 +6756,10 @@ app.get('/v1/twitter/community', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch the community." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch the community." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -6872,12 +6771,18 @@ app.get('/v1/twitter/community', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/twitter/community', 0, { url: cleanUrl }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
         });
     }
 });
+
+
+// --- EXPRESS ROUTE: TWITTER COMMUNITY TWEETS ---
 app.get('/v1/twitter/community/tweets', authMiddleware, async (req, res) => {
     const { url } = req.query;
 
@@ -6899,31 +6804,31 @@ app.get('/v1/twitter/community/tweets', authMiddleware, async (req, res) => {
     }
 
     try {
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
         }
 
-        const upstreamUrl = new URL('https://api.scrapecreators.com/v1/twitter/community/tweets');
-        upstreamUrl.searchParams.append('url', cleanUrl);
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/twitter/community/tweets');
+        targetUrl.searchParams.append('url', cleanUrl);
 
-        const response = await fetch(upstreamUrl.toString(), {
+        const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(25000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        if (!response.ok || !upstreamPayload.success) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch Twitter community tweets'}`);
+        if (!response.ok || !payload.success) {
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to fetch Twitter community tweets'}`);
         }
 
-        const trimmedTweets = Array.isArray(upstreamPayload.tweets) 
-            ? upstreamPayload.tweets.map(tweet => ({
+        const trimmedTweets = Array.isArray(payload.tweets) 
+            ? payload.tweets.map(tweet => ({
                 id: tweet.id_str || tweet.id || "",
                 text: tweet.full_text || "",
                 created_at: tweet.created_at || null,
@@ -6955,6 +6860,9 @@ app.get('/v1/twitter/community/tweets', authMiddleware, async (req, res) => {
 
         req.user.credits -= costToUser;
 
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/twitter/community/tweets', costToUser, { url: cleanUrl }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -6965,8 +6873,10 @@ app.get('/v1/twitter/community/tweets', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch the community tweets." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch the community tweets." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -6978,17 +6888,20 @@ app.get('/v1/twitter/community/tweets', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/twitter/community/tweets', 0, { url: cleanUrl }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
         });
     }
-}); 
+});
 
+// --- EXPRESS ROUTE: TWITTER SINGLE TWEET ---
 app.get('/v1/twitter/tweet', authMiddleware, async (req, res) => {
     const { url, trim, cache_max_age } = req.query;
 
-    // 1. Parameter Validation
     if (!url || typeof url !== 'string' || url.trim() === '') {
         return res.status(400).json({ 
             success: false, 
@@ -6996,9 +6909,8 @@ app.get('/v1/twitter/tweet', authMiddleware, async (req, res) => {
         });
     }
 
-    const cleanUrl = url.trim().split('?')[0]; // Strip tracking parameters
+    const cleanUrl = url.trim().split('?')[0]; 
 
-    // 2. Pre-flight Credit Check (Charge 2 credits to maintain 50% margin)
     const baseCostToUser = 1;
     if (req.user.credits < baseCostToUser) {
         return res.status(403).json({ 
@@ -7007,55 +6919,36 @@ app.get('/v1/twitter/tweet', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-    const safeTrim = trim === 'true' ? 'true' : 'false';
-    const safeMaxAge = cache_max_age || '0';
-    const cacheKey = `tw_tweet_sc_${Buffer.from(cleanUrl).toString('base64')}_${safeTrim}_${safeMaxAge}`;
-
     try {
-        // 4. Local Cache Check (Free 100% margin on repeat queries)
-        if (mockRedisCache[cacheKey]) {
-            return res.status(200).json({
-                success: true,
-                credits_remaining: req.user.credits,
-                credits_charged: 0, 
-                ...mockRedisCache[cacheKey]
-            });
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
         }
 
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
-        }
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/twitter/tweet');
+        targetUrl.searchParams.append('url', cleanUrl);
+        
+        if (trim) targetUrl.searchParams.append('trim', trim);
+        if (cache_max_age) targetUrl.searchParams.append('cache_max_age', cache_max_age);
 
-        const upstreamUrl = new URL('https://api.scrapecreators.com/v1/twitter/tweet');
-        upstreamUrl.searchParams.append('url', cleanUrl);
-        if (trim) upstreamUrl.searchParams.append('trim', trim);
-        if (cache_max_age) upstreamUrl.searchParams.append('cache_max_age', cache_max_age);
-
-        // 6. Execute Request (20s timeout)
-        const response = await fetch(upstreamUrl.toString(), {
+        const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(20000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 7. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
+        if (!response.ok || !payload.success) {
             throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch tweet details'}`
+                `Server Error: ${payload.error || response.statusText || 'Failed to fetch tweet details'}`
             );
         }
 
-        // 8. Payload Construction
-        // We separate the billing/cache metadata and pass through the raw tweet JSON (or trimmed version)
-        const { success, credits_remaining, credits_charged, cached, cached_at, ...tweetData } = upstreamPayload;
+        const { success, credits_remaining, credits_charged, cached, cached_at, ...tweetData } = payload;
         
         const responseData = {
             cached: cached || false,
@@ -7063,15 +6956,14 @@ app.get('/v1/twitter/tweet', authMiddleware, async (req, res) => {
             ...tweetData
         };
 
-        // 9. Dynamic Billing Deduction
-        // If upstream served from cache, they charged 0. We pass that savings to the user (and charge 0). 
-        // Otherwise, we charge our base cost of 2 credits.
+        // Dynamic Billing: Pass 0-cost cache hits to the user
         const actualCost = credits_charged === 0 ? 0 : baseCostToUser;
         
         req.user.credits -= actualCost;
-        mockRedisCache[cacheKey] = responseData;
 
-        // 10. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/twitter/tweet', actualCost, { url: cleanUrl, trim, cache_max_age }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -7082,8 +6974,10 @@ app.get('/v1/twitter/tweet', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch the tweet." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch the tweet." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -7095,6 +6989,9 @@ app.get('/v1/twitter/tweet', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/twitter/tweet', 0, { url: cleanUrl, trim, cache_max_age }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -7102,6 +6999,8 @@ app.get('/v1/twitter/tweet', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: TWITTER PROFILE TWEETS ---
 app.get('/v1/twitter/profile/tweets', authMiddleware, async (req, res) => {
     const { handle, trim } = req.query;
 
@@ -7123,37 +7022,40 @@ app.get('/v1/twitter/profile/tweets', authMiddleware, async (req, res) => {
     }
 
     try {
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
         }
 
-        const upstreamUrl = new URL('https://api.scrapecreators.com/v1/twitter/user-tweets');
-        upstreamUrl.searchParams.append('handle', cleanHandle);
-        if (trim) upstreamUrl.searchParams.append('trim', trim);
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/twitter/user-tweets');
+        targetUrl.searchParams.append('handle', cleanHandle);
+        if (trim) targetUrl.searchParams.append('trim', trim);
 
-        const response = await fetch(upstreamUrl.toString(), {
+        const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(20000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        if (!response.ok || !upstreamPayload.success) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch Twitter user tweets'}`);
+        if (!response.ok || !payload.success) {
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to fetch Twitter user tweets'}`);
         }
 
         const responseData = {
             handle: cleanHandle,
-            total_returned: Array.isArray(upstreamPayload.tweets) ? upstreamPayload.tweets.length : 0,
-            tweets: upstreamPayload.tweets || []
+            total_returned: Array.isArray(payload.tweets) ? payload.tweets.length : 0,
+            tweets: payload.tweets || []
         };
 
         req.user.credits -= baseCostToUser;
+
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/twitter/profile/tweets', baseCostToUser, { handle: cleanHandle, trim }, 200);
 
         return res.status(200).json({
             success: true,
@@ -7165,18 +7067,23 @@ app.get('/v1/twitter/profile/tweets', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch the tweets." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch the tweets." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
             notifyFailure({ 
-                endpoint: '/v1/twitter/user-tweets', 
+                endpoint: '/v1/twitter/profile/tweets', 
                 params: { handle: cleanHandle, trim }, 
                 statusCode: statusCode, 
                 errorMsg: finalErrorMsg 
             });
         }
+
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/twitter/profile/tweets', 0, { handle: cleanHandle, trim }, statusCode);
 
         return res.status(statusCode).json({ 
             success: false, 
@@ -7185,6 +7092,8 @@ app.get('/v1/twitter/profile/tweets', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: TWITTER PROFILE ---
 app.get('/v1/twitter/profile', authMiddleware, async (req, res) => {
     const { handle, cache_max_age } = req.query;
 
@@ -7206,31 +7115,31 @@ app.get('/v1/twitter/profile', authMiddleware, async (req, res) => {
     }
 
     try {
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
         }
 
-        const upstreamUrl = new URL('https://api.scrapecreators.com/v1/twitter/profile');
-        upstreamUrl.searchParams.append('handle', cleanHandle);
-        if (cache_max_age) upstreamUrl.searchParams.append('cache_max_age', cache_max_age);
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/twitter/profile');
+        targetUrl.searchParams.append('handle', cleanHandle);
+        if (cache_max_age) targetUrl.searchParams.append('cache_max_age', cache_max_age);
 
-        const response = await fetch(upstreamUrl.toString(), {
+        const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(20000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        if (!response.ok || !upstreamPayload.success) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch Twitter profile'}`);
+        if (!response.ok || !payload.success) {
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to fetch Twitter profile'}`);
         }
 
-        const { success, credits_remaining, credits_charged, cached, cached_at, ...twitterData } = upstreamPayload;
+        const { success, credits_remaining, credits_charged, cached, cached_at, ...twitterData } = payload;
         
         const responseData = {
             cached: cached || false,
@@ -7242,6 +7151,9 @@ app.get('/v1/twitter/profile', authMiddleware, async (req, res) => {
         
         req.user.credits -= actualCost;
 
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/twitter/profile', actualCost, { handle: cleanHandle, cache_max_age }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -7252,8 +7164,10 @@ app.get('/v1/twitter/profile', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch the profile." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch the profile." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -7265,6 +7179,9 @@ app.get('/v1/twitter/profile', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/twitter/profile', 0, { handle: cleanHandle, cache_max_age }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -7272,10 +7189,10 @@ app.get('/v1/twitter/profile', authMiddleware, async (req, res) => {
     }
 });
 
+// --- EXPRESS ROUTE: TIKTOK PRODUCT DETAILS ---
 app.get('/v1/tiktok/product', authMiddleware, async (req, res) => {
     const { url, region } = req.query;
 
-    // 1. Parameter Validation
     if (!url || typeof url !== 'string' || url.trim() === '') {
         return res.status(400).json({ 
             success: false, 
@@ -7283,11 +7200,11 @@ app.get('/v1/tiktok/product', authMiddleware, async (req, res) => {
         });
     }
 
-    const cleanUrl = url.trim().split('?')[0]; // Strip tracking parameters
+    const cleanUrl = url.trim().split('?')[0]; 
     const safeRegion = region ? region.trim().toUpperCase() : 'US';
 
-    // 2. Pre-flight Credit Check (Charge 2 credits for 50% profit margin)
-    const costToUser = 1;
+    // Charge 2 credits for 50% profit margin
+    const costToUser = 2;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
             success: false, 
@@ -7295,67 +7212,57 @@ app.get('/v1/tiktok/product', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-
     try {
-        // 4. Local Cache Check (Free 100% margin on repeat requests)
-
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
         }
 
-        const upstreamUrl = new URL('https://api.scrapecreators.com/v1/tiktok/product');
-        upstreamUrl.searchParams.append('url', cleanUrl);
-        upstreamUrl.searchParams.append('region', safeRegion);
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/tiktok/product');
+        targetUrl.searchParams.append('url', cleanUrl);
+        targetUrl.searchParams.append('region', safeRegion);
 
-        // 6. Execute Upstream Request (25s timeout)
-        const response = await fetch(upstreamUrl.toString(), {
+        const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(25000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 7. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
+        if (!response.ok || !payload.success) {
             throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch TikTok product details'}`
+                `Server Error: ${payload.error || response.statusText || 'Failed to fetch TikTok product details'}`
             );
         }
 
-        // 8. Payload Construction & Safe Mapping
-        // We safely navigate the object without aggressive destructuring so it doesn't return null
         const responseData = {
             url: cleanUrl,
             region: safeRegion,
-            categories: Array.isArray(upstreamPayload.categories) 
-                ? upstreamPayload.categories.map(c => c.category_name) 
+            categories: Array.isArray(payload.categories) 
+                ? payload.categories.map(c => c.category_name) 
                 : [],
-            product: upstreamPayload.product_info ? {
-                id: upstreamPayload.product_info.product_id || "",
-                title: upstreamPayload.product_info.product_base?.title || "",
-                status: upstreamPayload.product_info.status || 1,
-                sold_count: upstreamPayload.product_info.product_base?.sold_count || 0,
+            product: payload.product_info ? {
+                id: payload.product_info.product_id || "",
+                title: payload.product_info.product_base?.title || "",
+                status: payload.product_info.status || 1,
+                sold_count: payload.product_info.product_base?.sold_count || 0,
                 price: {
-                    original: upstreamPayload.product_info.product_base?.price?.original_price || null,
-                    discounted: upstreamPayload.product_info.product_base?.price?.real_price || null,
-                    currency: upstreamPayload.product_info.product_base?.price?.currency || "USD",
-                    discount_text: upstreamPayload.product_info.product_base?.price?.discount || null
+                    original: payload.product_info.product_base?.price?.original_price || null,
+                    discounted: payload.product_info.product_base?.price?.real_price || null,
+                    currency: payload.product_info.product_base?.price?.currency || "USD",
+                    discount_text: payload.product_info.product_base?.price?.discount || null
                 },
-                images: upstreamPayload.product_info.product_base?.images?.map(img => img.url_list?.[0]).filter(Boolean) || [],
-                video_url: upstreamPayload.product_info.product_base?.desc_video?.video_infos?.[0]?.main_url || null,
+                images: payload.product_info.product_base?.images?.map(img => img.url_list?.[0]).filter(Boolean) || [],
+                video_url: payload.product_info.product_base?.desc_video?.video_infos?.[0]?.main_url || null,
                 rating: {
-                    score: upstreamPayload.product_info.product_detail_review?.product_rating || 0,
-                    review_count: upstreamPayload.product_info.product_detail_review?.review_count || 0
+                    score: payload.product_info.product_detail_review?.product_rating || 0,
+                    review_count: payload.product_info.product_detail_review?.review_count || 0
                 },
-                skus: Array.isArray(upstreamPayload.product_info.skus) ? upstreamPayload.product_info.skus.map(sku => ({
+                skus: Array.isArray(payload.product_info.skus) ? payload.product_info.skus.map(sku => ({
                     id: sku.sku_id,
                     stock: sku.stock || 0,
                     price: sku.price?.real_price?.price_str || null,
@@ -7365,15 +7272,15 @@ app.get('/v1/tiktok/product', authMiddleware, async (req, res) => {
                     })) : []
                 })) : []
             } : null,
-            shop: upstreamPayload.shop_info ? {
-                id: upstreamPayload.shop_info.seller_id || "",
-                name: upstreamPayload.shop_info.shop_name || "",
-                rating: upstreamPayload.shop_info.shop_rating || "",
-                sold_count: upstreamPayload.shop_info.sold_count || 0,
-                followers_count: upstreamPayload.shop_info.followers_count || "0",
-                url: upstreamPayload.shop_info.shop_link || ""
+            shop: payload.shop_info ? {
+                id: payload.shop_info.seller_id || "",
+                name: payload.shop_info.shop_name || "",
+                rating: payload.shop_info.shop_rating || "",
+                sold_count: payload.shop_info.sold_count || 0,
+                followers_count: payload.shop_info.followers_count || "0",
+                url: payload.shop_info.shop_link || ""
             } : null,
-            related_videos: Array.isArray(upstreamPayload.related_videos) ? upstreamPayload.related_videos.map(video => ({
+            related_videos: Array.isArray(payload.related_videos) ? payload.related_videos.map(video => ({
                 id: video.item_id,
                 title: video.title,
                 url: video.url,
@@ -7383,11 +7290,12 @@ app.get('/v1/tiktok/product', authMiddleware, async (req, res) => {
             })) : []
         };
 
-        // 9. Billing Deduction & Caching
-        const actualCost = upstreamPayload.credits_charged === 0 ? 0 : costToUser;
+        const actualCost = payload.credits_charged === 0 ? 0 : costToUser;
         req.user.credits -= actualCost;
 
-        // 10. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/tiktok/product', actualCost, { url: cleanUrl, region: safeRegion }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -7398,8 +7306,10 @@ app.get('/v1/tiktok/product', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch product details." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch product details." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -7411,6 +7321,9 @@ app.get('/v1/tiktok/product', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/tiktok/product', 0, { url: cleanUrl, region: safeRegion }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -7418,10 +7331,11 @@ app.get('/v1/tiktok/product', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: TIKTOK PRODUCT REVIEWS ---
 app.get('/v1/tiktok/shop/product/reviews', authMiddleware, async (req, res) => {
     const { url, product_id, region, page } = req.query;
 
-    // 1. Parameter Validation
     if (!url && !product_id) {
         return res.status(400).json({ 
             success: false, 
@@ -7429,12 +7343,11 @@ app.get('/v1/tiktok/shop/product/reviews', authMiddleware, async (req, res) => {
         });
     }
 
-    const cleanUrl = url ? url.trim().split('?')[0] : null; // Strip tracking parameters
+    const cleanUrl = url ? url.trim().split('?')[0] : null; 
     const safeProductId = product_id ? product_id.trim() : null;
     const safeRegion = region ? region.trim().toUpperCase() : 'US';
     const safePage = page ? parseInt(page, 10) : 1;
 
-    // 2. Pre-flight Credit Check (Charge exactly 1 credit)
     const costToUser = 1;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
@@ -7443,52 +7356,43 @@ app.get('/v1/tiktok/shop/product/reviews', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-    const identifier = safeProductId ? `id_${safeProductId}` : `url_${Buffer.from(cleanUrl).toString('base64')}`;
-
     try {
-
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
         }
 
-        const upstreamUrl = new URL('https://api.scrapecreators.com/v1/tiktok/shop/product/reviews');
-        if (cleanUrl) upstreamUrl.searchParams.append('url', cleanUrl);
-        if (safeProductId) upstreamUrl.searchParams.append('product_id', safeProductId);
-        upstreamUrl.searchParams.append('region', safeRegion);
-        upstreamUrl.searchParams.append('page', safePage);
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/tiktok/shop/product/reviews');
+        if (cleanUrl) targetUrl.searchParams.append('url', cleanUrl);
+        if (safeProductId) targetUrl.searchParams.append('product_id', safeProductId);
+        targetUrl.searchParams.append('region', safeRegion);
+        targetUrl.searchParams.append('page', safePage);
 
-        // 6. Execute Upstream Request (20s timeout)
-        const response = await fetch(upstreamUrl.toString(), {
+        const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(20000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 7. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
+        if (!response.ok || !payload.success) {
             throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch TikTok product reviews'}`
+                `Server Error: ${payload.error || response.statusText || 'Failed to fetch TikTok product reviews'}`
             );
         }
 
-        // 8. Payload Construction & Strict Mapping (Trim to relevant info only)
         const responseData = {
-            has_more: !!upstreamPayload.has_more,
-            total_reviews: parseInt(upstreamPayload.total_reviews || "0", 10),
-            summary: upstreamPayload.review_ratings ? {
-                average_score: upstreamPayload.review_ratings.overall_score || 0,
-                rating_distribution: upstreamPayload.review_ratings.rating_result || {}
+            has_more: !!payload.has_more,
+            total_reviews: parseInt(payload.total_reviews || "0", 10),
+            summary: payload.review_ratings ? {
+                average_score: payload.review_ratings.overall_score || 0,
+                rating_distribution: payload.review_ratings.rating_result || {}
             } : null,
-            reviews: Array.isArray(upstreamPayload.product_reviews) ? upstreamPayload.product_reviews.map(r => ({
+            reviews: Array.isArray(payload.product_reviews) ? payload.product_reviews.map(r => ({
                 id: r.review_id || "",
                 rating: r.review_rating || 0,
                 timestamp: r.review_time ? parseInt(r.review_time, 10) : null,
@@ -7500,11 +7404,12 @@ app.get('/v1/tiktok/shop/product/reviews', authMiddleware, async (req, res) => {
             })) : []
         };
 
-        // 9. Billing Deduction & Caching
-        const actualCost = upstreamPayload.credits_charged === 0 ? 0 : costToUser;
+        const actualCost = payload.credits_charged === 0 ? 0 : costToUser;
         req.user.credits -= actualCost;
 
-        // 10. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/tiktok/shop/product/reviews', actualCost, { url: cleanUrl, product_id: safeProductId, region: safeRegion, page: safePage }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -7515,8 +7420,10 @@ app.get('/v1/tiktok/shop/product/reviews', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch product reviews." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch product reviews." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -7528,6 +7435,9 @@ app.get('/v1/tiktok/shop/product/reviews', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/tiktok/shop/product/reviews', 0, { url: cleanUrl, product_id: safeProductId, region: safeRegion, page: safePage }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -7535,10 +7445,11 @@ app.get('/v1/tiktok/shop/product/reviews', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: TIKTOK SHOP PRODUCTS ---
 app.get('/v1/tiktok/shop/products', authMiddleware, async (req, res) => {
     const { url, cursor, sort_by, region } = req.query;
 
-    // 1. Parameter Validation
     if (!url || typeof url !== 'string' || url.trim() === '') {
         return res.status(400).json({ 
             success: false, 
@@ -7546,11 +7457,10 @@ app.get('/v1/tiktok/shop/products', authMiddleware, async (req, res) => {
         });
     }
 
-    const cleanUrl = url.trim().split('?')[0]; // Strip tracking query params
+    const cleanUrl = url.trim().split('?')[0]; 
     const safeSortBy = sort_by && ['top', 'new_releases'].includes(sort_by.toLowerCase()) ? sort_by.toLowerCase() : 'top';
     const safeRegion = region ? region.trim().toUpperCase() : 'US';
 
-    // 2. Pre-flight Credit Check (Charge 2 credits to maintain 50% profit margin)
     const baseCostToUser = 2;
     if (req.user.credits < baseCostToUser) {
         return res.status(403).json({ 
@@ -7559,62 +7469,53 @@ app.get('/v1/tiktok/shop/products', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-    const safeCursor = cursor ? Buffer.from(cursor).toString('base64').substring(0, 15) : '0';
-
     try {
-
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
         }
 
-        const upstreamUrl = new URL('https://api.scrapecreators.com/v1/tiktok/shop/products');
-        upstreamUrl.searchParams.append('url', cleanUrl);
-        upstreamUrl.searchParams.append('sort_by', safeSortBy);
-        upstreamUrl.searchParams.append('region', safeRegion);
-        if (cursor) upstreamUrl.searchParams.append('cursor', cursor);
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/tiktok/shop/products');
+        targetUrl.searchParams.append('url', cleanUrl);
+        targetUrl.searchParams.append('sort_by', safeSortBy);
+        targetUrl.searchParams.append('region', safeRegion);
+        if (cursor) targetUrl.searchParams.append('cursor', cursor);
 
-        // 6. Execute Request (30s timeout for heavy catalog fetching)
-        const response = await fetch(upstreamUrl.toString(), {
+        const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(30000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 7. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
+        if (!response.ok || !payload.success) {
             throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch TikTok shop products'}`
+                `Server Error: ${payload.error || response.statusText || 'Failed to fetch TikTok shop products'}`
             );
         }
 
-        // 8. Payload Sanitization & Formatting
         const responseData = {
             url: cleanUrl,
             sort_by: safeSortBy,
             region: safeRegion,
-            shopInfo: upstreamPayload.shopInfo ? {
-                seller_id: upstreamPayload.shopInfo.seller_id || "",
-                shop_name: upstreamPayload.shopInfo.shop_name || "",
-                shop_logo: upstreamPayload.shopInfo.shop_logo || null,
-                shop_rating: upstreamPayload.shopInfo.shop_rating || null,
-                sold_count: upstreamPayload.shopInfo.sold_count || 0,
-                format_sold_count: upstreamPayload.shopInfo.format_sold_count || "0",
-                on_sell_product_count: upstreamPayload.shopInfo.on_sell_product_count || 0,
-                followers_count: upstreamPayload.shopInfo.followers_count || "0",
-                review_count: upstreamPayload.shopInfo.review_count || 0,
-                shop_slogan: upstreamPayload.shopInfo.shop_slogan || "",
-                shop_link: upstreamPayload.shopInfo.shop_link || cleanUrl
+            shopInfo: payload.shopInfo ? {
+                seller_id: payload.shopInfo.seller_id || "",
+                shop_name: payload.shopInfo.shop_name || "",
+                shop_logo: payload.shopInfo.shop_logo || null,
+                shop_rating: payload.shopInfo.shop_rating || null,
+                sold_count: payload.shopInfo.sold_count || 0,
+                format_sold_count: payload.shopInfo.format_sold_count || "0",
+                on_sell_product_count: payload.shopInfo.on_sell_product_count || 0,
+                followers_count: payload.shopInfo.followers_count || "0",
+                review_count: payload.shopInfo.review_count || 0,
+                shop_slogan: payload.shopInfo.shop_slogan || "",
+                shop_link: payload.shopInfo.shop_link || cleanUrl
             } : null,
-            products: Array.isArray(upstreamPayload.products) ? upstreamPayload.products.map(product => ({
+            products: Array.isArray(payload.products) ? payload.products.map(product => ({
                 product_id: product.product_id || "",
                 title: product.title || "",
                 image: product.image || null,
@@ -7637,17 +7538,17 @@ app.get('/v1/tiktok/shop/products', authMiddleware, async (req, res) => {
                 } : null,
                 seo_url: product.seo_url?.canonical_url || null
             })) : [],
-            has_more: !!upstreamPayload.has_more,
-            cursor: upstreamPayload.cursor || null
+            has_more: !!payload.has_more,
+            cursor: payload.cursor || null
         };
 
-        // 9. Dynamic Billing Deduction
-        // If upstream utilized internal cache (charged 0 credits), pass 0-cost savings to user
-        const actualCost = upstreamPayload.credits_charged === 0 ? 0 : baseCostToUser;
+        const actualCost = payload.credits_charged === 0 ? 0 : baseCostToUser;
         
         req.user.credits -= actualCost;
 
-        // 10. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/tiktok/shop/products', actualCost, { url: cleanUrl, cursor, sort_by: safeSortBy, region: safeRegion }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -7658,8 +7559,10 @@ app.get('/v1/tiktok/shop/products', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch the shop products." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch the shop products." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -7671,6 +7574,9 @@ app.get('/v1/tiktok/shop/products', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/tiktok/shop/products', 0, { url: cleanUrl, cursor, sort_by: safeSortBy, region: safeRegion }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -7678,10 +7584,11 @@ app.get('/v1/tiktok/shop/products', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: TIKTOK SHOP SEARCH ---
 app.get('/v1/tiktok/shop/search', authMiddleware, async (req, res) => {
     const { query, page, region } = req.query;
 
-    // 1. Parameter Validation
     if (!query || typeof query !== 'string' || query.trim() === '') {
         return res.status(400).json({ 
             success: false, 
@@ -7693,8 +7600,8 @@ app.get('/v1/tiktok/shop/search', authMiddleware, async (req, res) => {
     const safeRegion = region ? region.trim().toUpperCase() : 'US';
     const safePage = page ? parseInt(page, 10) : 1;
 
-    // 2. Pre-flight Credit Check (Charge 2 credits to maintain 50% margin)
-    const baseCostToUser = 1;
+    // Charge 2 credits to maintain 50% margin
+    const baseCostToUser = 2;
     if (req.user.credits < baseCostToUser) {
         return res.status(403).json({ 
             success: false, 
@@ -7702,55 +7609,47 @@ app.get('/v1/tiktok/shop/search', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-
     try {
-
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
         }
 
-        const upstreamUrl = new URL('https://api.scrapecreators.com/v1/tiktok/shop/search');
-        upstreamUrl.searchParams.append('query', cleanQuery);
-        if (page) upstreamUrl.searchParams.append('page', safePage);
-        if (region) upstreamUrl.searchParams.append('region', safeRegion);
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/tiktok/shop/search');
+        targetUrl.searchParams.append('query', cleanQuery);
+        if (page) targetUrl.searchParams.append('page', safePage);
+        if (region) targetUrl.searchParams.append('region', safeRegion);
 
-        // 6. Execute Request (25s timeout)
-        const response = await fetch(upstreamUrl.toString(), {
+        const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(25000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 7. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
+        if (!response.ok || !payload.success) {
             throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch TikTok shop products'}`
+                `Server Error: ${payload.error || response.statusText || 'Failed to fetch TikTok shop products'}`
             );
         }
 
-        // 8. Payload Construction
-        // We separate the billing metadata from upstream and pass through the products.
-        const { success, credits_remaining, credits_charged, ...shopData } = upstreamPayload;
+        const { success, credits_remaining, credits_charged, ...shopData } = payload;
         
         const responseData = {
             ...shopData
         };
 
-        // 9. Dynamic Billing Deduction
         const actualCost = credits_charged === 0 ? 0 : baseCostToUser;
         
         req.user.credits -= actualCost;
 
-        // 10. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/tiktok/shop/search', actualCost, { query: cleanQuery, region: safeRegion, page: safePage }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -7761,8 +7660,10 @@ app.get('/v1/tiktok/shop/search', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch the shop data." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch the shop data." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -7774,6 +7675,9 @@ app.get('/v1/tiktok/shop/search', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/tiktok/shop/search', 0, { query: cleanQuery, region: safeRegion, page: safePage }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -7781,10 +7685,10 @@ app.get('/v1/tiktok/shop/search', authMiddleware, async (req, res) => {
     }
 });
 
+// --- EXPRESS ROUTE: LINKEDIN ADS SEARCH ---
 app.get('/v1/linkedin/ads/search', authMiddleware, async (req, res) => {
     const { company, keyword, companyId, countries, startDate, endDate, paginationToken } = req.query;
 
-    // 1. Parameter Validation
     if (!company && !keyword && !companyId) {
         return res.status(400).json({ 
             success: false, 
@@ -7792,7 +7696,6 @@ app.get('/v1/linkedin/ads/search', authMiddleware, async (req, res) => {
         });
     }
 
-    // 2. Pre-flight Credit Check (Charge 2 credits as requested)
     const costToUser = 2;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
@@ -7801,56 +7704,43 @@ app.get('/v1/linkedin/ads/search', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-    const safePagination = paginationToken ? Buffer.from(paginationToken.trim()).toString('base64').substring(0, 15) : '0';
-    const cacheParams = [company, keyword, companyId, countries, startDate, endDate]
-        .filter(Boolean)
-        .map(param => Buffer.from(param.trim()).toString('base64').substring(0, 10))
-        .join('_');
-
     try {
-
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
         }
 
-        const upstreamUrl = new URL('https://api.scrapecreators.com/v1/linkedin/ads/search');
-        if (company) upstreamUrl.searchParams.append('company', company.trim());
-        if (keyword) upstreamUrl.searchParams.append('keyword', keyword.trim());
-        if (companyId) upstreamUrl.searchParams.append('companyId', companyId.trim());
-        if (countries) upstreamUrl.searchParams.append('countries', countries.trim().toUpperCase());
-        if (startDate) upstreamUrl.searchParams.append('startDate', startDate.trim());
-        if (endDate) upstreamUrl.searchParams.append('endDate', endDate.trim());
-        if (paginationToken) upstreamUrl.searchParams.append('paginationToken', paginationToken.trim());
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/linkedin/ads/search');
+        if (company) targetUrl.searchParams.append('company', company.trim());
+        if (keyword) targetUrl.searchParams.append('keyword', keyword.trim());
+        if (companyId) targetUrl.searchParams.append('companyId', companyId.trim());
+        if (countries) targetUrl.searchParams.append('countries', countries.trim().toUpperCase());
+        if (startDate) targetUrl.searchParams.append('startDate', startDate.trim());
+        if (endDate) targetUrl.searchParams.append('endDate', endDate.trim());
+        if (paginationToken) targetUrl.searchParams.append('paginationToken', paginationToken.trim());
 
-        // 6. Execute Upstream Request (25s timeout for search indexing)
-        const response = await fetch(upstreamUrl.toString(), {
+        const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(25000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 7. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
+        if (!response.ok || !payload.success) {
             throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to search LinkedIn Ads Library'}`
+                `Server Error: ${payload.error || response.statusText || 'Failed to search LinkedIn Ads Library'}`
             );
         }
 
-        // 8. Payload Construction & Strict Mapping (Trim to relevant info only)
         const responseData = {
-            total_ads: upstreamPayload.totalAds || 0,
-            has_more: !upstreamPayload.isLastPage,
-            pagination_token: upstreamPayload.paginationToken || null,
-            ads: Array.isArray(upstreamPayload.ads) ? upstreamPayload.ads.map(ad => ({
+            total_ads: payload.totalAds || 0,
+            has_more: !payload.isLastPage,
+            pagination_token: payload.paginationToken || null,
+            ads: Array.isArray(payload.ads) ? payload.ads.map(ad => ({
                 id: ad.id || "",
                 advertiser: {
                     name: ad.advertiser || ad.poster || "",
@@ -7865,7 +7755,7 @@ app.get('/v1/linkedin/ads/search', authMiddleware, async (req, res) => {
                     video_url: ad.video || null,
                     carousel_images: Array.isArray(ad.carouselImages) ? ad.carouselImages : [],
                     cta_text: ad.cta || null,
-                    destination_url: ad.destinationUrl ? ad.destinationUrl.split('?')[0] : null // Stripped tracking
+                    destination_url: ad.destinationUrl ? ad.destinationUrl.split('?')[0] : null
                 },
                 performance: {
                     total_impressions: ad.totalImpressions || null,
@@ -7884,11 +7774,12 @@ app.get('/v1/linkedin/ads/search', authMiddleware, async (req, res) => {
             })) : []
         };
 
-        // 9. Billing Deduction & Caching
-        const actualCost = upstreamPayload.credits_charged === 0 ? 0 : costToUser;
+        const actualCost = payload.credits_charged === 0 ? 0 : costToUser;
         req.user.credits -= actualCost;
 
-        // 10. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/linkedin/ads/search', actualCost, { company, keyword, companyId, countries, startDate, endDate, paginationToken }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -7899,8 +7790,10 @@ app.get('/v1/linkedin/ads/search', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch LinkedIn ads." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch LinkedIn ads." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -7912,6 +7805,9 @@ app.get('/v1/linkedin/ads/search', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/linkedin/ads/search', 0, { company, keyword, companyId, countries, startDate, endDate, paginationToken }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -7919,10 +7815,11 @@ app.get('/v1/linkedin/ads/search', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: FACEBOOK AD LIBRARY SINGLE AD ---
 app.get('/v1/facebook/adLibrary/ad', authMiddleware, async (req, res) => {
     const { id, url, trim, cache_max_age } = req.query;
 
-    // 1. Parameter Validation
     if (!id && !url) {
         return res.status(400).json({ 
             success: false, 
@@ -7934,7 +7831,6 @@ app.get('/v1/facebook/adLibrary/ad', authMiddleware, async (req, res) => {
     const cleanUrl = url ? url.trim().split('?')[0] : null; 
     const safeTrim = trim === 'true' ? 'true' : 'false';
 
-    // 2. Pre-flight Credit Check
     const baseCostToUser = 2;
     if (req.user.credits < baseCostToUser) {
         return res.status(403).json({ 
@@ -7944,41 +7840,36 @@ app.get('/v1/facebook/adLibrary/ad', authMiddleware, async (req, res) => {
     }
 
     try {
-        // 3. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
         }
 
-        const upstreamUrl = new URL('https://api.scrapecreators.com/v1/facebook/adLibrary/ad');
-        if (safeId) upstreamUrl.searchParams.append('id', safeId);
-        if (cleanUrl) upstreamUrl.searchParams.append('url', cleanUrl);
-        if (trim) upstreamUrl.searchParams.append('trim', safeTrim);
-        if (cache_max_age) upstreamUrl.searchParams.append('cache_max_age', cache_max_age);
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/facebook/adLibrary/ad');
+        if (safeId) targetUrl.searchParams.append('id', safeId);
+        if (cleanUrl) targetUrl.searchParams.append('url', cleanUrl);
+        if (trim) targetUrl.searchParams.append('trim', safeTrim);
+        if (cache_max_age) targetUrl.searchParams.append('cache_max_age', cache_max_age);
 
-        // 4. Execute Upstream Request (20s timeout)
-        const response = await fetch(upstreamUrl.toString(), {
+        const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(20000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 5. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
+        if (!response.ok || !payload.success) {
             throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch Facebook Ad details'}`
+                `Server Error: ${payload.error || response.statusText || 'Failed to fetch Facebook Ad details'}`
             );
         }
 
-        // 6. Payload Construction & Strict Mapping
-        const snap = upstreamPayload.snapshot || {};
+        const snap = payload.snapshot || {};
         
-        // Handle Multi-Version/Carousel Ads securely
         let adTitle = typeof snap.title === 'string' ? snap.title : "";
         let adImages = Array.isArray(snap.images) ? snap.images.map(img => img.resized_image_url || img.original_image_url).filter(Boolean) : [];
         let adLink = typeof snap.link_url === 'string' ? snap.link_url : "";
@@ -7993,7 +7884,6 @@ app.get('/v1/facebook/adLibrary/ad', authMiddleware, async (req, res) => {
             if (!adLink) adLink = typeof snap.cards[0]?.link_url === 'string' ? snap.cards[0].link_url : "";
         }
 
-        // Safely parse body text replacing HTML breaks if it's a string
         let safeBodyText = "";
         if (typeof snap.body === 'string') {
             safeBodyText = snap.body.replace(/<br\s*\/?>/gi, '\n');
@@ -8002,15 +7892,15 @@ app.get('/v1/facebook/adLibrary/ad', authMiddleware, async (req, res) => {
         }
 
         const responseData = {
-            ad_id: upstreamPayload.adArchiveID || safeId,
-            is_active: !!upstreamPayload.isActive,
+            ad_id: payload.adArchiveID || safeId,
+            is_active: !!payload.isActive,
             duration: {
-                start: upstreamPayload.startDateString || null,
-                end: upstreamPayload.endDateString || null
+                start: payload.startDateString || null,
+                end: payload.endDateString || null
             },
             advertiser: {
-                id: upstreamPayload.pageID || snap.page_id || "",
-                name: upstreamPayload.pageName || snap.page_name || "",
+                id: payload.pageID || snap.page_id || "",
+                name: payload.pageName || snap.page_name || "",
                 profile_url: snap.page_profile_uri || null,
                 profile_picture: snap.page_profile_picture_url || null,
                 instagram_handle: snap.instagram_actor_name || null
@@ -8028,20 +7918,21 @@ app.get('/v1/facebook/adLibrary/ad', authMiddleware, async (req, res) => {
                     preview_image: v.video_preview_image_url || null
                 })) : []
             },
-            platforms: Array.isArray(upstreamPayload.publisherPlatform) ? upstreamPayload.publisherPlatform : [],
-            audience_reach: upstreamPayload.aaa_info ? {
-                total_reach: upstreamPayload.aaa_info.eu_total_reach || null,
-                age_targeting: upstreamPayload.aaa_info.age_audience || null,
-                gender_targeting: upstreamPayload.aaa_info.gender_audience || null,
-                locations: upstreamPayload.aaa_info.location_audience || []
+            platforms: Array.isArray(payload.publisherPlatform) ? payload.publisherPlatform : [],
+            audience_reach: payload.aaa_info ? {
+                total_reach: payload.aaa_info.eu_total_reach || null,
+                age_targeting: payload.aaa_info.age_audience || null,
+                gender_targeting: payload.aaa_info.gender_audience || null,
+                locations: payload.aaa_info.location_audience || []
             } : null
         };
 
-        // 7. Dynamic Billing Deduction
-        const actualCost = upstreamPayload.credits_charged === 0 ? 0 : baseCostToUser;
+        const actualCost = payload.credits_charged === 0 ? 0 : baseCostToUser;
         req.user.credits -= actualCost;
 
-        // 8. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/facebook/adLibrary/ad', actualCost, { id: safeId, url: cleanUrl, trim: safeTrim, cache_max_age }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -8052,8 +7943,10 @@ app.get('/v1/facebook/adLibrary/ad', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch Ad Library details." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch ad details." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -8065,6 +7958,9 @@ app.get('/v1/facebook/adLibrary/ad', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/facebook/adLibrary/ad', 0, { id: safeId, url: cleanUrl, trim: safeTrim, cache_max_age }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -8072,10 +7968,11 @@ app.get('/v1/facebook/adLibrary/ad', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: FACEBOOK AD LIBRARY TRANSCRIPT ---
 app.get('/v1/facebook/adLibrary/ad/transcript', authMiddleware, async (req, res) => {
     const { id, url, cache_max_age } = req.query;
 
-    // 1. Parameter Validation
     if (!id && !url) {
         return res.status(400).json({ 
             success: false, 
@@ -8086,7 +7983,6 @@ app.get('/v1/facebook/adLibrary/ad/transcript', authMiddleware, async (req, res)
     const safeId = id ? id.trim() : null;
     const cleanUrl = url ? url.trim().split('?')[0] : null;
 
-    // 2. Pre-flight Credit Check
     const expectedMaxCost = 5;
     if (req.user.credits < expectedMaxCost) {
         return res.status(403).json({ 
@@ -8096,50 +7992,46 @@ app.get('/v1/facebook/adLibrary/ad/transcript', authMiddleware, async (req, res)
     }
 
     try {
-        // 3. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
         }
 
-        const upstreamUrl = new URL('https://api.scrapecreators.com/v1/facebook/adLibrary/ad/transcript');
-        if (safeId) upstreamUrl.searchParams.append('id', safeId);
-        if (cleanUrl) upstreamUrl.searchParams.append('url', cleanUrl);
-        if (cache_max_age) upstreamUrl.searchParams.append('cache_max_age', cache_max_age);
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/facebook/adLibrary/ad/transcript');
+        if (safeId) targetUrl.searchParams.append('id', safeId);
+        if (cleanUrl) targetUrl.searchParams.append('url', cleanUrl);
+        if (cache_max_age) targetUrl.searchParams.append('cache_max_age', cache_max_age);
 
-        // 4. Execute Upstream Request (30s timeout for video parsing/transcription)
-        const response = await fetch(upstreamUrl.toString(), {
+        const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(30000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 5. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
+        if (!response.ok || !payload.success) {
             throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch Facebook Ad transcript'}`
+                `Server Error: ${payload.error || response.statusText || 'Failed to fetch Facebook Ad transcript'}`
             );
         }
 
-        // 6. Payload Construction & Strict Mapping
         const responseData = {
-            ad_id: upstreamPayload.ad_id || safeId || "",
-            url: upstreamPayload.url || cleanUrl || "",
-            transcript_available: !!upstreamPayload.transcript_available,
-            transcript: upstreamPayload.transcript || null
+            ad_id: payload.ad_id || safeId || "",
+            url: payload.url || cleanUrl || "",
+            transcript_available: !!payload.transcript_available,
+            transcript: payload.transcript || null
         };
 
-        // 7. Dynamic Billing Deduction
-        const actualCost = (upstreamPayload.credits_charged || 0) * 5;
-        
+        const actualCost = (payload.credits_charged || 0) * 5;
         req.user.credits -= actualCost;
 
-        // 8. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/facebook/adLibrary/ad/transcript', actualCost, { id: safeId, url: cleanUrl, cache_max_age }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -8150,8 +8042,10 @@ app.get('/v1/facebook/adLibrary/ad/transcript', authMiddleware, async (req, res)
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch the transcript." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch the transcript." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -8163,6 +8057,9 @@ app.get('/v1/facebook/adLibrary/ad/transcript', authMiddleware, async (req, res)
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/facebook/adLibrary/ad/transcript', 0, { id: safeId, url: cleanUrl, cache_max_age }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -8170,8 +8067,9 @@ app.get('/v1/facebook/adLibrary/ad/transcript', authMiddleware, async (req, res)
     }
 });
 
+
+// --- EXPRESS ROUTE: FACEBOOK AD LIBRARY SEARCH ---
 app.all('/v1/facebook/adLibrary/search/ads', authMiddleware, async (req, res) => {
-    // Support both GET (query strings) and POST (JSON body) for heavy pagination cursors
     if (req.method !== 'GET' && req.method !== 'POST') {
         return res.status(405).json({ success: false, error: "405 Method Not Allowed. Use GET or POST." });
     }
@@ -8182,7 +8080,6 @@ app.all('/v1/facebook/adLibrary/search/ads', authMiddleware, async (req, res) =>
         status, media_type, start_date, end_date, cursor, trim 
     } = params;
 
-    // 1. Parameter Validation
     if (!query || typeof query !== 'string' || query.trim() === '') {
         return res.status(400).json({ 
             success: false, 
@@ -8191,9 +8088,7 @@ app.all('/v1/facebook/adLibrary/search/ads', authMiddleware, async (req, res) =>
     }
 
     const cleanQuery = query.trim();
-    const safeCursor = cursor ? cursor.trim() : null;
 
-    // 2. Pre-flight Credit Check (Charge exactly 2 credits)
     const costToUser = 2;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
@@ -8202,63 +8097,47 @@ app.all('/v1/facebook/adLibrary/search/ads', authMiddleware, async (req, res) =>
         });
     }
 
-    // 3. Cache Key Construction
-    const cacheCursor = safeCursor ? Buffer.from(safeCursor).toString('base64').substring(0, 15) : '0';
-    const cacheParams = [
-        cleanQuery, sort_by, search_type, ad_type, country, 
-        status, media_type, start_date, end_date
-    ].filter(Boolean).map(p => Buffer.from(p.trim()).toString('base64').substring(0, 8)).join('_');
-    
-
     try {
-
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
         }
 
-        const upstreamUrl = new URL('https://api.scrapecreators.com/v1/facebook/adLibrary/search/ads');
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/facebook/adLibrary/search/ads');
         
         const requestOptions = {
             method: req.method,
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
-            signal: AbortSignal.timeout(30000) // 30s timeout for heavy searches
+            signal: AbortSignal.timeout(30000) 
         };
 
-        // Format parameters based on request method
         if (req.method === 'GET') {
             Object.keys(params).forEach(key => {
-                if (params[key]) upstreamUrl.searchParams.append(key, params[key]);
+                if (params[key]) targetUrl.searchParams.append(key, params[key]);
             });
         } else {
             requestOptions.body = JSON.stringify(params);
         }
 
-        // 6. Execute Upstream Request
-        const response = await fetch(upstreamUrl.toString(), requestOptions);
-        const upstreamPayload = await response.json();
+        const response = await fetch(targetUrl.toString(), requestOptions);
+        const payload = await response.json();
 
-        // 7. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
+        if (!response.ok || !payload.success) {
             throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to search Facebook Ad Library'}`
+                `Server Error: ${payload.error || response.statusText || 'Failed to search Facebook Ad Library'}`
             );
         }
 
-        // 8. Payload Construction & Strict Mapping
         const responseData = {
-            total_results: upstreamPayload.searchResultsCount || 0,
-            has_more: !!upstreamPayload.cursor,
-            cursor: upstreamPayload.cursor || null,
-            ads: Array.isArray(upstreamPayload.searchResults) ? upstreamPayload.searchResults.map(ad => {
+            total_results: payload.searchResultsCount || 0,
+            has_more: !!payload.cursor,
+            cursor: payload.cursor || null,
+            ads: Array.isArray(payload.searchResults) ? payload.searchResults.map(ad => {
                 const snap = ad.snapshot || {};
 
-                // Safely parse body text across different Facebook object structures
                 let bodyText = "";
                 if (typeof snap.body === 'string') {
                     bodyText = snap.body.replace(/<br\s*\/?>/gi, '\n');
@@ -8268,12 +8147,10 @@ app.all('/v1/facebook/adLibrary/search/ads', authMiddleware, async (req, res) =>
                     bodyText = snap.body.markup.replace(/<br\s*\/?>/gi, '\n');
                 }
 
-                // Map standard images
                 const adImages = Array.isArray(snap.images) 
                     ? snap.images.map(img => img.resized_image_url || img.original_image_url).filter(Boolean) 
                     : [];
                 
-                // Map carousel cards if present
                 const carousel = Array.isArray(snap.cards) ? snap.cards.map(c => ({
                     title: typeof c.title === 'string' ? c.title : null,
                     image: c.resized_image_url || c.original_image_url || null,
@@ -8309,11 +8186,12 @@ app.all('/v1/facebook/adLibrary/search/ads', authMiddleware, async (req, res) =>
             }) : []
         };
 
-        // 9. Billing Deduction & Caching
-        const actualCost = upstreamPayload.credits_charged === 0 ? 0 : costToUser;
+        const actualCost = payload.credits_charged === 0 ? 0 : costToUser;
         req.user.credits -= actualCost;
 
-        // 10. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/facebook/adLibrary/search/ads', actualCost, params, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -8324,8 +8202,10 @@ app.all('/v1/facebook/adLibrary/search/ads', authMiddleware, async (req, res) =>
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch ad library data." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch ad library data." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -8336,6 +8216,9 @@ app.all('/v1/facebook/adLibrary/search/ads', authMiddleware, async (req, res) =>
                 errorMsg: finalErrorMsg 
             });
         }
+
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/facebook/adLibrary/search/ads', 0, params, statusCode);
 
         return res.status(statusCode).json({ 
             success: false, 
@@ -8518,10 +8401,10 @@ app.all('/v1/facebook/adLibrary/company/ads', authMiddleware, async (req, res) =
     }
 });
 
+// --- EXPRESS ROUTE: FACEBOOK MARKETPLACE LOCATION SEARCH ---
 app.get('/v1/facebook/marketplace/location/search', authMiddleware, async (req, res) => {
     const { query } = req.query;
 
-    // 1. Parameter Validation
     if (!query || typeof query !== 'string' || query.trim() === '') {
         return res.status(400).json({ 
             success: false, 
@@ -8531,7 +8414,6 @@ app.get('/v1/facebook/marketplace/location/search', authMiddleware, async (req, 
 
     const cleanQuery = query.trim();
 
-    // 2. Pre-flight Credit Check (Charge exactly 1 credit)
     const costToUser = 1;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
@@ -8540,44 +8422,35 @@ app.get('/v1/facebook/marketplace/location/search', authMiddleware, async (req, 
         });
     }
 
-    // 3. Cache Key Construction
-
     try {
-        // 4. Local Cache Check (Free 100% margin on repeat queries)
-
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
         }
 
-        const upstreamUrl = new URL('https://api.scrapecreators.com/v1/facebook/marketplace/location/search');
-        upstreamUrl.searchParams.append('query', cleanQuery);
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/facebook/marketplace/location/search');
+        targetUrl.searchParams.append('query', cleanQuery);
 
-        // 6. Execute Upstream Request (15s timeout is sufficient for location search)
-        const response = await fetch(upstreamUrl.toString(), {
+        const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(15000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 7. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
+        if (!response.ok || !payload.success) {
             throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to search Facebook Marketplace locations'}`
+                `Server Error: ${payload.error || response.statusText || 'Failed to search Facebook Marketplace locations'}`
             );
         }
 
-        // 8. Payload Construction & Strict Mapping
         const responseData = {
             query: cleanQuery,
-            locations: Array.isArray(upstreamPayload.locations) ? upstreamPayload.locations.map(loc => ({
+            locations: Array.isArray(payload.locations) ? payload.locations.map(loc => ({
                 name: loc.name || "",
                 subtitle: loc.subtitle || "",
                 page_id: loc.page_id || "",
@@ -8589,11 +8462,12 @@ app.get('/v1/facebook/marketplace/location/search', authMiddleware, async (req, 
             })) : []
         };
 
-        // 9. Billing Deduction & Caching
-        const actualCost = upstreamPayload.credits_charged === 0 ? 0 : costToUser;
+        const actualCost = payload.credits_charged === 0 ? 0 : costToUser;
         req.user.credits -= actualCost;
 
-        // 10. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/facebook/marketplace/location/search', actualCost, { query: cleanQuery }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -8604,8 +8478,10 @@ app.get('/v1/facebook/marketplace/location/search', authMiddleware, async (req, 
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch location data." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch location data." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -8617,6 +8493,9 @@ app.get('/v1/facebook/marketplace/location/search', authMiddleware, async (req, 
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/facebook/marketplace/location/search', 0, { query: cleanQuery }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -8624,13 +8503,14 @@ app.get('/v1/facebook/marketplace/location/search', authMiddleware, async (req, 
     }
 });
 
+
+// --- EXPRESS ROUTE: FACEBOOK MARKETPLACE SEARCH ---
 app.get('/v1/facebook/marketplace/search', authMiddleware, async (req, res) => {
     const { 
         query, lat, lng, radius_km, min_price, max_price, count, 
         sort_by, delivery_method, condition, date_listed, availability, cursor 
     } = req.query;
 
-    // 1. Parameter Validation
     if (!query || !lat || !lng) {
         return res.status(400).json({ 
             success: false, 
@@ -8642,7 +8522,6 @@ app.get('/v1/facebook/marketplace/search', authMiddleware, async (req, res) => {
     const safeLat = lat.trim();
     const safeLng = lng.trim();
 
-    // 2. Pre-flight Credit Check (Charge exactly 1 credit)
     const costToUser = 1;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
@@ -8651,64 +8530,50 @@ app.get('/v1/facebook/marketplace/search', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-    const cacheParams = [
-        cleanQuery, safeLat, safeLng, radius_km, min_price, max_price, count,
-        sort_by, delivery_method, condition, date_listed, availability
-    ].filter(Boolean).map(p => Buffer.from(String(p).trim()).toString('base64').substring(0, 6)).join('_');
-    
-    const safeCursor = cursor ? Buffer.from(cursor.trim()).toString('base64').substring(0, 15) : '0';
-
     try {
-
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
         }
 
-        const upstreamUrl = new URL('https://api.scrapecreators.com/v1/facebook/marketplace/search');
-        upstreamUrl.searchParams.append('query', cleanQuery);
-        upstreamUrl.searchParams.append('lat', safeLat);
-        upstreamUrl.searchParams.append('lng', safeLng);
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/facebook/marketplace/search');
+        targetUrl.searchParams.append('query', cleanQuery);
+        targetUrl.searchParams.append('lat', safeLat);
+        targetUrl.searchParams.append('lng', safeLng);
         
-        if (radius_km) upstreamUrl.searchParams.append('radius_km', radius_km.trim());
-        if (min_price) upstreamUrl.searchParams.append('min_price', min_price.trim());
-        if (max_price) upstreamUrl.searchParams.append('max_price', max_price.trim());
-        if (count) upstreamUrl.searchParams.append('count', count.trim());
-        if (sort_by) upstreamUrl.searchParams.append('sort_by', sort_by.trim());
-        if (delivery_method) upstreamUrl.searchParams.append('delivery_method', delivery_method.trim());
-        if (condition) upstreamUrl.searchParams.append('condition', condition.trim());
-        if (date_listed) upstreamUrl.searchParams.append('date_listed', date_listed.trim());
-        if (availability) upstreamUrl.searchParams.append('availability', availability.trim());
-        if (cursor) upstreamUrl.searchParams.append('cursor', cursor.trim());
+        if (radius_km) targetUrl.searchParams.append('radius_km', radius_km.trim());
+        if (min_price) targetUrl.searchParams.append('min_price', min_price.trim());
+        if (max_price) targetUrl.searchParams.append('max_price', max_price.trim());
+        if (count) targetUrl.searchParams.append('count', count.trim());
+        if (sort_by) targetUrl.searchParams.append('sort_by', sort_by.trim());
+        if (delivery_method) targetUrl.searchParams.append('delivery_method', delivery_method.trim());
+        if (condition) targetUrl.searchParams.append('condition', condition.trim());
+        if (date_listed) targetUrl.searchParams.append('date_listed', date_listed.trim());
+        if (availability) targetUrl.searchParams.append('availability', availability.trim());
+        if (cursor) targetUrl.searchParams.append('cursor', cursor.trim());
 
-        // 6. Execute Upstream Request (20s timeout)
-        const response = await fetch(upstreamUrl.toString(), {
+        const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(20000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 7. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
+        if (!response.ok || !payload.success) {
             throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to search Facebook Marketplace'}`
+                `Server Error: ${payload.error || response.statusText || 'Failed to search Facebook Marketplace'}`
             );
         }
 
-        // 8. Payload Construction & Strict Mapping
         const responseData = {
             query: cleanQuery,
-            has_next_page: !!upstreamPayload.has_next_page,
-            cursor: upstreamPayload.cursor || null,
-            listings: Array.isArray(upstreamPayload.listings) ? upstreamPayload.listings.map(item => ({
+            has_next_page: !!payload.has_next_page,
+            cursor: payload.cursor || null,
+            listings: Array.isArray(payload.listings) ? payload.listings.map(item => ({
                 id: item.id || "",
                 url: item.url || "",
                 title: item.title || "",
@@ -8728,11 +8593,17 @@ app.get('/v1/facebook/marketplace/search', authMiddleware, async (req, res) => {
             })) : []
         };
 
-        // 9. Billing Deduction & Caching
-        const actualCost = upstreamPayload.credits_charged === 0 ? 0 : costToUser;
+        const actualCost = payload.credits_charged === 0 ? 0 : costToUser;
         req.user.credits -= actualCost;
 
-        // 10. Return Response
+        const requestParamsLog = { 
+            query: cleanQuery, lat: safeLat, lng: safeLng, radius_km, min_price, max_price, 
+            count, sort_by, delivery_method, condition, date_listed, availability, cursor 
+        };
+
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/facebook/marketplace/search', actualCost, requestParamsLog, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -8743,18 +8614,28 @@ app.get('/v1/facebook/marketplace/search', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch marketplace listings." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch marketplace listings." 
             : error.message;
+
+        const requestParamsLog = { 
+            query: cleanQuery, lat: safeLat, lng: safeLng, radius_km, min_price, max_price, 
+            count, sort_by, delivery_method, condition, date_listed, availability, cursor 
+        };
 
         if (typeof notifyFailure === 'function') {
             notifyFailure({ 
                 endpoint: '/v1/facebook/marketplace/search', 
-                params: { query: cleanQuery, lat: safeLat, lng: safeLng, cursor: safeCursor }, 
+                params: requestParamsLog, 
                 statusCode: statusCode, 
                 errorMsg: finalErrorMsg 
             });
         }
+
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/facebook/marketplace/search', 0, requestParamsLog, statusCode);
 
         return res.status(statusCode).json({ 
             success: false, 
@@ -8763,10 +8644,10 @@ app.get('/v1/facebook/marketplace/search', authMiddleware, async (req, res) => {
     }
 });
 
+// --- EXPRESS ROUTE: FACEBOOK MARKETPLACE ITEM ---
 app.get('/v1/facebook/marketplace/item', authMiddleware, async (req, res) => {
     const { id, url } = req.query;
 
-    // 1. Parameter Validation
     if (!id && !url) {
         return res.status(400).json({ 
             success: false, 
@@ -8775,9 +8656,8 @@ app.get('/v1/facebook/marketplace/item', authMiddleware, async (req, res) => {
     }
 
     const safeId = id ? id.trim() : null;
-    const cleanUrl = url ? url.trim().split('?')[0] : null; // Strip tracking parameters
+    const cleanUrl = url ? url.trim().split('?')[0] : null; 
 
-    // 2. Pre-flight Credit Check (Charge exactly 1 credit)
     const costToUser = 1;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
@@ -8786,93 +8666,84 @@ app.get('/v1/facebook/marketplace/item', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-    const identifier = safeId ? `id_${safeId}` : `url_${Buffer.from(cleanUrl).toString('base64')}`;
-
     try {
-        // 4. Local Cache Check (Free 100% margin on repeat requests)
-
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
         }
 
-        const upstreamUrl = new URL('https://api.scrapecreators.com/v1/facebook/marketplace/item');
-        if (safeId) upstreamUrl.searchParams.append('id', safeId);
-        if (cleanUrl) upstreamUrl.searchParams.append('url', cleanUrl);
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/facebook/marketplace/item');
+        if (safeId) targetUrl.searchParams.append('id', safeId);
+        if (cleanUrl) targetUrl.searchParams.append('url', cleanUrl);
 
-        // 6. Execute Upstream Request (20s timeout)
-        const response = await fetch(upstreamUrl.toString(), {
+        const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(20000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 7. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
+        if (!response.ok || !payload.success) {
             throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch Marketplace item details'}`
+                `Server Error: ${payload.error || response.statusText || 'Failed to fetch Marketplace item details'}`
             );
         }
 
-        // 8. Payload Construction & Strict Mapping
         const responseData = {
-            id: upstreamPayload.id || safeId || "",
-            url: upstreamPayload.url || cleanUrl || "",
-            title: upstreamPayload.title || "",
-            description: upstreamPayload.description || "",
-            creation_time: upstreamPayload.creation_time || null,
-            listing_date_text: upstreamPayload.listing_date_text || null,
-            availability_text: upstreamPayload.availability_text || null,
+            id: payload.id || safeId || "",
+            url: payload.url || cleanUrl || "",
+            title: payload.title || "",
+            description: payload.description || "",
+            creation_time: payload.creation_time || null,
+            listing_date_text: payload.listing_date_text || null,
+            availability_text: payload.availability_text || null,
             location: {
-                text: upstreamPayload.location_text || "",
-                latitude: upstreamPayload.location?.latitude || null,
-                longitude: upstreamPayload.location?.longitude || null
+                text: payload.location_text || "",
+                latitude: payload.location?.latitude || null,
+                longitude: payload.location?.longitude || null
             },
-            price: upstreamPayload.price ? {
-                formatted: upstreamPayload.price.formatted_amount_zeros_stripped || "",
-                amount: upstreamPayload.price.amount || 0,
-                currency: upstreamPayload.price.currency || "USD"
+            price: payload.price ? {
+                formatted: payload.price.formatted_amount_zeros_stripped || "",
+                amount: payload.price.amount || 0,
+                currency: payload.price.currency || "USD"
             } : null,
-            category_id: upstreamPayload.category_id || "",
-            attributes: Array.isArray(upstreamPayload.attributes) ? upstreamPayload.attributes.map(attr => ({
+            category_id: payload.category_id || "",
+            attributes: Array.isArray(payload.attributes) ? payload.attributes.map(attr => ({
                 name: attr.attribute_name || "",
                 value: attr.value || "",
                 label: attr.label || ""
             })) : [],
-            photos: Array.isArray(upstreamPayload.photos) ? upstreamPayload.photos.map(photo => ({
+            photos: Array.isArray(payload.photos) ? payload.photos.map(photo => ({
                 id: photo.id || "",
                 url: photo.url || "",
                 width: photo.width || 0,
                 height: photo.height || 0
             })) : [],
             status: {
-                is_live: !!upstreamPayload.is_live,
-                is_sold: !!upstreamPayload.is_sold,
-                is_pending: !!upstreamPayload.is_pending,
-                is_hidden: !!upstreamPayload.is_hidden,
-                is_shipping_offered: !!upstreamPayload.is_shipping_offered
+                is_live: !!payload.is_live,
+                is_sold: !!payload.is_sold,
+                is_pending: !!payload.is_pending,
+                is_hidden: !!payload.is_hidden,
+                is_shipping_offered: !!payload.is_shipping_offered
             },
-            delivery_types: Array.isArray(upstreamPayload.delivery_types) ? upstreamPayload.delivery_types : [],
-            seller: upstreamPayload.seller ? {
-                id: upstreamPayload.seller.id || "",
-                name: upstreamPayload.seller.name || "",
-                profile_url: upstreamPayload.seller.profile_url || ""
+            delivery_types: Array.isArray(payload.delivery_types) ? payload.delivery_types : [],
+            seller: payload.seller ? {
+                id: payload.seller.id || "",
+                name: payload.seller.name || "",
+                profile_url: payload.seller.profile_url || ""
             } : null
         };
 
-        // 9. Billing Deduction & Caching
-        const actualCost = upstreamPayload.credits_charged === 0 ? 0 : costToUser;
+        const actualCost = payload.credits_charged === 0 ? 0 : costToUser;
         req.user.credits -= actualCost;
 
-        // 10. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/facebook/marketplace/item', actualCost, { id: safeId, url: cleanUrl }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -8883,8 +8754,10 @@ app.get('/v1/facebook/marketplace/item', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: Upstream provider took too long to fetch marketplace item data." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch marketplace item data." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -8896,6 +8769,9 @@ app.get('/v1/facebook/marketplace/item', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/facebook/marketplace/item', 0, { id: safeId, url: cleanUrl }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -8903,9 +8779,11 @@ app.get('/v1/facebook/marketplace/item', authMiddleware, async (req, res) => {
     }
 });
 
-const { scrapeTrustpilotSearch,scrapeTrustpilotReviews } = require('./src/scrapers/trustpilot');
+
+// --- EXPRESS ROUTE: TRUSTPILOT REVIEWS ---
+const { scrapeTrustpilotSearch, scrapeTrustpilotReviews } = require('./src/scrapers/trustpilot');
+
 app.get('/v1/trustpilot/reviews', authMiddleware, async (req, res) => {
-    // 1. Removed 'page', added 'limit'
     const { domain, limit, sort, stars } = req.query;
 
     if (!domain || typeof domain !== 'string' || domain.trim() === '') {
@@ -8917,67 +8795,70 @@ app.get('/v1/trustpilot/reviews', authMiddleware, async (req, res) => {
 
     const cleanDomain = domain.trim().toLowerCase();
     
-    // 2. Parse limit (defaulting to 200 if not provided), cap it at 200 for AnyAPI safety
     let safeLimit = limit ? parseInt(limit, 10) : 20;
     if (safeLimit > 200) safeLimit = 200; 
 
     const safeSort = sort ? sort.trim().toLowerCase() : 'recency';
     const safeStars = stars ? stars.toString().trim() : '';
 
-    // 3. Pre-flight Credit Check
     const costToUser = 5;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
             success: false, 
-            error: `403 Forbidden: Insufficient credits. This request requires ${costToUser} credit.` 
+            error: `403 Forbidden: Insufficient credits. This request requires ${costToUser} credits.` 
         });
     }
 
     try {
-        // 4. Map parameters to AnyAPI Schema, passing the limit directly
-        const payload = {
+        const payloadData = {
             company: cleanDomain,
             limit: safeLimit 
         };
 
         if (safeSort === 'recency' || safeSort === 'recent') {
-            payload.sortBy = 'recent';
+            payloadData.sortBy = 'recent';
         } else if (safeSort === 'relevancy') {
-            payload.sortBy = 'relevancy';
+            payloadData.sortBy = 'relevancy';
         } else {
-            payload.sortBy = 'auto';
+            payloadData.sortBy = 'auto';
         }
 
         if (safeStars) {
-            payload.stars = safeStars;
+            payloadData.stars = safeStars;
         }
 
-        // 5. Execute Request
-        const anyApiResponse = await axios.post(
+        const apiKey = process.env.ANYAPI_KEY;
+        if (!apiKey) throw new Error("Missing extraction API Key in environment");
+
+        const response = await axios.post(
             'https://api.getanyapi.com/v1/run/trustpilot.reviews',
-            payload,
+            payloadData,
             {
                 headers: {
-                    'Authorization': `Bearer ${process.env.ANYAPI_KEY}`,
+                    'Authorization': `Bearer ${apiKey}`,
                     'Content-Type': 'application/json'
                 },
                 timeout: 30000 
             }
         );
 
-        const resultData = anyApiResponse.data;
+        const payload = response.data;
 
-        if (resultData.output && resultData.output.found === false) {
+        if (payload.output && payload.output.found === false) {
+             // [NEW] LOG 404 AS FAILURE (Cost = 0)
+             await logApiRequest(req, '/v1/trustpilot/reviews', 0, { domain: cleanDomain, limit: safeLimit, sort: safeSort, stars: safeStars }, 404);
+             
              return res.status(404).json({
                 success: false,
-                error: `No reviews found for domain: ${cleanDomain}. Reason: ${resultData.output.reason}`
+                error: `404 Not Found: No reviews found for domain: ${cleanDomain}. Reason: ${payload.output.reason}`
              });
         }
 
-        // 6. Deduct Credit
         req.user.credits -= costToUser;
 
-        // 7. Return clean response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/trustpilot/reviews', costToUser, { domain: cleanDomain, limit: safeLimit, sort: safeSort, stars: safeStars }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -8988,19 +8869,20 @@ app.get('/v1/trustpilot/reviews', authMiddleware, async (req, res) => {
                 sort: safeSort,
                 stars: safeStars
             },
-            data: resultData.output.data
+            data: payload.output.data
         });
 
     } catch (error) {
         const isTimeout = error.code === 'ECONNABORTED' || (error.message && error.message.includes('timeout'));
         const statusCode = error.response ? error.response.status : (isTimeout ? 504 : 500);
         
+        // White-labeled
         let finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: The server took too long to fetch Trustpilot reviews." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch Trustpilot reviews." 
             : error.message;
 
         if (error.response?.data?.error) {
-            finalErrorMsg = `${statusCode} Upstream Provider Error: ${error.response.data.error}`;
+            finalErrorMsg = `${statusCode} Server Error: ${error.response.data.error}`;
         }
 
         if (typeof notifyFailure === 'function') {
@@ -9012,6 +8894,9 @@ app.get('/v1/trustpilot/reviews', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/trustpilot/reviews', 0, { domain: cleanDomain, limit: safeLimit, sort: safeSort, stars: safeStars }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -9019,10 +8904,11 @@ app.get('/v1/trustpilot/reviews', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: TRUSTPILOT SEARCH ---
 app.get('/v1/trustpilot/search', authMiddleware, async (req, res) => {
     const { query } = req.query;
 
-    // 1. Parameter Validation
     if (!query || typeof query !== 'string' || query.trim() === '') {
         return res.status(400).json({ 
             success: false, 
@@ -9032,7 +8918,6 @@ app.get('/v1/trustpilot/search', authMiddleware, async (req, res) => {
 
     const cleanQuery = query.trim();
 
-    // 2. Pre-flight Credit Check (Charge exactly 1 credit)
     const costToUser = 1;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
@@ -9041,18 +8926,16 @@ app.get('/v1/trustpilot/search', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-
     try {
-
-
-        // 5. Try Playwright first, then SocialCrawl
         const result = await trustpilotOrchestrator.executeSearch(
             () => scrapeTrustpilotSearch(cleanQuery),
             cleanQuery
         );
 
         if (!result.success) {
+            // [NEW] LOG 503 AS FAILURE (Cost = 0)
+            await logApiRequest(req, '/v1/trustpilot/search', 0, { query: cleanQuery }, 503);
+            
             return res.status(503).json({
                 success: false,
                 error: result.error,
@@ -9062,10 +8945,11 @@ app.get('/v1/trustpilot/search', authMiddleware, async (req, res) => {
 
         const responseData = result.data;
 
-        // 6. Deduct Credit & Store in Cache
         req.user.credits -= result.creditCost;
 
-        // 7. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/trustpilot/search', result.creditCost, { query: cleanQuery }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -9076,8 +8960,10 @@ app.get('/v1/trustpilot/search', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.message.includes('Timeout');
         const statusCode = isTimeout ? 504 : 500;
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: The scraper took too long to fetch Trustpilot results." 
+            ? "504 Gateway Timeout: The extraction engine took too long to fetch Trustpilot results." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -9089,6 +8975,9 @@ app.get('/v1/trustpilot/search', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/trustpilot/search', 0, { query: cleanQuery }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -9098,10 +8987,14 @@ app.get('/v1/trustpilot/search', authMiddleware, async (req, res) => {
 
 const { scrapeYellowpagesAPI } = require('./src/scrapers/yellowpages');
 
+// --- YELLOWPAGES IMPORTS ---
+// Assuming scrapeYellowpagesAPI is defined in your scrapers folder
+const { scrapeYellowpagesAPI } = require('./src/scrapers/yellowpages');
+
+// --- EXPRESS ROUTE: YELLOWPAGES SEARCH ---
 app.get('/v1/yellowpages/search', authMiddleware, async (req, res) => {
     const { term, location, page } = req.query;
 
-    // 1. Parameter Validation
     if (!term || !location) {
         return res.status(400).json({ 
             success: false, 
@@ -9113,7 +9006,6 @@ app.get('/v1/yellowpages/search', authMiddleware, async (req, res) => {
     const cleanLocation = location.trim();
     const safePage = page ? parseInt(page, 10) : 1;
 
-    // 2. Pre-flight Credit Check
     const costToUser = 1;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
@@ -9122,12 +9014,8 @@ app.get('/v1/yellowpages/search', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-
     try {
-
-
-        // 5. Execute ScraperAPI Module
+        // Execute internal scraper module
         const businesses = await scrapeYellowpagesAPI(cleanTerm, cleanLocation, safePage);
 
         const responseData = {
@@ -9140,12 +9028,11 @@ app.get('/v1/yellowpages/search', authMiddleware, async (req, res) => {
             businesses: businesses
         };
 
-        // 6. Deduct Credit & Store in Cache (Only non-empty responses)
         req.user.credits -= costToUser;
-        if (businesses.length > 0) {
-        }
 
-        // 7. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/yellowpages/search', costToUser, { term: cleanTerm, location: cleanLocation, page: safePage }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -9156,8 +9043,10 @@ app.get('/v1/yellowpages/search', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.message.includes('Timeout') || error.name === 'TimeoutError';
         const statusCode = isTimeout ? 504 : 500;
+        
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: The Scraping API took too long to fetch Yellowpages results." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch Yellowpages results." 
             : error.message;
 
         if (typeof notifyFailure === 'function') {
@@ -9169,6 +9058,9 @@ app.get('/v1/yellowpages/search', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/yellowpages/search', 0, { term: cleanTerm, location: cleanLocation, page: safePage }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -9176,13 +9068,14 @@ app.get('/v1/yellowpages/search', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- ZILLOW IMPORTS ---
 const { scrapeZillowSearchAPI, scrapeZillowDetailAPI } = require('./src/scrapers/zillow');
 
-// --- Zillow Search Endpoint ---
+// --- EXPRESS ROUTE: ZILLOW SEARCH ---
 app.get('/v1/zillow/search', authMiddleware, async (req, res) => {
     const { location, page } = req.query;
 
-    // 1. Parameter Validation
     if (!location || typeof location !== 'string' || location.trim() === '') {
         return res.status(400).json({ 
             success: false, 
@@ -9191,11 +9084,9 @@ app.get('/v1/zillow/search', authMiddleware, async (req, res) => {
     }
 
     const cleanLocation = location.trim();
-    // Retained for backward compatibility with your existing frontend/users
     const safePage = page ? parseInt(page, 10) : 1; 
     const costToUser = 1;
 
-    // 2. Pre-flight Credit Check
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
             success: false, 
@@ -9204,36 +9095,38 @@ app.get('/v1/zillow/search', authMiddleware, async (req, res) => {
     }
 
     try {
-        // 3. Map parameters to AnyAPI Schema
+        const apiKey = process.env.GETANYAPI_KEY;
+        if (!apiKey) throw new Error("Missing extraction API key in environment");
+
         const payload = {
             location: cleanLocation,
-            limit: 25 // Maximum allowed by AnyAPI Zillow Search
+            limit: 25 
         };
 
-        // 4. Execute Request to AnyAPI
-        const anyApiResponse = await axios.post(
+        const serverResponse = await axios.post(
             'https://api.getanyapi.com/v1/run/zillow.search',
             payload,
             {
                 headers: {
-                    'Authorization': `Bearer ${process.env.ANYAPI_KEY}`,
+                    'Authorization': `Bearer ${apiKey}`,
                     'Content-Type': 'application/json'
                 },
-                timeout: 30000 // 30 seconds for AnyAPI to navigate DataDome/PerimeterX
+                timeout: 30000 
             }
         );
 
-        const resultData = anyApiResponse.data;
+        const resultData = serverResponse.data;
 
-        // Handle clean "Not Found" states without throwing 500s
         if (resultData.output && resultData.output.found === false) {
-             return res.status(404).json({
+            // [NEW] LOG 404 FAILURE (Cost = 0)
+            await logApiRequest(req, '/v1/zillow/search', 0, { location: cleanLocation, page: safePage }, 404);
+
+            return res.status(404).json({
                 success: false,
-                error: `No listings found for location: ${cleanLocation}. Reason: ${resultData.output.reason}`
-             });
+                error: `404 Not Found: No listings found for location: ${cleanLocation}. Reason: ${resultData.output.reason}`
+            });
         }
 
-        // Extract the normalized items array from AnyAPI's output envelope
         const listings = resultData.output?.data?.items || [];
 
         const responseData = {
@@ -9245,10 +9138,11 @@ app.get('/v1/zillow/search', authMiddleware, async (req, res) => {
             listings: listings
         };
 
-        // 5. Deduct Credit
         req.user.credits -= costToUser;
 
-        // 6. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/zillow/search', costToUser, { location: cleanLocation, page: safePage }, 200);
+
         return res.status(200).json({
             success: true, 
             credits_remaining: req.user.credits, 
@@ -9257,17 +9151,16 @@ app.get('/v1/zillow/search', authMiddleware, async (req, res) => {
         });
 
     } catch (error) {
-        // 7. Standardized Error Handling
         const isTimeout = error.code === 'ECONNABORTED' || (error.message && error.message.includes('timeout'));
         const statusCode = error.response ? error.response.status : (isTimeout ? 504 : 500);
         
+        // White-labeled
         let finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: The server took too long to fetch Zillow listings." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch Zillow listings." 
             : error.message;
 
-        // Pass through native AnyAPI errors (e.g., 402 Payment Required, 429 Rate Limit)
         if (error.response?.data?.error) {
-            finalErrorMsg = `${statusCode} Upstream Provider Error: ${error.response.data.error}`;
+            finalErrorMsg = `${statusCode} Server Error: ${error.response.data.error}`;
         }
 
         if (typeof notifyFailure === 'function') {
@@ -9279,6 +9172,9 @@ app.get('/v1/zillow/search', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/zillow/search', 0, { location: cleanLocation, page: safePage }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -9287,7 +9183,7 @@ app.get('/v1/zillow/search', authMiddleware, async (req, res) => {
 });
 
 
-// --- Zillow Item Endpoint ---
+// --- EXPRESS ROUTE: ZILLOW ITEM ---
 app.get('/v1/zillow/item', authMiddleware, async (req, res) => {
     const { zpid, url } = req.query;
 
@@ -9301,12 +9197,9 @@ app.get('/v1/zillow/item', authMiddleware, async (req, res) => {
     const safeZpid = zpid ? zpid.trim() : null;
     const cleanUrl = url ? url.trim().split('?')[0] : null;
     
-    // AnyAPI requires a URL. If the user only provides a ZPID, we construct a valid Zillow URL.
-    // Zillow's backend ignores the slug (the "property" text) as long as the ZPID is correct at the end.
     const targetUrl = cleanUrl || `https://www.zillow.com/homedetails/property/${safeZpid}_zpid/`;
 
     const costToUser = 1;
-
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
             success: false, 
@@ -9315,47 +9208,52 @@ app.get('/v1/zillow/item', authMiddleware, async (req, res) => {
     }
 
     try {
+        const apiKey = process.env.GETANYAPI_KEY;
+        if (!apiKey) throw new Error("Missing extraction API key in environment");
+
         const payload = {
             url: targetUrl
         };
 
-        const anyApiResponse = await axios.post(
+        const serverResponse = await axios.post(
             'https://api.getanyapi.com/v1/run/zillow.property',
             payload,
             {
                 headers: {
-                    'Authorization': `Bearer ${process.env.ANYAPI_KEY}`,
+                    'Authorization': `Bearer ${apiKey}`,
                     'Content-Type': 'application/json'
                 },
-                timeout: 30000 // 30 seconds for AnyAPI to bypass Zillow's protections
+                timeout: 30000 
             }
         );
 
-        const resultData = anyApiResponse.data;
+        const resultData = serverResponse.data;
 
-        // Cleanly handle cases where the property was taken down or doesn't exist
         if (resultData.output && resultData.output.found === false) {
-             return res.status(404).json({
+            // [NEW] LOG 404 FAILURE (Cost = 0)
+            await logApiRequest(req, '/v1/zillow/item', 0, { zpid: safeZpid, url: cleanUrl }, 404);
+
+            return res.status(404).json({
                 success: false,
-                error: `Property not found. Reason: ${resultData.output.reason}`
-             });
+                error: `404 Not Found: Property not found. Reason: ${resultData.output.reason}`
+            });
         }
 
-        // AnyAPI returns a single element array for specific property lookups
         const propertyData = resultData.output?.data?.items?.[0];
 
         if (!propertyData) {
             throw new Error("Successfully fetched the page, but failed to locate the property data block.");
         }
 
-        // Deduct Credit
         req.user.credits -= costToUser;
+
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/zillow/item', costToUser, { zpid: safeZpid, url: cleanUrl }, 200);
 
         return res.status(200).json({
             success: true, 
             credits_remaining: req.user.credits, 
             credits_charged: costToUser,
-            // Spreading the property data keeps your existing output schema identical
             ...propertyData 
         });
 
@@ -9363,12 +9261,13 @@ app.get('/v1/zillow/item', authMiddleware, async (req, res) => {
         const isTimeout = error.code === 'ECONNABORTED' || (error.message && error.message.includes('timeout'));
         const statusCode = error.response ? error.response.status : (isTimeout ? 504 : 500);
         
+        // White-labeled
         let finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: The server took too long to fetch Zillow property details." 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch Zillow property details." 
             : error.message;
 
         if (error.response?.data?.error) {
-            finalErrorMsg = `${statusCode} Upstream Provider Error: ${error.response.data.error}`;
+            finalErrorMsg = `${statusCode} Server Error: ${error.response.data.error}`;
         }
 
         if (typeof notifyFailure === 'function') {
@@ -9380,6 +9279,9 @@ app.get('/v1/zillow/item', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/zillow/item', 0, { zpid: safeZpid, url: cleanUrl }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -9387,12 +9289,14 @@ app.get('/v1/zillow/item', authMiddleware, async (req, res) => {
     }
 });
 
-const { scrapeGoogleMapsSearch,scrapeGoogleMapsReviews } = require('./src/scrapers/gmaps');
 
+// --- GOOGLE MAPS IMPORTS ---
+const { scrapeGoogleMapsSearch, scrapeGoogleMapsReviews } = require('./src/scrapers/gmaps');
+
+// --- EXPRESS ROUTE: GOOGLE MAPS REVIEWS ---
 app.get('/v1/gmaps/reviews', authMiddleware, async (req, res) => {
     const { url, limit = 50, sort = 'newest' } = req.query;
 
-    // 1. Validation
     if (!url || typeof url !== 'string' || !url.includes('google.com/maps')) {
         return res.status(400).json({ 
             success: false, 
@@ -9404,7 +9308,6 @@ app.get('/v1/gmaps/reviews', authMiddleware, async (req, res) => {
     const sortParam = sort.toLowerCase().trim();
     const parsedLimit = parseInt(limit, 10);
 
-    // 2. Credit Check
     const costToUser = 2; 
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
@@ -9413,13 +9316,8 @@ app.get('/v1/gmaps/reviews', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Collision-Proof Cache Key
-    const queryHash = crypto.createHash('md5').update(`${cleanUrl}_${parsedLimit}_${sortParam}`).digest('hex');
-
     try {
-
-
-        // 5. Execute Apify Scraper
+        // Execute internal scraper module
         const reviews = await scrapeGoogleMapsReviews(cleanUrl, parsedLimit, sortParam);
 
         const responseData = {
@@ -9429,12 +9327,11 @@ app.get('/v1/gmaps/reviews', authMiddleware, async (req, res) => {
             reviews: reviews
         };
 
-        // 6. Deduct Credit & Store in Cache (Only if we got data!)
         req.user.credits -= costToUser;
-        if (reviews.length > 0) {
-        }
 
-        // 7. Success Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/gmaps/reviews', costToUser, { url: cleanUrl, limit: parsedLimit, sort: sortParam }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -9445,12 +9342,15 @@ app.get('/v1/gmaps/reviews', authMiddleware, async (req, res) => {
     } catch (error) {
         if (typeof notifyFailure === 'function') {
             notifyFailure({ 
-                endpoint: '/v1/google/maps/reviews', 
+                endpoint: '/v1/gmaps/reviews', 
                 params: { url: cleanUrl, sort: sortParam, limit: parsedLimit }, 
                 statusCode: 500, 
                 errorMsg: error.message 
             });
         }
+
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/gmaps/reviews', 0, { url: cleanUrl, limit: parsedLimit, sort: sortParam }, 500);
 
         return res.status(500).json({ 
             success: false, 
@@ -9458,9 +9358,9 @@ app.get('/v1/gmaps/reviews', authMiddleware, async (req, res) => {
         });
     }
 });
-
 const { ApifyClient } = require('apify-client');
 
+// --- EXPRESS ROUTE: GOOGLE MAPS SEARCH ---
 app.get('/v1/gmaps/search', authMiddleware, async (req, res) => {
     const { query, location, limit } = req.query;
 
@@ -9473,13 +9373,9 @@ app.get('/v1/gmaps/search', authMiddleware, async (req, res) => {
 
     const cleanQuery = query.trim();
     const targetLocation = location ? location.trim() : "";
-    
-    // Default to 50 if limit is not provided
     const resultLimit = parseInt(limit, 10) || 50; 
 
-    // --- PRE-FLIGHT CHECK ---
-    // Ensure the user has enough credits to cover the maximum possible results.
-    // Logic: 1 credit per 20 results (minimum 1 credit).
+    // Dynamic cost: 1 credit per 20 results (minimum 1 credit).
     const maxPotentialCost = Math.max(1, Math.ceil(resultLimit / 20));
 
     if (req.user.credits < maxPotentialCost) {
@@ -9489,15 +9385,11 @@ app.get('/v1/gmaps/search', authMiddleware, async (req, res) => {
         });
     }
 
-    // Cache key incorporates location and limit
-
     try {
+        const apiKey = process.env.APIFY_API_TOKEN;
+        if (!apiKey) throw new Error("Missing extraction API key in environment variables");
 
-
-        const apifyToken = process.env.APIFY_API_TOKEN;
-        if (!apifyToken) throw new Error("Missing APIFY_API_TOKEN in environment variables");
-
-        const client = new ApifyClient({ token: apifyToken });
+        const client = new ApifyClient({ token: apiKey });
 
         const runInput = {
             searchStringsArray: [cleanQuery],
@@ -9508,14 +9400,12 @@ app.get('/v1/gmaps/search', authMiddleware, async (req, res) => {
             maxImages: 0 
         };
 
-        // Enforce a strict 25-second wait to prevent Express 504 timeouts
         const run = await client.actor("compass/crawler-google-places").call(runInput, { waitSecs: 25 });
 
         if (run.status !== 'SUCCEEDED') {
-             throw new Error("Apify Actor took too long to complete. Try reducing the limit parameter.");
+             throw new Error("The extraction process took too long to complete. Try reducing the limit parameter.");
         }
 
-        // Fetch the JSON array from Apify's storage dataset
         const { items } = await client.dataset(run.defaultDatasetId).listItems();
 
         const responseData = {
@@ -9534,12 +9424,11 @@ app.get('/v1/gmaps/search', authMiddleware, async (req, res) => {
             }))
         };
 
-        // --- POST-FETCH DEDUCTION ---
-        // Charge the user based on actual returned results, not the requested limit.
-        // Example: If limit=100 (max cost 5), but Apify only found 15 places, cost is 1.
         const actualCost = Math.max(1, Math.ceil(items.length / 20));
-
         req.user.credits -= actualCost;
+
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/gmaps/search', actualCost, { query: cleanQuery, location: targetLocation, limit: resultLimit }, 200);
 
         return res.status(200).json({
             success: true,
@@ -9552,8 +9441,9 @@ app.get('/v1/gmaps/search', authMiddleware, async (req, res) => {
         const isTimeout = error.message.includes('too long to complete');
         const statusCode = isTimeout ? 504 : 500;
         
+        // White-labeled
         const finalErrorMsg = isTimeout 
-            ? "504 Gateway Timeout: The scraper took too long to fetch Google Maps results. Please retry with a smaller limit."
+            ? "504 Gateway Timeout: The extraction server took too long to fetch Google Maps results. Please retry with a smaller limit."
             : error.message || "Internal Server Error";
 
         if (typeof notifyFailure === 'function') {
@@ -9565,6 +9455,9 @@ app.get('/v1/gmaps/search', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/gmaps/search', 0, { query: cleanQuery, location: targetLocation, limit: resultLimit }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -9572,16 +9465,14 @@ app.get('/v1/gmaps/search', authMiddleware, async (req, res) => {
     }
 });
 
-const { scrapeAmazonStorefront,scrapeAmazonSearchAPI,MARKETPLACE_MAP,scrapeAmazonProductAPI } = require('./src/scrapers/amazon');
 
-const crypto = require('crypto');
+// --- AMAZON IMPORTS ---
+const { scrapeAmazonStorefront, scrapeAmazonSearchAPI, MARKETPLACE_MAP, scrapeAmazonProductAPI } = require('./src/scrapers/amazon');
 
-
-
+// --- EXPRESS ROUTE: AMAZON PRODUCT ---
 app.get('/v1/amazon/product', authMiddleware, async (req, res) => {
     const { asin, marketplace = 'us' } = req.query;
 
-    // 1. Parameter Validation
     if (!asin || typeof asin !== 'string' || !/^[a-zA-Z0-9]{10}$/.test(asin.trim())) {
         return res.status(400).json({ 
             success: false, 
@@ -9592,7 +9483,6 @@ app.get('/v1/amazon/product', authMiddleware, async (req, res) => {
     const marketCode = marketplace.toString().toLowerCase().trim();
     const cleanAsin = asin.toUpperCase().trim();
 
-    // 2. Pre-flight Credit Check
     const costToUser = 1;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
@@ -9601,18 +9491,16 @@ app.get('/v1/amazon/product', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Collision-Proof Cache Key
-
     try {
-
-
-        // 5. Try Playwright/ScraperAPI first, then SocialCrawl
         const result = await amazonOrchestrator.executeProduct(
             () => scrapeAmazonProductAPI(cleanAsin, marketCode),
             { asin: cleanAsin, country: MARKETPLACE_MAP[marketCode]?.country || 'us' }
         );
 
         if (!result.success) {
+            // [NEW] LOG ORCHESTRATOR FAILURE (Cost = 0)
+            await logApiRequest(req, '/v1/amazon/product', 0, { asin: cleanAsin, marketplace: marketCode }, 503);
+
             return res.status(503).json({
                 success: false,
                 error: result.error,
@@ -9620,10 +9508,11 @@ app.get('/v1/amazon/product', authMiddleware, async (req, res) => {
             });
         }
 
-        // 6. Deduct Credit & Store in Cache
         req.user.credits -= result.creditCost;
 
-        // 7. Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/amazon/product', result.creditCost, { asin: cleanAsin, marketplace: marketCode }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -9648,6 +9537,9 @@ app.get('/v1/amazon/product', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/amazon/product', 0, { asin: cleanAsin, marketplace: marketCode }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: error.message 
@@ -9655,10 +9547,11 @@ app.get('/v1/amazon/product', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: AMAZON SEARCH ---
 app.get('/v1/amazon/search', authMiddleware, async (req, res) => {
     const { keyword, marketplace = 'us', page = 1 } = req.query;
 
-    // 1. Parameter Validation
     if (!keyword || typeof keyword !== 'string' || !keyword.trim()) {
         return res.status(400).json({ 
             success: false, 
@@ -9677,7 +9570,6 @@ app.get('/v1/amazon/search', authMiddleware, async (req, res) => {
     const cleanKeyword = keyword.trim();
     const pageNum = Math.max(1, parseInt(page, 10) || 1);
 
-    // 2. Pre-flight Credit Check
     const costToUser = 2;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
@@ -9686,13 +9578,7 @@ app.get('/v1/amazon/search', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Collision-Proof Cache Key
-    const queryHash = crypto.createHash('md5').update(`${marketCode}:${pageNum}:${cleanKeyword.toLowerCase()}`).digest('hex');
-
     try {
-
-
-        // 5. Try ScraperAPI first, then fallback
         const result = await amazonOrchestrator.executeSearch(
             () => scrapeAmazonSearchAPI(cleanKeyword, marketCode, pageNum),
             {
@@ -9704,6 +9590,9 @@ app.get('/v1/amazon/search', authMiddleware, async (req, res) => {
         );
 
         if (!result.success) {
+            // [NEW] LOG ORCHESTRATOR FAILURE (Cost = 0)
+            await logApiRequest(req, '/v1/amazon/search', 0, { keyword: cleanKeyword, marketplace: marketCode, page: pageNum }, 503);
+
             return res.status(503).json({
                 success: false,
                 error: result.error,
@@ -9713,7 +9602,6 @@ app.get('/v1/amazon/search', authMiddleware, async (req, res) => {
 
         const responseData = result.data;
 
-        // Safely extract products array whether responseData is a raw array or an object
         const productsList = Array.isArray(responseData) 
             ? responseData 
             : (responseData?.products || responseData?.results || []);
@@ -9722,12 +9610,11 @@ app.get('/v1/amazon/search', authMiddleware, async (req, res) => {
             ? { products: productsList, total_results: productsList.length }
             : responseData;
 
-        // 6. Deduct Credit & Cache Non-Empty Responses
         req.user.credits -= result.creditCost;
-        if (productsList.length > 0) {
-        }
 
-        // 7. Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/amazon/search', result.creditCost, { keyword: cleanKeyword, marketplace: marketCode, page: pageNum }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -9738,11 +9625,11 @@ app.get('/v1/amazon/search', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.message.includes('timeout') || error.name === 'TimeoutError';
         const statusCode = isTimeout ? 504 : 500;
-        let finalErrorMsg = error.message;
-
-        if (isTimeout) {
-            finalErrorMsg = "504 Gateway Timeout: The Scraping API took too long to fetch Amazon search results.";
-        }
+        
+        // White-labeled
+        let finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch Amazon search results."
+            : error.message;
 
         if (typeof notifyFailure === 'function') {
             notifyFailure({ 
@@ -9753,6 +9640,9 @@ app.get('/v1/amazon/search', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/amazon/search', 0, { keyword: cleanKeyword, marketplace: marketCode, page: pageNum }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -9760,10 +9650,11 @@ app.get('/v1/amazon/search', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: AMAZON STOREFRONT ---
 app.get('/v1/amazon/storefront', authMiddleware, async (req, res) => {
     const { url } = req.query;
 
-    // 1. Parameter Validation
     if (!url || typeof url !== 'string' || !url.includes('amazon.com')) {
         return res.status(400).json({ 
             success: false, 
@@ -9773,7 +9664,6 @@ app.get('/v1/amazon/storefront', authMiddleware, async (req, res) => {
 
     const cleanUrl = url.trim();
 
-    // 2. Pre-flight Credit Check (Charge exactly 1 credit)
     const costToUser = 1;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
@@ -9782,25 +9672,16 @@ app.get('/v1/amazon/storefront', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-
-    const crypto = require('crypto'); // Add this at the very top of your file
-
-// ... inside the route ...
-
-// Create a unique hash of the ENTIRE URL to prevent collisions
-const urlHash = crypto.createHash('md5').update(cleanUrl).digest('hex');
     try {
-        // 4. Local Cache Check
-
-
-        // 5. Try Playwright first, then SocialCrawl
         const result = await amazonOrchestrator.executeStorefront(
             () => scrapeAmazonStorefront(cleanUrl),
             { url: cleanUrl }
         );
 
         if (!result.success) {
+            // [NEW] LOG ORCHESTRATOR FAILURE (Cost = 0)
+            await logApiRequest(req, '/v1/amazon/storefront', 0, { url: cleanUrl }, 503);
+
             return res.status(503).json({
                 success: false,
                 error: result.error,
@@ -9810,10 +9691,11 @@ const urlHash = crypto.createHash('md5').update(cleanUrl).digest('hex');
 
         const responseData = result.data;
 
-        // 6. Deduct Credit & Store in Cache
         req.user.credits -= result.creditCost;
 
-        // 7. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/amazon/storefront', result.creditCost, { url: cleanUrl }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -9825,8 +9707,10 @@ const urlHash = crypto.createHash('md5').update(cleanUrl).digest('hex');
         const isTimeout = error.message.includes('timeout') || error.name === 'TimeoutError';
         const statusCode = isTimeout ? 504 : 500;
         
-        let finalErrorMsg = error.message;
-        if (isTimeout) finalErrorMsg = "504 Gateway Timeout: The Scraping API took too long to fetch the Amazon storefront. The proxy may have been blocked.";
+        // White-labeled
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch the Amazon storefront. Protection mechanisms may have blocked the request."
+            : error.message;
 
         if (typeof notifyFailure === 'function') {
             notifyFailure({ 
@@ -9836,6 +9720,9 @@ const urlHash = crypto.createHash('md5').update(cleanUrl).digest('hex');
                 errorMsg: finalErrorMsg 
             });
         }
+
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/amazon/storefront', 0, { url: cleanUrl }, statusCode);
 
         return res.status(statusCode).json({ 
             success: false, 
