@@ -55,8 +55,21 @@ const PORT = process.env.PORT || 3000;
 
 // Reusable logging function
 const logApiRequest = async (req, endpoint, cost, params, statusCode) => {
-    // Safety check: Don't try to log if there's no authenticated user attached
-    if (!req.user || !req.user.id) return;
+    console.log(`\n--- 📊 ATTEMPTING TO LOG API CALL ---`);
+    console.log(`Endpoint: ${endpoint} | Cost: ${cost} | Status: ${statusCode}`);
+    
+    // 1. Check if the user object exists and what keys it has
+    console.log(`User Object in Request:`, req.user); 
+
+    if (!req.user) {
+        console.error('❌ LOGGING ABORTED: req.user is entirely missing from the request.');
+        return;
+    }
+
+    if (!req.user.id) {
+        console.error('❌ LOGGING ABORTED: req.user exists, but req.user.id is undefined. Check your authMiddleware!');
+        return;
+    }
 
     try {
         const { error } = await supabase
@@ -70,10 +83,14 @@ const logApiRequest = async (req, endpoint, cost, params, statusCode) => {
             });
 
         if (error) {
-            console.error(`Failed to log ${endpoint} usage:`, error);
+            // 2. Check if Supabase rejected it (usually an RLS error)
+            console.error(`❌ SUPABASE INSERT ERROR:`, error);
+        } else {
+            console.log(`✅ Log successfully inserted into api_logs!`);
         }
     } catch (err) {
-        console.error('Server error during logging:', err);
+        // 3. Catch server crashes (like supabase being undefined)
+        console.error('❌ FATAL SERVER ERROR DURING LOGGING:', err);
     }
 };
 
@@ -3551,10 +3568,10 @@ app.get('/v1/tiktok/search/users', authMiddleware, async (req, res) => {
     }
 });
 
+// --- EXPRESS ROUTE: TIKTOK USER FOLLOWERS ---
 app.get('/v1/tiktok/user/followers', authMiddleware, async (req, res) => {
     const { handle, user_id, min_time, trim } = req.query;
 
-    // 1. Validation
     if (!handle && !user_id) {
         return res.status(400).json({ 
             success: false, 
@@ -3562,8 +3579,6 @@ app.get('/v1/tiktok/user/followers', authMiddleware, async (req, res) => {
         });
     }
 
-    // 2. Pre-flight Credit Check
-    // We expect the upstream cost to be 1, so we require the user to have at least 2 credits.
     const minimumRequiredCredits = 2;
     if (req.user.credits < minimumRequiredCredits) {
         return res.status(403).json({ 
@@ -3572,17 +3587,11 @@ app.get('/v1/tiktok/user/followers', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
     const identifier = handle ? handle.replace('@', '').toLowerCase().trim() : `uid_${user_id}`;
-    const safeMinTime = min_time || '0';
-    const safeTrim = trim === 'true' ? 'true' : 'false';
 
     try {
-
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API Key in environment");
 
         const targetUrl = new URL('https://api.scrapecreators.com/v1/tiktok/user/followers');
         
@@ -3591,40 +3600,38 @@ app.get('/v1/tiktok/user/followers', authMiddleware, async (req, res) => {
         if (min_time) targetUrl.searchParams.append('min_time', min_time);
         if (trim) targetUrl.searchParams.append('trim', trim);
 
-        // 6. Execute Request
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(20000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 7. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch follower list'}`);
+        if (!response.ok || !payload.success) {
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to fetch follower list'}`);
         }
 
-        // 8. Sanitize Payload Structure
         const responseData = {
-            has_more: upstreamPayload.has_more || false,
-            min_time: upstreamPayload.min_time || 0,
-            max_time: upstreamPayload.max_time || 0,
-            total: upstreamPayload.total || 0,
-            next_page_token: upstreamPayload.next_page_token || null,
-            followers: upstreamPayload.followers || []
+            has_more: payload.has_more || false,
+            min_time: payload.min_time || 0,
+            max_time: payload.max_time || 0,
+            total: payload.total || 0,
+            next_page_token: payload.next_page_token || null,
+            followers: payload.followers || []
         };
 
-        // 9. Margin Logic: Charge exactly double the upstream cost
-        const upstreamCost = upstreamPayload.credits_charged || 1;
+        const upstreamCost = payload.credits_charged || 1;
         const finalCostToUser = upstreamCost * 2;
 
         req.user.credits -= finalCostToUser;
 
-        // 10. Return Response to Consumer
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/tiktok/user/followers', finalCostToUser, { handle: identifier, user_id, min_time, trim }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -3635,17 +3642,23 @@ app.get('/v1/tiktok/user/followers', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message === 'TimeoutError';
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
-        const finalErrorMsg = isTimeout ? "504 Gateway Timeout: Upstream provider took too long to respond." : error.message;
         
-        // Background Alerting
+        // White-labeled
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction server took too long to respond." 
+            : error.message;
+        
         if (typeof notifyFailure === 'function') {
             notifyFailure({ 
                 endpoint: '/v1/tiktok/user/followers', 
-                params: { handle: identifier, user_id, min_time }, 
+                params: { handle: identifier, user_id, min_time, trim }, 
                 statusCode: statusCode, 
                 errorMsg: finalErrorMsg 
             });
         }
+
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/tiktok/user/followers', 0, { handle: identifier, user_id, min_time, trim }, statusCode);
 
         return res.status(statusCode).json({ 
             success: false, 
@@ -3654,10 +3667,11 @@ app.get('/v1/tiktok/user/followers', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: TIKTOK USER FOLLOWING ---
 app.get('/v1/tiktok/user/following', authMiddleware, async (req, res) => {
     const { handle, min_time, trim } = req.query;
 
-    // 1. Validation
     if (!handle) {
         return res.status(400).json({ 
             success: false, 
@@ -3665,8 +3679,6 @@ app.get('/v1/tiktok/user/following', authMiddleware, async (req, res) => {
         });
     }
 
-    // 2. Pre-flight Credit Check
-    // We expect the upstream cost to be 1, so we require the user to have at least 2 credits.
     const minimumRequiredCredits = 2;
     if (req.user.credits < minimumRequiredCredits) {
         return res.status(403).json({ 
@@ -3675,17 +3687,11 @@ app.get('/v1/tiktok/user/following', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
     const identifier = handle.replace('@', '').toLowerCase().trim();
-    const safeMinTime = min_time || '0';
-    const safeTrim = trim === 'true' ? 'true' : 'false';
 
     try {
-
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API Key in environment");
 
         const targetUrl = new URL('https://api.scrapecreators.com/v1/tiktok/user/following');
         targetUrl.searchParams.append('handle', identifier);
@@ -3693,40 +3699,38 @@ app.get('/v1/tiktok/user/following', authMiddleware, async (req, res) => {
         if (min_time) targetUrl.searchParams.append('min_time', min_time);
         if (trim) targetUrl.searchParams.append('trim', trim);
 
-        // 6. Execute Request
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(20000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 7. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch following list'}`);
+        if (!response.ok || !payload.success) {
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to fetch following list'}`);
         }
 
-        // 8. Sanitize Payload Structure
         const responseData = {
-            has_more: upstreamPayload.has_more || false,
-            min_time: upstreamPayload.min_time || 0,
-            max_time: upstreamPayload.max_time || 0,
-            total: upstreamPayload.total || 0,
-            next_page_token: upstreamPayload.next_page_token || null,
-            followings: upstreamPayload.followings || []
+            has_more: payload.has_more || false,
+            min_time: payload.min_time || 0,
+            max_time: payload.max_time || 0,
+            total: payload.total || 0,
+            next_page_token: payload.next_page_token || null,
+            followings: payload.followings || []
         };
 
-        // 9. Margin Logic: Charge exactly double the upstream cost
-        const upstreamCost = upstreamPayload.credits_charged || 1;
+        const upstreamCost = payload.credits_charged || 1;
         const finalCostToUser = upstreamCost * 2;
 
         req.user.credits -= finalCostToUser;
 
-        // 10. Return Response to Consumer
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/tiktok/user/following', finalCostToUser, { handle: identifier, min_time, trim }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -3737,17 +3741,23 @@ app.get('/v1/tiktok/user/following', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message === 'TimeoutError';
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
-        const finalErrorMsg = isTimeout ? "504 Gateway Timeout: Upstream provider took too long to respond." : error.message;
         
-        // Background Alerting
+        // White-labeled
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction server took too long to respond." 
+            : error.message;
+        
         if (typeof notifyFailure === 'function') {
             notifyFailure({ 
                 endpoint: '/v1/tiktok/user/following', 
-                params: { handle: identifier, min_time }, 
+                params: { handle: identifier, min_time, trim }, 
                 statusCode: statusCode, 
                 errorMsg: finalErrorMsg 
             });
         }
+
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/tiktok/user/following', 0, { handle: identifier, min_time, trim }, statusCode);
 
         return res.status(statusCode).json({ 
             success: false, 
@@ -3756,10 +3766,11 @@ app.get('/v1/tiktok/user/following', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: TIKTOK VIDEO COMMENTS ---
 app.get('/v1/tiktok/video/comments', authMiddleware, async (req, res) => {
     const { url, cursor, trim } = req.query;
 
-    // 1. Validation
     if (!url) {
         return res.status(400).json({ 
             success: false, 
@@ -3767,7 +3778,6 @@ app.get('/v1/tiktok/video/comments', authMiddleware, async (req, res) => {
         });
     }
 
-    // 2. Pre-flight Credit Check (1 credit)
     const costPerRequest = 1;
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({ 
@@ -3776,18 +3786,9 @@ app.get('/v1/tiktok/video/comments', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-    // The cursor is critical here so we don't serve Page 1 data to a Page 2 request.
-    const safeCursor = cursor || '0';
-    const safeTrim = trim === 'true' ? 'true' : 'false';
-
     try {
-        // 4. Cache Check - 100% margin on repeat paginated queries
-
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API Key in environment");
 
         const targetUrl = new URL('https://api.scrapecreators.com/v1/tiktok/video/comments');
         targetUrl.searchParams.append('url', url);
@@ -3795,38 +3796,34 @@ app.get('/v1/tiktok/video/comments', authMiddleware, async (req, res) => {
         if (cursor) targetUrl.searchParams.append('cursor', cursor);
         if (trim) targetUrl.searchParams.append('trim', trim);
 
-        // 6. Execute Request
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(20000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 7. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch comments'}`);
+        if (!response.ok || !payload.success) {
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to fetch comments'}`);
         }
 
-        // 8. Sanitize Payload Structure
-        // Extracting only the necessary pagination logic and comments array
         const responseData = {
-            has_more: upstreamPayload.has_more,
-            cursor: upstreamPayload.cursor,
-            total: upstreamPayload.total || 0,
-            comments: upstreamPayload.comments || []
+            has_more: payload.has_more,
+            cursor: payload.cursor,
+            total: payload.total || 0,
+            comments: payload.comments || []
         };
 
-        // 9. Deduct Credits & Cache locally
         const actualCost = costPerRequest;
         req.user.credits -= actualCost;
-        
 
-        // 10. Return Response to Consumer
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/tiktok/video/comments', actualCost, { url, cursor, trim }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -3837,17 +3834,23 @@ app.get('/v1/tiktok/video/comments', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message === 'TimeoutError';
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
-        const finalErrorMsg = isTimeout ? "504 Gateway Timeout: Upstream provider took too long to respond." : error.message;
         
-        // Background Alerting
+        // White-labeled
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction server took too long to respond." 
+            : error.message;
+        
         if (typeof notifyFailure === 'function') {
             notifyFailure({ 
                 endpoint: '/v1/tiktok/video/comments', 
-                params: { url, cursor }, 
+                params: { url, cursor, trim }, 
                 statusCode: statusCode, 
                 errorMsg: finalErrorMsg 
             });
         }
+
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/tiktok/video/comments', 0, { url, cursor, trim }, statusCode);
 
         return res.status(statusCode).json({ 
             success: false, 
@@ -3856,10 +3859,10 @@ app.get('/v1/tiktok/video/comments', authMiddleware, async (req, res) => {
     }
 });
 
+// --- EXPRESS ROUTE: TIKTOK USER LIVE ---
 app.get('/v1/tiktok/user/live', authMiddleware, async (req, res) => {
     const { handle } = req.query;
 
-    // 1. Validation
     if (!handle) {
         return res.status(400).json({ 
             success: false, 
@@ -3867,7 +3870,6 @@ app.get('/v1/tiktok/user/live', authMiddleware, async (req, res) => {
         });
     }
 
-    // 2. Pre-flight Credit Check (1 credit)
     const costPerRequest = 1;
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({ 
@@ -3876,46 +3878,40 @@ app.get('/v1/tiktok/user/live', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
     const identifier = handle.replace('@', '').toLowerCase().trim();
 
     try {
-
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API Key in environment");
 
         const targetUrl = new URL('https://api.scrapecreators.com/v1/tiktok/user/live');
         targetUrl.searchParams.append('handle', identifier);
 
-        // 6. Execute Request with a 20-second timeout
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(20000)
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 7. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch live stream details'}`);
+        if (!response.ok || !payload.success) {
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to fetch live stream details'}`);
         }
 
-        // 8. Sanitize Payload Structure
         const responseData = {
-            liveRoomUserInfo: upstreamPayload.liveRoomUserInfo || null,
-            liveRoom: upstreamPayload.liveRoom || null
+            liveRoomUserInfo: payload.liveRoomUserInfo || null,
+            liveRoom: payload.liveRoom || null
         };
 
-        // 9. Deduct Credits & Cache locally
         req.user.credits -= costPerRequest;
 
-        // 10. Return Response to Consumer
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/tiktok/user/live', costPerRequest, { handle: identifier }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -3926,7 +3922,11 @@ app.get('/v1/tiktok/user/live', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message === 'TimeoutError';
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
-        const finalErrorMsg = isTimeout ? "504 Gateway Timeout: Upstream provider took too long to respond." : error.message;
+        
+        // White-labeled
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction server took too long to respond." 
+            : error.message;
 
         if (typeof notifyFailure === 'function') {
             notifyFailure({ 
@@ -3937,6 +3937,9 @@ app.get('/v1/tiktok/user/live', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/tiktok/user/live', 0, { handle: identifier }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -3944,10 +3947,11 @@ app.get('/v1/tiktok/user/live', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: TIKTOK VIDEO TRANSCRIPT ---
 app.get('/v1/tiktok/video/transcript', authMiddleware, async (req, res) => {
     const { url, language, use_ai_as_fallback } = req.query;
 
-    // 1. Validation
     if (!url) {
         return res.status(400).json({ 
             success: false, 
@@ -3955,7 +3959,6 @@ app.get('/v1/tiktok/video/transcript', authMiddleware, async (req, res) => {
         });
     }
 
-    // 2. Pre-flight Credit Check
     const maxPotentialCost = use_ai_as_fallback === 'true' ? 15 : 2;
     if (req.user.credits < maxPotentialCost) {
         return res.status(403).json({ 
@@ -3964,16 +3967,9 @@ app.get('/v1/tiktok/video/transcript', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Cache Key Construction
-    const safeLang = language || 'default';
-    const safeAiFallback = use_ai_as_fallback === 'true' ? 'true' : 'false';
-
     try {
-
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API Key in environment");
 
         const targetUrl = new URL('https://api.scrapecreators.com/v1/tiktok/video/transcript');
         targetUrl.searchParams.append('url', url);
@@ -3983,33 +3979,30 @@ app.get('/v1/tiktok/video/transcript', authMiddleware, async (req, res) => {
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(20000)
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 6. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch transcript'}`);
+        if (!response.ok || !payload.success) {
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to fetch transcript'}`);
         }
 
-        // 7. Sanitize & Structure Payload
         const responseData = {
-            id: upstreamPayload.id || null,
-            url: upstreamPayload.url || url,
-            transcript: upstreamPayload.transcript || ""
+            id: payload.id || null,
+            url: payload.url || url,
+            transcript: payload.transcript || ""
         };
 
-        // 8. Dynamic Credit Deduction & Local Caching
-        // FIX: We now use the actual credits charged by the upstream payload, or fallback to your maxPotentialCost
-        const actualCost = upstreamPayload.credits_charged || maxPotentialCost; 
+        const actualCost = payload.credits_charged || maxPotentialCost; 
         req.user.credits -= actualCost;
 
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/tiktok/video/transcript', actualCost, { url, language, use_ai_as_fallback }, 200);
 
-        // 9. Return Response to Client
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -4020,16 +4013,23 @@ app.get('/v1/tiktok/video/transcript', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message === 'TimeoutError';
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
-        const finalErrorMsg = isTimeout ? "504 Gateway Timeout: Upstream provider took too long to respond." : error.message;
+        
+        // White-labeled
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction server took too long to respond." 
+            : error.message;
 
         if (typeof notifyFailure === 'function') {
             notifyFailure({ 
                 endpoint: '/v1/tiktok/video/transcript', 
-                params: { url, language }, 
+                params: { url, language, use_ai_as_fallback }, 
                 statusCode: statusCode, 
                 errorMsg: finalErrorMsg 
             });
         }
+
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/tiktok/video/transcript', 0, { url, language, use_ai_as_fallback }, statusCode);
 
         return res.status(statusCode).json({ 
             success: false, 
@@ -4038,10 +4038,11 @@ app.get('/v1/tiktok/video/transcript', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: TIKTOK SINGLE VIDEO ---
 app.get('/v1/tiktok/video', authMiddleware, async (req, res) => {
     const { url, get_transcript, region, trim, download_media, cache_max_age } = req.query;
 
-    // 1. Validation
     if (!url) {
         return res.status(400).json({ 
             success: false, 
@@ -4049,7 +4050,6 @@ app.get('/v1/tiktok/video', authMiddleware, async (req, res) => {
         });
     }
 
-    // 2. Pre-flight Credit Check
     const maxPotentialCost = download_media === 'true' ? 10 : 1;
     if (req.user.credits < maxPotentialCost) {
         return res.status(403).json({ 
@@ -4059,9 +4059,8 @@ app.get('/v1/tiktok/video', authMiddleware, async (req, res) => {
     }
 
     try {
-        // 3. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API Key in environment");
 
         const targetUrl = new URL('https://api.scrapecreators.com/v2/tiktok/video');
         targetUrl.searchParams.append('url', url);
@@ -4075,34 +4074,33 @@ app.get('/v1/tiktok/video', authMiddleware, async (req, res) => {
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(20000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 4. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch video data'}`);
+        if (!response.ok || !payload.success) {
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to fetch video data'}`);
         }
 
-        // 5. Extract data and sanitize
         const responseData = {
-            status_code: upstreamPayload.status_code,
-            status_msg: upstreamPayload.status_msg,
-            aweme_detail: upstreamPayload.aweme_detail || null,
-            transcript: upstreamPayload.transcript || null,
-            cached: upstreamPayload.cached || false,
-            cached_at: upstreamPayload.cached_at || null
+            status_code: payload.status_code,
+            status_msg: payload.status_msg,
+            aweme_detail: payload.aweme_detail || null,
+            transcript: payload.transcript || null,
+            cached: payload.cached || false,
+            cached_at: payload.cached_at || null
         };
 
-        // 6. Dynamic Credit Deduction
-        const actualCost = upstreamPayload.credits_charged || 1;
+        const actualCost = payload.credits_charged || 1;
         req.user.credits -= actualCost;
         
-        // 7. Return to Consumer (Intercepted by cache middleware if successful)
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/tiktok/video', actualCost, { url, get_transcript, region, trim, download_media, cache_max_age }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -4113,16 +4111,23 @@ app.get('/v1/tiktok/video', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message === 'TimeoutError';
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
-        const finalErrorMsg = isTimeout ? "504 Gateway Timeout: Upstream provider took too long." : error.message;
+        
+        // White-labeled
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction server took too long to respond." 
+            : error.message;
         
         if (typeof notifyFailure === 'function') {
             notifyFailure({ 
                 endpoint: '/v1/tiktok/video', 
-                params: { url }, 
+                params: { url, get_transcript, region, trim, download_media, cache_max_age }, 
                 statusCode: statusCode, 
                 errorMsg: finalErrorMsg 
             });
         }
+
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/tiktok/video', 0, { url, get_transcript, region, trim, download_media, cache_max_age }, statusCode);
 
         return res.status(statusCode).json({ 
             success: false, 
@@ -4131,10 +4136,10 @@ app.get('/v1/tiktok/video', authMiddleware, async (req, res) => {
     }
 });
 
+// --- EXPRESS ROUTE: TIKTOK PROFILE VIDEOS ---
 app.get('/v1/tiktok/profile/videos', authMiddleware, async (req, res) => {
     const { handle, user_id, sort_by, max_cursor, region, trim } = req.query;
 
-    // 1. Validation
     if (!handle && !user_id) {
         return res.status(400).json({ 
             success: false, 
@@ -4142,7 +4147,6 @@ app.get('/v1/tiktok/profile/videos', authMiddleware, async (req, res) => {
         });
     }
 
-    // Dynamic Pricing Logic: 1 credit
     const costPerRequest = 1;
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({ 
@@ -4151,16 +4155,11 @@ app.get('/v1/tiktok/profile/videos', authMiddleware, async (req, res) => {
         });
     }
 
-    // 2. Cache Key Construction
     const identifier = handle ? handle.replace('@', '').toLowerCase() : user_id;
-    const safeCursor = max_cursor || '0';
-    const safeSort = sort_by || 'latest';
-    const safeTrim = trim === 'true' ? 'true' : 'false';
 
     try {
-        // 4. Delegate entirely to ScrapeCreators v3
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API Key in environment");
 
         const targetUrl = new URL('https://api.scrapecreators.com/v3/tiktok/profile/videos');
         
@@ -4171,37 +4170,35 @@ app.get('/v1/tiktok/profile/videos', authMiddleware, async (req, res) => {
         if (region) targetUrl.searchParams.append('region', region);
         if (trim) targetUrl.searchParams.append('trim', trim);
 
-        // Keep the timeout snappy for a great user experience
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(25000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 5. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch profile videos'}`);
+        if (!response.ok || !payload.success) {
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to fetch profile videos'}`);
         }
 
-        // 6. Extract data safely to prevent exposing upstream metadata
         const responseData = {
-            has_more: upstreamPayload.has_more,
-            max_cursor: upstreamPayload.max_cursor,
-            min_cursor: upstreamPayload.min_cursor,
-            status_code: upstreamPayload.status_code,
-            status_msg: upstreamPayload.status_msg,
-            aweme_list: upstreamPayload.aweme_list || []
+            has_more: payload.has_more,
+            max_cursor: payload.max_cursor,
+            min_cursor: payload.min_cursor,
+            status_code: payload.status_code,
+            status_msg: payload.status_msg,
+            aweme_list: payload.aweme_list || []
         };
 
-        // 7. Deduct Credits & Cache locally
         req.user.credits -= costPerRequest;
 
-        // 8. Return to Consumer
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/tiktok/profile/videos', costPerRequest, { handle: identifier, user_id, sort_by, max_cursor, region, trim }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -4212,9 +4209,12 @@ app.get('/v1/tiktok/profile/videos', authMiddleware, async (req, res) => {
     } catch (error) {
         const isTimeout = error.name === 'TimeoutError' || error.message === 'TimeoutError';
         const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
-        const finalErrorMsg = isTimeout ? "504 Gateway Timeout: Upstream provider took too long to respond." : error.message;
         
-        // Background Alerting
+        // White-labeled
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction server took too long to respond." 
+            : error.message;
+        
         if (typeof notifyFailure === 'function') {
             notifyFailure({ 
                 endpoint: '/v1/tiktok/profile/videos', 
@@ -4224,6 +4224,9 @@ app.get('/v1/tiktok/profile/videos', authMiddleware, async (req, res) => {
             });
         }
 
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/tiktok/profile/videos', 0, { handle: identifier, user_id, sort_by, max_cursor, region, trim }, statusCode);
+
         return res.status(statusCode).json({ 
             success: false, 
             error: finalErrorMsg 
@@ -4231,10 +4234,11 @@ app.get('/v1/tiktok/profile/videos', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: TIKTOK PROFILE REGION ---
 app.get('/v1/tiktok/profile/region', authMiddleware, async (req, res) => {
     const { handle } = req.query;
 
-    // 1. Validation
     if (!handle) {
         return res.status(400).json({
             success: false,
@@ -4242,7 +4246,6 @@ app.get('/v1/tiktok/profile/region', authMiddleware, async (req, res) => {
         });
     }
 
-    // Dynamic Pricing Logic: 1 credit
     const costPerRequest = 1;
 
     if (req.user.credits < costPerRequest) {
@@ -4255,11 +4258,8 @@ app.get('/v1/tiktok/profile/region', authMiddleware, async (req, res) => {
     const cleanHandle = handle.startsWith('@') ? handle.substring(1) : handle;
 
     try {
-
-
-        // 2. Delegate to ScrapeCreators
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API Key in environment");
 
         const targetUrl = new URL('https://api.scrapecreators.com/v1/tiktok/profile/region');
         targetUrl.searchParams.append('handle', cleanHandle);
@@ -4267,30 +4267,29 @@ app.get('/v1/tiktok/profile/region', authMiddleware, async (req, res) => {
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: {
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(25000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 3. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch region'}`);
+        if (!response.ok || !payload.success) {
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to fetch region'}`);
         }
 
-        // 4. Extract data and sanitize
         const responseData = {
-            handle: upstreamPayload.handle,
-            profile_url: upstreamPayload.profile_url,
-            region: upstreamPayload.region
+            handle: payload.handle,
+            profile_url: payload.profile_url,
+            region: payload.region
         };
 
-        // 5. Deduct Credits & Cache locally
         req.user.credits -= costPerRequest;
 
-        // 6. Return to Consumer
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/tiktok/profile/region', costPerRequest, { handle: cleanHandle }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -4299,21 +4298,25 @@ app.get('/v1/tiktok/profile/region', authMiddleware, async (req, res) => {
         });
 
     } catch (error) {
-        const errorMessage = error.message || "Internal Server Error";
-        
         const isTimeout = error.name === 'TimeoutError';
         const statusCode = isTimeout ? 504 : 500;
-        const finalErrorMsg = isTimeout ? "504 Gateway Timeout: Upstream provider took too long to respond." : errorMessage;
+        
+        // White-labeled
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction server took too long to respond." 
+            : (error.message || "Internal Server Error");
 
-        // Discord Failure Alert
         if (typeof notifyFailure === 'function') {
             notifyFailure({
                 endpoint: '/v1/tiktok/profile/region',
-                params: { handle },
+                params: { handle: cleanHandle },
                 statusCode: statusCode,
                 errorMsg: finalErrorMsg
             });
         }
+
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/tiktok/profile/region', 0, { handle: cleanHandle }, statusCode);
 
         return res.status(statusCode).json({
             success: false,
@@ -4322,6 +4325,8 @@ app.get('/v1/tiktok/profile/region', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: TIKTOK PROFILE ---
 app.get('/v1/tiktok/profile', authMiddleware, async (req, res) => {
     const { 
         handle, 
@@ -4329,7 +4334,6 @@ app.get('/v1/tiktok/profile', authMiddleware, async (req, res) => {
         cache_max_age 
     } = req.query;
 
-    // 1. Validation - Allow EITHER handle OR user_id
     if (!handle && !user_id) {
         return res.status(400).json({
             success: false,
@@ -4337,7 +4341,6 @@ app.get('/v1/tiktok/profile', authMiddleware, async (req, res) => {
         });
     }
 
-    // 2. Billing Check
     const costPerRequest = 1;
     if (req.user.credits < costPerRequest) {
         return res.status(403).json({
@@ -4346,11 +4349,11 @@ app.get('/v1/tiktok/profile', authMiddleware, async (req, res) => {
         });
     }
 
-    // 3. Construct Upstream URL & Parameters
     const targetUrl = new URL('https://api.scrapecreators.com/v1/tiktok/profile');
     
+    let cleanHandle = null;
     if (handle) {
-        const cleanHandle = handle.startsWith('@') ? handle.substring(1) : handle;
+        cleanHandle = handle.startsWith('@') ? handle.substring(1) : handle;
         targetUrl.searchParams.append('handle', cleanHandle);
     }
     
@@ -4363,11 +4366,13 @@ app.get('/v1/tiktok/profile', authMiddleware, async (req, res) => {
     }
 
     try {
-        // 4. Call ScrapeCreators API with a native 20-second timeout
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API Key in environment");
+
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: {
-                'x-api-key': process.env.SCRAPE_CREATORS_API_KEY, 
+                'x-api-key': apiKey, 
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(20000)
@@ -4377,18 +4382,19 @@ app.get('/v1/tiktok/profile', authMiddleware, async (req, res) => {
         try {
             data = await response.json();
         } catch (parseError) {
-            throw new Error(`Upstream returned invalid JSON. Status: ${response.status}`);
+            throw new Error(`Extraction server returned invalid JSON. Status: ${response.status}`);
         }
 
         if (!response.ok || !data.success) {
-            const upStreamError = data.error || data.message || `Upstream error: ${response.statusText}`;
-            throw new Error(`[${response.status}] ${upStreamError}`);
+            const serverError = data.error || data.message || `Server error: ${response.statusText}`;
+            throw new Error(`[${response.status}] ${serverError}`);
         }
 
-        // 5. Deduct Credits
         req.user.credits -= costPerRequest;
 
-        // 6. Return Payload to Your User (Intercepted by global cache middleware)
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/tiktok/profile', costPerRequest, { handle: cleanHandle, user_id, cache_max_age }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -4406,21 +4412,24 @@ app.get('/v1/tiktok/profile', authMiddleware, async (req, res) => {
         const statusCode = isNotFound ? 404 : (isTimeout ? 504 : 500);
         let finalErrorMsg = error.message || "Internal Server Error";
 
+        // White-labeled
         if (isTimeout) {
-            finalErrorMsg = "504 Gateway Timeout: Upstream scraping service took too long to respond.";
+            finalErrorMsg = "504 Gateway Timeout: The extraction server took too long to respond.";
         } else if (isNotFound) {
             finalErrorMsg = "404 Not Found: The requested TikTok profile does not exist or is banned.";
         }
 
-        // 7. Discord Failure Alert 
         if (typeof notifyFailure === 'function' && !isNotFound) {
             notifyFailure({
                 endpoint: '/v1/tiktok/profile',
-                params: { handle, user_id },
+                params: { handle: cleanHandle, user_id },
                 statusCode: statusCode,
                 errorMsg: finalErrorMsg
             });
         }
+
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/tiktok/profile', 0, { handle: cleanHandle, user_id, cache_max_age }, statusCode);
 
         return res.status(statusCode).json({
             success: false,
@@ -4429,10 +4438,11 @@ app.get('/v1/tiktok/profile', authMiddleware, async (req, res) => {
     }
 });
 
+
+// --- EXPRESS ROUTE: TIKTOK COLLECTION VIDEOS ---
 app.get('/v1/tiktok/collection/videos', authMiddleware, async (req, res) => {
     const { url, cursor } = req.query;
 
-    // 1. Validation
     if (!url) {
         return res.status(400).json({
             success: false,
@@ -4440,7 +4450,6 @@ app.get('/v1/tiktok/collection/videos', authMiddleware, async (req, res) => {
         });
     }
 
-    // Dynamic Pricing Logic: Base is 1 credit.
     const costPerRequest = 1;
 
     if (req.user.credits < costPerRequest) {
@@ -4450,50 +4459,43 @@ app.get('/v1/tiktok/collection/videos', authMiddleware, async (req, res) => {
         });
     }
 
-    // Cache key explicitly flags URL and the pagination cursor to prevent data bleed
-
     try {
-
-
-        // 2. Fetch from ScrapeCreators
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) throw new Error("Missing ScrapeCreators API Key in environment");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) throw new Error("Missing extraction API Key in environment");
 
         const targetUrl = new URL('https://api.scrapecreators.com/v1/tiktok/collection/videos');
         targetUrl.searchParams.append('url', url);
         if (cursor) targetUrl.searchParams.append('cursor', cursor);
 
-        // 35-second timeout safeguard - grabbing deeply paginated video arrays can be heavy
         const response = await fetch(targetUrl.toString(), {
             method: 'GET',
             headers: {
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
             signal: AbortSignal.timeout(35000) 
         });
 
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 3. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
-            throw new Error(`Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch collection videos'}`);
+        if (!response.ok || !payload.success) {
+            throw new Error(`Server Error: ${payload.error || response.statusText || 'Failed to fetch collection videos'}`);
         }
 
-        // 4. Safely extract results and sanitize upstream billing data
         const responseData = {
-            collection_id: upstreamPayload.collection_id,
-            has_more: upstreamPayload.has_more,
-            max_cursor: upstreamPayload.max_cursor,
-            status_code: upstreamPayload.status_code,
-            status_msg: upstreamPayload.status_msg,
-            videos: upstreamPayload.videos || []
+            collection_id: payload.collection_id,
+            has_more: payload.has_more,
+            max_cursor: payload.max_cursor,
+            status_code: payload.status_code,
+            status_msg: payload.status_msg,
+            videos: payload.videos || []
         };
 
-        // 5. Deduct Credits & Cache locally
         req.user.credits -= costPerRequest;
 
-        // 6. Return to Consumer
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/tiktok/collection/videos', costPerRequest, { url, cursor }, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -4506,9 +4508,12 @@ app.get('/v1/tiktok/collection/videos', authMiddleware, async (req, res) => {
         
         const isTimeout = error.name === 'TimeoutError';
         const statusCode = isTimeout ? 504 : 500;
-        const finalErrorMsg = isTimeout ? "504 Gateway Timeout: Upstream provider took too long to respond." : errorMessage;
+        
+        // White-labeled
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction server took too long to respond." 
+            : errorMessage;
 
-        // Discord Failure Alert - essential for monitoring upstream pagination health
         if (typeof notifyFailure === 'function') {
             notifyFailure({
                 endpoint: '/v1/tiktok/collection/videos',
@@ -4518,7 +4523,9 @@ app.get('/v1/tiktok/collection/videos', authMiddleware, async (req, res) => {
             });
         }
 
-        // Only refund/don't charge the user if the request failed
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/tiktok/collection/videos', 0, { url, cursor }, statusCode);
+
         return res.status(statusCode).json({
             success: false,
             error: finalErrorMsg
