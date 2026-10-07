@@ -8986,7 +8986,6 @@ const { scrapeYellowpagesAPI } = require('./src/scrapers/yellowpages');
 
 // --- YELLOWPAGES IMPORTS ---
 // Assuming scrapeYellowpagesAPI is defined in your scrapers folder
-const { scrapeYellowpagesAPI } = require('./src/scrapers/yellowpages');
 
 // --- EXPRESS ROUTE: YELLOWPAGES SEARCH ---
 app.get('/v1/yellowpages/search', authMiddleware, async (req, res) => {
