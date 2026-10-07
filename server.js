@@ -9727,6 +9727,505 @@ app.get('/v1/amazon/storefront', authMiddleware, async (req, res) => {
     }
 });
 
+// --- EXPRESS ROUTE: THREADS PROFILE ---
+app.get('/v1/threads/profile', authMiddleware, async (req, res) => {
+    const { handle, cache_max_age } = req.query;
+
+    if (!handle || typeof handle !== 'string' || handle.trim() === '') {
+        return res.status(400).json({ 
+            success: false, 
+            error: "400 Bad Request: Missing required parameter 'handle'." 
+        });
+    }
+
+    const cleanHandle = handle.trim().replace(/^@/, '');
+
+    const baseCostToUser = 1;
+    if (req.user.credits < baseCostToUser) {
+        return res.status(403).json({ 
+            success: false, 
+            error: `403 Forbidden: Insufficient credits. This request requires up to ${baseCostToUser} credit.` 
+        });
+    }
+
+    try {
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
+        }
+
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/threads/profile');
+        targetUrl.searchParams.append('handle', cleanHandle);
+        if (cache_max_age) targetUrl.searchParams.append('cache_max_age', cache_max_age);
+
+        const response = await fetch(targetUrl.toString(), {
+            method: 'GET',
+            headers: { 
+                'x-api-key': apiKey,
+                'Content-Type': 'application/json'
+            },
+            signal: AbortSignal.timeout(20000) 
+        });
+
+        const payload = await response.json();
+
+        if (!response.ok || !payload.success) {
+            throw new Error(
+                `Server Error: ${payload.error || response.statusText || 'Failed to fetch Threads profile'}`
+            );
+        }
+
+        // Separate billing/status from the raw profile data
+        const { success, credits_remaining, credits_charged, ...profileData } = payload;
+
+        // Dynamic Billing Deduction
+        const actualCost = credits_charged === 0 ? 0 : baseCostToUser;
+        req.user.credits -= actualCost;
+
+        const requestParamsLog = { handle: cleanHandle, cache_max_age };
+
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/threads/profile', actualCost, requestParamsLog, 200);
+
+        return res.status(200).json({
+            success: true,
+            credits_remaining: req.user.credits,
+            credits_charged: actualCost,
+            ...profileData
+        });
+
+    } catch (error) {
+        const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
+        const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch the profile." 
+            : error.message;
+
+        const requestParamsLog = { handle: cleanHandle, cache_max_age };
+
+        if (typeof notifyFailure === 'function') {
+            notifyFailure({ 
+                endpoint: '/v1/threads/profile', 
+                params: requestParamsLog, 
+                statusCode: statusCode, 
+                errorMsg: finalErrorMsg 
+            });
+        }
+
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/threads/profile', 0, requestParamsLog, statusCode);
+
+        return res.status(statusCode).json({ 
+            success: false, 
+            error: finalErrorMsg 
+        });
+    }
+});
+
+
+// --- EXPRESS ROUTE: THREADS USER POSTS ---
+app.get('/v1/threads/user/posts', authMiddleware, async (req, res) => {
+    const { handle, trim } = req.query;
+
+    if (!handle || typeof handle !== 'string' || handle.trim() === '') {
+        return res.status(400).json({ 
+            success: false, 
+            error: "400 Bad Request: Missing required parameter 'handle'." 
+        });
+    }
+
+    const cleanHandle = handle.trim().replace(/^@/, '');
+    const safeTrim = trim === 'true' ? 'true' : 'false';
+
+    const baseCostToUser = 1;
+    if (req.user.credits < baseCostToUser) {
+        return res.status(403).json({ 
+            success: false, 
+            error: `403 Forbidden: Insufficient credits. This request requires up to ${baseCostToUser} credit.` 
+        });
+    }
+
+    try {
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
+        }
+
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/threads/user/posts');
+        targetUrl.searchParams.append('handle', cleanHandle);
+        if (trim) targetUrl.searchParams.append('trim', safeTrim);
+
+        const response = await fetch(targetUrl.toString(), {
+            method: 'GET',
+            headers: { 
+                'x-api-key': apiKey,
+                'Content-Type': 'application/json'
+            },
+            signal: AbortSignal.timeout(20000) 
+        });
+
+        const payload = await response.json();
+
+        if (!response.ok || !payload.success) {
+            throw new Error(
+                `Server Error: ${payload.error || response.statusText || 'Failed to fetch Threads posts'}`
+            );
+        }
+
+        const responseData = {
+            posts: Array.isArray(payload.posts) ? payload.posts : []
+        };
+
+        const actualCost = payload.credits_charged === 0 ? 0 : baseCostToUser;
+        req.user.credits -= actualCost;
+
+        const requestParamsLog = { handle: cleanHandle, trim: safeTrim };
+
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/threads/user/posts', actualCost, requestParamsLog, 200);
+
+        return res.status(200).json({
+            success: true,
+            credits_remaining: req.user.credits,
+            credits_charged: actualCost,
+            ...responseData
+        });
+
+    } catch (error) {
+        const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
+        const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch user posts." 
+            : error.message;
+
+        const requestParamsLog = { handle: cleanHandle, trim: safeTrim };
+
+        if (typeof notifyFailure === 'function') {
+            notifyFailure({ 
+                endpoint: '/v1/threads/user/posts', 
+                params: requestParamsLog, 
+                statusCode: statusCode, 
+                errorMsg: finalErrorMsg 
+            });
+        }
+
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/threads/user/posts', 0, requestParamsLog, statusCode);
+
+        return res.status(statusCode).json({ 
+            success: false, 
+            error: finalErrorMsg 
+        });
+    }
+});
+
+
+// --- EXPRESS ROUTE: THREADS SEARCH ---
+app.get('/v1/threads/search', authMiddleware, async (req, res) => {
+    const { query, start_date, end_date, trim } = req.query;
+
+    if (!query || typeof query !== 'string' || query.trim() === '') {
+        return res.status(400).json({ 
+            success: false, 
+            error: "400 Bad Request: Missing required parameter 'query'." 
+        });
+    }
+
+    const cleanQuery = query.trim();
+    const safeTrim = trim === 'true' ? 'true' : 'false';
+
+    const baseCostToUser = 1;
+    if (req.user.credits < baseCostToUser) {
+        return res.status(403).json({ 
+            success: false, 
+            error: `403 Forbidden: Insufficient credits. This request requires up to ${baseCostToUser} credit.` 
+        });
+    }
+
+    try {
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
+        }
+
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/threads/search');
+        targetUrl.searchParams.append('query', cleanQuery);
+        
+        if (start_date) targetUrl.searchParams.append('start_date', start_date.trim());
+        if (end_date) targetUrl.searchParams.append('end_date', end_date.trim());
+        if (trim) targetUrl.searchParams.append('trim', safeTrim);
+
+        const response = await fetch(targetUrl.toString(), {
+            method: 'GET',
+            headers: { 
+                'x-api-key': apiKey,
+                'Content-Type': 'application/json'
+            },
+            signal: AbortSignal.timeout(20000) 
+        });
+
+        const payload = await response.json();
+
+        if (!response.ok || !payload.success) {
+            throw new Error(
+                `Server Error: ${payload.error || response.statusText || 'Failed to search Threads'}`
+            );
+        }
+
+        const responseData = {
+            posts: Array.isArray(payload.posts) ? payload.posts : []
+        };
+
+        const actualCost = payload.credits_charged === 0 ? 0 : baseCostToUser;
+        req.user.credits -= actualCost;
+
+        const requestParamsLog = { query: cleanQuery, start_date, end_date, trim: safeTrim };
+
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/threads/search', actualCost, requestParamsLog, 200);
+
+        return res.status(200).json({
+            success: true,
+            credits_remaining: req.user.credits,
+            credits_charged: actualCost,
+            ...responseData
+        });
+
+    } catch (error) {
+        const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
+        const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch search results." 
+            : error.message;
+
+        const requestParamsLog = { query: cleanQuery, start_date, end_date, trim: safeTrim };
+
+        if (typeof notifyFailure === 'function') {
+            notifyFailure({ 
+                endpoint: '/v1/threads/search', 
+                params: requestParamsLog, 
+                statusCode: statusCode, 
+                errorMsg: finalErrorMsg 
+            });
+        }
+
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/threads/search', 0, requestParamsLog, statusCode);
+
+        return res.status(statusCode).json({ 
+            success: false, 
+            error: finalErrorMsg 
+        });
+    }
+});
+
+// --- EXPRESS ROUTE: THREADS SINGLE POST ---
+app.get('/v1/threads/post', authMiddleware, async (req, res) => {
+    const { url, trim, cache_max_age } = req.query;
+
+    if (!url || typeof url !== 'string' || url.trim() === '') {
+        return res.status(400).json({ 
+            success: false, 
+            error: "400 Bad Request: Missing required parameter 'url'." 
+        });
+    }
+
+    const cleanUrl = url.trim().split('?')[0]; 
+    const safeTrim = trim === 'true' ? 'true' : 'false';
+
+    const baseCostToUser = 1;
+    if (req.user.credits < baseCostToUser) {
+        return res.status(403).json({ 
+            success: false, 
+            error: `403 Forbidden: Insufficient credits. This request requires up to ${baseCostToUser} credit.` 
+        });
+    }
+
+    try {
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
+        }
+
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/threads/post');
+        targetUrl.searchParams.append('url', cleanUrl);
+        if (trim) targetUrl.searchParams.append('trim', safeTrim);
+        if (cache_max_age) targetUrl.searchParams.append('cache_max_age', cache_max_age);
+
+        const response = await fetch(targetUrl.toString(), {
+            method: 'GET',
+            headers: { 
+                'x-api-key': apiKey,
+                'Content-Type': 'application/json'
+            },
+            signal: AbortSignal.timeout(20000) 
+        });
+
+        const payload = await response.json();
+
+        if (!response.ok || !payload.success) {
+            throw new Error(
+                `Server Error: ${payload.error || response.statusText || 'Failed to fetch Threads post'}`
+            );
+        }
+
+        const responseData = {
+            post: payload.post || null,
+            comments: Array.isArray(payload.comments) ? payload.comments : [],
+            threadItems: Array.isArray(payload.threadItems) ? payload.threadItems : [],
+            relatedPosts: Array.isArray(payload.relatedPosts) ? payload.relatedPosts : [],
+            cached: payload.cached || false,
+            cached_at: payload.cached_at || null
+        };
+
+        const actualCost = payload.credits_charged === 0 ? 0 : baseCostToUser;
+        req.user.credits -= actualCost;
+
+        const requestParamsLog = { url: cleanUrl, trim: safeTrim, cache_max_age };
+
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/threads/post', actualCost, requestParamsLog, 200);
+
+        return res.status(200).json({
+            success: true,
+            credits_remaining: req.user.credits,
+            credits_charged: actualCost,
+            ...responseData
+        });
+
+    } catch (error) {
+        const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
+        const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch the post." 
+            : error.message;
+
+        const requestParamsLog = { url: cleanUrl, trim: safeTrim, cache_max_age };
+
+        if (typeof notifyFailure === 'function') {
+            notifyFailure({ 
+                endpoint: '/v1/threads/post', 
+                params: requestParamsLog, 
+                statusCode: statusCode, 
+                errorMsg: finalErrorMsg 
+            });
+        }
+
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/threads/post', 0, requestParamsLog, statusCode);
+
+        return res.status(statusCode).json({ 
+            success: false, 
+            error: finalErrorMsg 
+        });
+    }
+});
+
+
+// --- EXPRESS ROUTE: THREADS USER SEARCH ---
+app.get('/v1/threads/search/users', authMiddleware, async (req, res) => {
+    const { query } = req.query;
+
+    if (!query || typeof query !== 'string' || query.trim() === '') {
+        return res.status(400).json({ 
+            success: false, 
+            error: "400 Bad Request: Missing required parameter 'query'." 
+        });
+    }
+
+    const cleanQuery = query.trim();
+
+    const costToUser = 1;
+    if (req.user.credits < costToUser) {
+        return res.status(403).json({ 
+            success: false, 
+            error: `403 Forbidden: Insufficient credits. This request requires ${costToUser} credit.` 
+        });
+    }
+
+    try {
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
+        }
+
+        const targetUrl = new URL('https://api.scrapecreators.com/v1/threads/search/users');
+        targetUrl.searchParams.append('query', cleanQuery);
+
+        const response = await fetch(targetUrl.toString(), {
+            method: 'GET',
+            headers: { 
+                'x-api-key': apiKey,
+                'Content-Type': 'application/json'
+            },
+            signal: AbortSignal.timeout(15000) 
+        });
+
+        const payload = await response.json();
+
+        if (!response.ok || !payload.success) {
+            throw new Error(
+                `Server Error: ${payload.error || response.statusText || 'Failed to search Threads users'}`
+            );
+        }
+
+        const responseData = {
+            users: Array.isArray(payload.users) ? payload.users : []
+        };
+
+        const actualCost = payload.credits_charged === 0 ? 0 : costToUser;
+        req.user.credits -= actualCost;
+
+        const requestParamsLog = { query: cleanQuery };
+
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/threads/search/users', actualCost, requestParamsLog, 200);
+
+        return res.status(200).json({
+            success: true,
+            credits_remaining: req.user.credits,
+            credits_charged: actualCost,
+            ...responseData
+        });
+
+    } catch (error) {
+        const isTimeout = error.name === 'TimeoutError' || error.message.includes('Timeout');
+        const statusCode = error.message.includes('404') ? 404 : (isTimeout ? 504 : 500);
+        
+        // White-labeled
+        const finalErrorMsg = isTimeout 
+            ? "504 Gateway Timeout: The extraction server took too long to fetch the user search results." 
+            : error.message;
+
+        const requestParamsLog = { query: cleanQuery };
+
+        if (typeof notifyFailure === 'function') {
+            notifyFailure({ 
+                endpoint: '/v1/threads/search/users', 
+                params: requestParamsLog, 
+                statusCode: statusCode, 
+                errorMsg: finalErrorMsg 
+            });
+        }
+
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/threads/search/users', 0, requestParamsLog, statusCode);
+
+        return res.status(statusCode).json({ 
+            success: false, 
+            error: finalErrorMsg 
+        });
+    }
+});
+
 // Catch-all for undefined API routes
 app.use((req, res) => {
     res.status(404).json({
