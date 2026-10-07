@@ -7817,6 +7817,7 @@ app.get('/v1/linkedin/ads/search', authMiddleware, async (req, res) => {
 
 
 // --- EXPRESS ROUTE: FACEBOOK AD LIBRARY SINGLE AD ---
+// --- EXPRESS ROUTE: FACEBOOK AD LIBRARY SINGLE AD ---
 app.get('/v1/facebook/adLibrary/ad', authMiddleware, async (req, res) => {
     const { id, url, trim, cache_max_age } = req.query;
 
@@ -8089,6 +8090,12 @@ app.all('/v1/facebook/adLibrary/search/ads', authMiddleware, async (req, res) =>
 
     const cleanQuery = query.trim();
 
+    // Explicitly build the log parameters so un-parseable body artifacts don't crash Supabase
+    const logParams = { 
+        query: cleanQuery, sort_by, search_type, ad_type, country, 
+        status, media_type, start_date, end_date, cursor, trim 
+    };
+
     const costToUser = 2;
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
@@ -8190,7 +8197,7 @@ app.all('/v1/facebook/adLibrary/search/ads', authMiddleware, async (req, res) =>
         req.user.credits -= actualCost;
 
         // [NEW] LOG SUCCESS
-        await logApiRequest(req, '/v1/facebook/adLibrary/search/ads', actualCost, params, 200);
+        await logApiRequest(req, '/v1/facebook/adLibrary/search/ads', actualCost, logParams, 200);
 
         return res.status(200).json({
             success: true,
@@ -8211,14 +8218,14 @@ app.all('/v1/facebook/adLibrary/search/ads', authMiddleware, async (req, res) =>
         if (typeof notifyFailure === 'function') {
             notifyFailure({ 
                 endpoint: '/v1/facebook/adLibrary/search/ads', 
-                params: params, 
+                params: logParams, 
                 statusCode: statusCode, 
                 errorMsg: finalErrorMsg 
             });
         }
 
         // [NEW] LOG FAILURE (Cost = 0)
-        await logApiRequest(req, '/v1/facebook/adLibrary/search/ads', 0, params, statusCode);
+        await logApiRequest(req, '/v1/facebook/adLibrary/search/ads', 0, logParams, statusCode);
 
         return res.status(statusCode).json({ 
             success: false, 
@@ -8227,8 +8234,9 @@ app.all('/v1/facebook/adLibrary/search/ads', authMiddleware, async (req, res) =>
     }
 });
 
+
+// --- EXPRESS ROUTE: FACEBOOK AD LIBRARY COMPANY ADS ---
 app.all('/v1/facebook/adLibrary/company/ads', authMiddleware, async (req, res) => {
-    // Support both GET (query strings) and POST (JSON body) for heavy pagination cursors
     if (req.method !== 'GET' && req.method !== 'POST') {
         return res.status(405).json({ success: false, error: "405 Method Not Allowed. Use GET or POST." });
     }
@@ -8239,7 +8247,6 @@ app.all('/v1/facebook/adLibrary/company/ads', authMiddleware, async (req, res) =
         language, sort_by, start_date, end_date, cursor, trim 
     } = params;
 
-    // 1. Parameter Validation
     if (!pageId && !companyName) {
         return res.status(400).json({ 
             success: false, 
@@ -8249,32 +8256,25 @@ app.all('/v1/facebook/adLibrary/company/ads', authMiddleware, async (req, res) =
 
     const safePageId = pageId ? pageId.trim() : null;
     const safeCompanyName = companyName ? companyName.trim() : null;
-    const safeCursor = cursor ? cursor.trim() : null;
 
-    // 2. Pre-flight Credit Check (Charge 1 credit)
-    const costToUser = 1;
+    // Explicitly build the log parameters so un-parseable body artifacts don't crash Supabase
+    const logParams = { 
+        pageId: safePageId, companyName: safeCompanyName, country, status, media_type, 
+        language, sort_by, start_date, end_date, cursor, trim 
+    };
+
+    const costToUser = 2; // Doubled to 2 credits for the 50% margin
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
             success: false, 
-            error: `403 Forbidden: Insufficient credits. This request requires ${costToUser} credit.` 
+            error: `403 Forbidden: Insufficient credits. This request requires ${costToUser} credits.` 
         });
     }
 
-    // 3. Cache Key Construction
-    const cacheCursor = safeCursor ? Buffer.from(safeCursor).toString('base64').substring(0, 15) : '0';
-    const cacheParams = [
-        safePageId, safeCompanyName, country, status, media_type, 
-        language, sort_by, start_date, end_date
-    ].filter(Boolean).map(p => Buffer.from(p.trim()).toString('base64').substring(0, 8)).join('_');
-    
-
     try {
-
-
-        // 5. Build Upstream Request
-        const upstreamApiKey = process.env.SCRAPE_CREATORS_API_KEY;
-        if (!upstreamApiKey) {
-            throw new Error("Missing SCRAPE_CREATORS_API_KEY in environment configuration");
+        const apiKey = process.env.SCRAPE_CREATORS_API_KEY;
+        if (!apiKey) {
+            throw new Error("Missing extraction API Key in environment configuration");
         }
 
         const upstreamUrl = new URL('https://api.scrapecreators.com/v1/facebook/adLibrary/company/ads');
@@ -8282,13 +8282,12 @@ app.all('/v1/facebook/adLibrary/company/ads', authMiddleware, async (req, res) =
         const requestOptions = {
             method: req.method,
             headers: { 
-                'x-api-key': upstreamApiKey,
+                'x-api-key': apiKey,
                 'Content-Type': 'application/json'
             },
-            signal: AbortSignal.timeout(30000) // 30s timeout for heavy pagination indexing
+            signal: AbortSignal.timeout(30000) 
         };
 
-        // Format parameters based on request method
         if (req.method === 'GET') {
             Object.keys(params).forEach(key => {
                 if (params[key]) upstreamUrl.searchParams.append(key, params[key]);
@@ -8297,25 +8296,21 @@ app.all('/v1/facebook/adLibrary/company/ads', authMiddleware, async (req, res) =
             requestOptions.body = JSON.stringify(params);
         }
 
-        // 6. Execute Upstream Request
         const response = await fetch(upstreamUrl.toString(), requestOptions);
-        const upstreamPayload = await response.json();
+        const payload = await response.json();
 
-        // 7. Handle Upstream Errors 
-        if (!response.ok || !upstreamPayload.success) {
+        if (!response.ok || !payload.success) {
             throw new Error(
-                `Upstream API Error: ${upstreamPayload.error || response.statusText || 'Failed to fetch company ads'}`
+                `Server Error: ${payload.error || response.statusText || 'Failed to fetch company ads'}`
             );
         }
 
-        // 8. Payload Construction & Strict Mapping
         const responseData = {
-            has_more: !!upstreamPayload.cursor,
-            cursor: upstreamPayload.cursor || null,
-            ads: Array.isArray(upstreamPayload.results) ? upstreamPayload.results.map(ad => {
+            has_more: !!payload.cursor,
+            cursor: payload.cursor || null,
+            ads: Array.isArray(payload.results) ? payload.results.map(ad => {
                 const snap = ad.snapshot || {};
 
-                // Safely parse body text across different Facebook object structures
                 let bodyText = "";
                 if (typeof snap.body === 'string') {
                     bodyText = snap.body.replace(/<br\s*\/?>/gi, '\n');
@@ -8325,12 +8320,10 @@ app.all('/v1/facebook/adLibrary/company/ads', authMiddleware, async (req, res) =
                     bodyText = snap.body.markup.replace(/<br\s*\/?>/gi, '\n');
                 }
 
-                // Map standard images
                 const adImages = Array.isArray(snap.images) 
                     ? snap.images.map(img => img.resized_image_url || img.original_image_url).filter(Boolean) 
                     : [];
                 
-                // Map carousel cards if present
                 const carousel = Array.isArray(snap.cards) ? snap.cards.map(c => ({
                     title: typeof c.title === 'string' ? c.title : null,
                     image: c.resized_image_url || c.original_image_url || null,
@@ -8366,11 +8359,12 @@ app.all('/v1/facebook/adLibrary/company/ads', authMiddleware, async (req, res) =
             }) : []
         };
 
-        // 9. Billing Deduction & Caching
-        const actualCost = upstreamPayload.credits_charged *2 === 0 ? 0 : costToUser * 2;
+        const actualCost = (payload.credits_charged || 0) === 0 ? 0 : costToUser;
         req.user.credits -= actualCost;
 
-        // 10. Return Response
+        // [NEW] LOG SUCCESS
+        await logApiRequest(req, '/v1/facebook/adLibrary/company/ads', actualCost, logParams, 200);
+
         return res.status(200).json({
             success: true,
             credits_remaining: req.user.credits,
@@ -8388,11 +8382,14 @@ app.all('/v1/facebook/adLibrary/company/ads', authMiddleware, async (req, res) =
         if (typeof notifyFailure === 'function') {
             notifyFailure({ 
                 endpoint: '/v1/facebook/adLibrary/company/ads', 
-                params: params, 
+                params: logParams, 
                 statusCode: statusCode, 
                 errorMsg: finalErrorMsg 
             });
         }
+
+        // [NEW] LOG FAILURE (Cost = 0)
+        await logApiRequest(req, '/v1/facebook/adLibrary/company/ads', 0, logParams, statusCode);
 
         return res.status(statusCode).json({ 
             success: false, 
