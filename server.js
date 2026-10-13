@@ -101,7 +101,7 @@ app.post('/api/webhook/dodo', express.raw({ type: 'application/json' }), async (
             const payment = event.data;
             const userId = payment.metadata?.user_id;
             const tier = payment.metadata?.tier;
-            const creditsToAdd = tier === 'starter' ? 7500 : tier === 'freelance' ? 25000 : tier === 'business' ? 400000 : 0;
+            const creditsToAdd = tier === 'starter' ? 5500 : tier === 'freelance' ? 20000 : tier === 'business' ? 350000 : 0;
             if (userId && creditsToAdd > 0) {
                 const { data: profile } = await supabase.from('profiles').select('credits').eq('id', userId).single();
                 if (profile) await supabase.from('profiles').update({ credits: profile.credits + creditsToAdd }).eq('id', userId);
@@ -1470,138 +1470,11 @@ app.get('/v1/instagram/user/highlights', authMiddleware, async (req, res) => {
 });
 
 
-// --- ENDPOINT 8: INSTAGRAM SINGLE POST ---
-app.get('/v1/instagram/post', authMiddleware, async (req, res) => {
-    const { shortcode, region, trim, download_media, cache_max_age } = req.query;
 
-    if (!shortcode) {
-        return res.status(400).json({ success: false, error: "400 Bad Request: Missing required parameter 'shortcode'" });
-    }
-
-    const isDownloadRequested = String(download_media).toLowerCase() === 'true';
-    const maxExpectedCost = isDownloadRequested ? 10 : 1;
-    
-    if (req.user.credits < maxExpectedCost) {
-        return res.status(403).json({
-            success: false,
-            error: `403 Forbidden: Insufficient credits. This request requires up to ${maxExpectedCost} credits.`
-        });
-    }
-
-    const targetUrl = shortcode.startsWith('http')
-        ? shortcode
-        : `https://www.instagram.com/p/${shortcode}/`;
-
-    let primaryError;
-    
-    // --- PRIMARY ENGINE ---
-    try {
-        const primaryApiKey = process.env.GETANYAPI_KEY;
-        if (!primaryApiKey) throw new Error('Missing primary API key in environment');
-
-        const response = await fetch('https://api.getanyapi.com/v1/run/instagram.post', {
-            method: 'POST',
-            headers: {
-                Authorization: `Bearer ${primaryApiKey}`,
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ url: targetUrl, ...(isDownloadRequested ? { hostVideo: true } : {}) }),
-            signal: AbortSignal.timeout(20000)
-        });
-        
-        const payload = await response.json();
-        
-        if (!response.ok) {
-            const error = new Error(`Extraction Error: ${payload.error || response.statusText || 'Failed to fetch Instagram post'}`);
-            error.statusCode = response.status;
-            throw error;
-        }
-
-        const actualCreditsCharged = isDownloadRequested ? 10 : 1;
-        req.user.credits -= actualCreditsCharged;
-
-        // [NEW] LOG SUCCESS
-        await logApiRequest(req, '/v1/instagram/post', actualCreditsCharged, { shortcode, region, trim, download_media, cache_max_age }, 200);
-
-        return res.status(200).json({
-            success: true,
-            credits_remaining: req.user.credits,
-            credits_charged: actualCreditsCharged,
-            status: 'success',
-            data: payload.output?.data || null
-        });
-    } catch (error) {
-        primaryError = error;
-        console.error('[SignalQub] Primary extraction engine failed:', error.message);
-    }
-
-    // --- FALLBACK ENGINE ---
-    try {
-        const fallbackUrl = new URL('https://api.scrapecreators.com/v1/instagram/post');
-        fallbackUrl.searchParams.set('url', targetUrl);
-        if (region) fallbackUrl.searchParams.set('region', region);
-        if (trim) fallbackUrl.searchParams.set('trim', trim);
-        if (download_media) fallbackUrl.searchParams.set('download_media', download_media);
-        if (cache_max_age) fallbackUrl.searchParams.set('cache_max_age', cache_max_age);
-
-        const response = await fetch(fallbackUrl, {
-            method: 'GET',
-            headers: {
-                'x-api-key': process.env.SCRAPE_CREATORS_API_KEY,
-                'Content-Type': 'application/json'
-            },
-            signal: AbortSignal.timeout(20000)
-        });
-        
-        const payload = await response.json();
-        
-        if (!response.ok || !payload.success) {
-            const error = new Error(payload.detail || payload.message || payload.error || 'Failed to fetch Instagram post');
-            error.statusCode = response.status === 200 ? 500 : response.status;
-            throw error;
-        }
-
-        const actualCreditsCharged = payload.credits_charged || 1;
-        req.user.credits -= actualCreditsCharged;
-
-        // [NEW] LOG SUCCESS
-        await logApiRequest(req, '/v1/instagram/post', actualCreditsCharged, { shortcode, region, trim, download_media, cache_max_age }, 200);
-
-        return res.status(200).json({
-            success: true,
-            credits_remaining: req.user.credits,
-            credits_charged: actualCreditsCharged,
-            status: 'success',
-            data: payload.data
-        });
-    } catch (fallbackError) {
-        const isTimeout = fallbackError.name === 'TimeoutError' || primaryError?.name === 'TimeoutError';
-        const statusCode = isTimeout ? 504 : (fallbackError.statusCode || 500);
-        
-        // White-labeled
-        const errorMessage = isTimeout
-            ? '504 Gateway Timeout: All extraction servers took too long to respond.'
-            : `500 Internal Server Error: The extraction failed. (${fallbackError.message})`;
-
-        if (typeof notifyFailure === 'function') {
-            notifyFailure({
-                endpoint: '/v1/instagram/post',
-                params: { shortcode, region, trim, download_media, cache_max_age },
-                statusCode,
-                errorMsg: `Primary Engine: ${primaryError?.message || 'unknown'} | Fallback Engine: ${fallbackError.message}`
-            });
-        }
-
-        // [NEW] LOG FAILURE (Cost = 0)
-        await logApiRequest(req, '/v1/instagram/post', 0, { shortcode, region, trim, download_media, cache_max_age }, statusCode);
-
-        return res.status(statusCode).json({ success: false, error: errorMessage });
-    }
-});
 
 
 // --- ENDPOINT 9: INSTAGRAM POST (LEGACY) ---
-app.get('/v1/instagram/post-legacy', authMiddleware, async (req, res) => {
+app.get('/v1/instagram/post', authMiddleware, async (req, res) => {
     const { shortcode, region, trim, download_media, cache_max_age } = req.query;
 
     if (!shortcode) {
