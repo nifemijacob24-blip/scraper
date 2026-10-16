@@ -9175,9 +9175,16 @@ app.get('/v1/gmaps/reviews', authMiddleware, async (req, res) => {
 
     const cleanUrl = url.trim();
     const sortParam = sort.toLowerCase().trim();
-    const parsedLimit = parseInt(limit, 10);
+    
+    // Parse limit, fallback to 50 if invalid, and ensure it's at least 1
+    let parsedLimit = parseInt(limit, 10);
+    if (isNaN(parsedLimit) || parsedLimit < 1) {
+        parsedLimit = 50;
+    }
 
-    const costToUser = 2; 
+    // [NEW] Calculate cost: 1 credit per 50 reviews (Math.ceil rounds up to the next whole number)
+    const costToUser = Math.ceil(parsedLimit / 50); 
+    
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
             success: false, 
@@ -9198,7 +9205,7 @@ app.get('/v1/gmaps/reviews', authMiddleware, async (req, res) => {
 
         req.user.credits -= costToUser;
 
-        // [NEW] LOG SUCCESS
+        // LOG SUCCESS
         await logApiRequest(req, '/v1/gmaps/reviews', costToUser, { url: cleanUrl, limit: parsedLimit, sort: sortParam }, 200);
 
         return res.status(200).json({
@@ -9218,7 +9225,7 @@ app.get('/v1/gmaps/reviews', authMiddleware, async (req, res) => {
             });
         }
 
-        // [NEW] LOG FAILURE (Cost = 0)
+        // LOG FAILURE (Cost = 0)
         await logApiRequest(req, '/v1/gmaps/reviews', 0, { url: cleanUrl, limit: parsedLimit, sort: sortParam }, 500);
 
         return res.status(500).json({ 
