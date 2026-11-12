@@ -19,6 +19,8 @@ const { scrapeSubredditDetails } = require('./src/scrapers/reddit');
 const { scrapeSubredditPosts } = require('./src/scrapers/reddit');
 const { scrapeSubredditSearch } = require('./src/scrapers/reddit');
 const { notifyFailure } = require('./src/utils/notifier');
+const indeedRoutes = require('./src/indeed/indeed-routes');
+const linkedinRoutes = require('./src/linkedin/linkedin-routes');
 
 // --- 1. INITIALIZE SUPABASE ---
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -264,6 +266,8 @@ async function authMiddleware(req, res, next) {
 app.use('/v1', authMiddleware);
 // Apply the global cache middleware to all routes under '/v1'
 app.use('/v1', universalCacheMiddleware);
+app.use('/v1/indeed', indeedRoutes(logApiRequest));
+app.use('/v1/linkedin', linkedinRoutes(logApiRequest));
 
 // --- EXPRESS ROUTE: REDDIT SUBREDDIT DETAILS ---
 app.get('/v1/reddit/subreddit/details', authMiddleware, async (req, res) => {
@@ -9164,7 +9168,7 @@ const { scrapeGoogleMapsSearch, scrapeGoogleMapsReviews } = require('./src/scrap
 
 // --- EXPRESS ROUTE: GOOGLE MAPS REVIEWS ---
 app.get('/v1/gmaps/reviews', authMiddleware, async (req, res) => {
-    const { url, limit = 50, sort = 'newest' } = req.query;
+    const { url, limit = 10, sort = 'newest' } = req.query;
 
     if (!url || typeof url !== 'string' || !url.includes('google.com/maps')) {
         return res.status(400).json({ 
@@ -9179,11 +9183,11 @@ app.get('/v1/gmaps/reviews', authMiddleware, async (req, res) => {
     // Parse limit, fallback to 50 if invalid, and ensure it's at least 1
     let parsedLimit = parseInt(limit, 10);
     if (isNaN(parsedLimit) || parsedLimit < 1) {
-        parsedLimit = 50;
+        parsedLimit = 10;
     }
 
     // [NEW] Calculate cost: 1 credit per 50 reviews (Math.ceil rounds up to the next whole number)
-    const costToUser = Math.ceil(parsedLimit / 50); 
+    const costToUser = Math.ceil(parsedLimit / 10); 
     
     if (req.user.credits < costToUser) {
         return res.status(403).json({ 
@@ -9300,7 +9304,7 @@ app.get('/v1/gmaps/search', authMiddleware, async (req, res) => {
             }))
         };
 
-        const actualCost = Math.max(1, Math.ceil(items.length / 20));
+        const actualCost = Math.max(1, Math.ceil(items.length / 10));
         req.user.credits -= actualCost;
 
         // [NEW] LOG SUCCESS

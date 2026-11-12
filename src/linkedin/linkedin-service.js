@@ -1,0 +1,50 @@
+const { scrapeLinkedIn } = require('./brightdata-client');
+
+function getRecords(payload) {
+    if (Array.isArray(payload)) return payload;
+    if (Array.isArray(payload?.data)) return payload.data;
+    if (Array.isArray(payload?.results)) return payload.results;
+    if (Array.isArray(payload?.records)) return payload.records;
+    return payload ? [payload] : [];
+}
+
+function normalizeJob(job) {
+    return {
+        id: job.job_id || job.job_posting_id || job.id || null,
+        title: job.job_title || job.title || null,
+        company: job.company_name || job.company || null,
+        companyUrl: job.company_url || null,
+        location: job.job_location || job.location || null,
+        description: job.job_summary || job.description || null,
+        employmentType: job.employment_type || null,
+        seniorityLevel: job.seniority_level || null,
+        workplaceType: job.workplace_type || null,
+        salary: job.salary || null,
+        postedAt: job.date_posted || job.posted_at || null,
+        applyUrl: job.apply_url || job.job_url || job.url || null,
+        source: 'linkedin',
+        raw: job
+    };
+}
+
+async function searchJobs(params) {
+    const limit = Math.min(Math.max(Number(params.limit) || 25, 1), 100);
+    const input = {
+        location: params.location,
+        keyword: params.keyword,
+        country: params.country || '',
+        time_range: params.time_range || '',
+        company: params.company || '',
+        location_radius: params.location_radius || '',
+        selective_search: params.selective_search || '',
+        jobs_to_not_include: params.jobs_to_not_include || ''
+    };
+
+    const payload = await scrapeLinkedIn(input, limit);
+    return {
+        jobs: getRecords(payload).map(normalizeJob),
+        nextCursor: payload?.next_cursor || payload?.cursor || null
+    };
+}
+
+module.exports = { searchJobs };
