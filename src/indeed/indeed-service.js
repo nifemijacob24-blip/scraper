@@ -83,6 +83,12 @@ function buildSearchInput({ query, location, locality, fromage, radius, sort, jo
         posted_by: '',
         location_radius: radius ? String(radius) : ''
     };
+
+    console.log('[Indeed] Bright Data search input:', JSON.stringify({
+        datasetId: process.env.BRIGHTDATA_INDEED_SEARCH_DATASET_ID || DATASET_ID,
+        input
+    }));
+
     return input;
 }
 

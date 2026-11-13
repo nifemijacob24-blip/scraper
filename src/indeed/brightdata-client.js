@@ -45,7 +45,12 @@ async function scrapeIndeed(input, datasetId, options = {}) {
     }
 
     if (!response.ok) {
-        const upstreamMessage = payload?.message || payload?.error || response.statusText;
+        const upstreamMessage = [
+            payload?.message,
+            payload?.error,
+            payload?.detail,
+            Array.isArray(payload?.errors) ? payload.errors.map(error => error.message || error).join('; ') : null
+        ].filter(Boolean).join(' | ') || response.statusText;
         throw new Error(`Bright Data request failed (${response.status}): ${upstreamMessage}`);
     }
 

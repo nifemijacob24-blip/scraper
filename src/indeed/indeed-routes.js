@@ -5,7 +5,7 @@ function createIndeedRouter(logApiRequest) {
     const router = express.Router();
 
 router.get('/jobs/search', async (req, res) => {
-    const { query, location, cursor, locality, fromage, radius, sort, job_type, country, limit } = req.query;
+    const { query, location, locality, fromage, radius, country, limit } = req.query;
     if (!query || typeof query !== 'string' || !query.trim()) {
         return res.status(400).json({ success: false, error: "Missing required parameter 'query'." });
     }
@@ -19,12 +19,9 @@ router.get('/jobs/search', async (req, res) => {
         query: query.trim(),
         location: typeof location === 'string' ? location.trim() : undefined,
         country: typeof country === 'string' ? country.trim() : undefined,
-        cursor,
         locality,
         fromage,
         radius,
-        sort,
-        job_type,
         limit
     };
 
