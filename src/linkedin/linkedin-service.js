@@ -28,7 +28,7 @@ function normalizeJob(job) {
 }
 
 async function searchJobs(params) {
-    const limit = Math.min(Math.max(Number(params.limit) || 25, 1), 100);
+    const limit = Math.min(Math.max(Number(params.limit) || 10, 1), 100);
     const input = {
         location: params.location,
         keyword: params.keyword,
@@ -41,9 +41,19 @@ async function searchJobs(params) {
     };
 
     const payload = await scrapeLinkedIn(input, limit);
+    if (payload?.snapshot_id && !getRecords(payload).length) {
+        return {
+            jobs: [],
+            nextCursor: null,
+            snapshotId: payload.snapshot_id,
+            status: 'pending'
+        };
+    }
+
     return {
         jobs: getRecords(payload).map(normalizeJob),
-        nextCursor: payload?.next_cursor || payload?.cursor || null
+        nextCursor: payload?.next_cursor || payload?.cursor || null,
+        status: 'complete'
     };
 }
 

@@ -15,18 +15,27 @@ async function scrapeLinkedIn(input, limitPerInput) {
     url.searchParams.set('type', 'discover_new');
     url.searchParams.set('discover_by', 'keyword');
 
-    const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-            Authorization: ['Bearer', token].join(' '),
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-            input: [input],
-            limit_per_input: limitPerInput
-        }),
-        signal: AbortSignal.timeout(60000)
-    });
+    const timeoutMs = Number(process.env.BRIGHTDATA_LINKEDIN_TIMEOUT_MS) || 90000;
+    let response;
+    try {
+        response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                Authorization: ['Bearer', token].join(' '),
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                input: [input],
+                limit_per_input: limitPerInput
+            }),
+            signal: AbortSignal.timeout(timeoutMs)
+        });
+    } catch (error) {
+        if (error.name === 'AbortError' || error.name === 'TimeoutError') {
+            throw new Error(`Bright Data LinkedIn request timed out after ${timeoutMs}ms. Try a smaller limit or narrower search.`);
+        }
+        throw error;
+    }
 
     const text = await response.text();
     let payload;

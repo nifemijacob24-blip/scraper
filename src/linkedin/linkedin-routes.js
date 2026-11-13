@@ -53,6 +53,18 @@ function createLinkedInRouter(logApiRequest) {
 
         try {
             const result = await searchJobs(params);
+            if (result.status === 'pending') {
+                await logApiRequest(req, '/v1/linkedin/jobs/search', 0, params, 202);
+                return res.status(202).json({
+                    success: true,
+                    status: 'pending',
+                    message: 'Bright Data is still collecting LinkedIn jobs. Poll the snapshot in Bright Data or retry with a narrower search.',
+                    snapshot_id: result.snapshotId,
+                    credits_charged: 0,
+                    credits_remaining: req.user.credits
+                });
+            }
+
             req.user.credits -= cost;
             await logApiRequest(req, '/v1/linkedin/jobs/search', cost, params, 200);
 

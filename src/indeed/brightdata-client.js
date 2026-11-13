@@ -1,6 +1,6 @@
 const BRIGHTDATA_API_URL = 'https://api.brightdata.com/datasets/v3/scrape';
 
-async function scrapeIndeed(input, datasetId, limitPerInput) {
+async function scrapeIndeed(input, datasetId, limitPerInput, options = {}) {
     const rawToken = process.env.BRIGHTDATA_API_TOKEN;
     if (!rawToken || !rawToken.trim()) {
         throw new Error('Missing BRIGHTDATA_API_TOKEN in environment configuration');
@@ -15,6 +15,10 @@ async function scrapeIndeed(input, datasetId, limitPerInput) {
     url.searchParams.set('dataset_id', datasetId);
     url.searchParams.set('notify', 'false');
     url.searchParams.set('include_errors', 'true');
+    if (options.discoverBy) {
+        url.searchParams.set('type', 'discover_new');
+        url.searchParams.set('discover_by', options.discoverBy);
+    }
 
     const response = await fetch(url, {
         method: 'POST',

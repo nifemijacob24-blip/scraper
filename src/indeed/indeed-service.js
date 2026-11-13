@@ -58,7 +58,8 @@ async function searchJobs(params) {
     const payload = await scrapeIndeed(
         buildSearchInput(params),
         process.env.BRIGHTDATA_INDEED_SEARCH_DATASET_ID || DATASET_ID,
-        limit
+        limit,
+        { discoverBy: 'keyword' }
     );
 
     return {
