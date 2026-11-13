@@ -8,6 +8,26 @@ function getRecords(payload) {
     return payload ? [payload] : [];
 }
 
+function getPendingSnapshot(payload) {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+        return null;
+    }
+
+    const status = String(payload.status || '').toLowerCase();
+    const message = String(payload.message || '').toLowerCase();
+    const isPendingStatus = ['closing', 'pending', 'running', 'processing'].includes(status);
+    const isNotReadyMessage = message.includes('not ready') || message.includes('try again');
+
+    if (payload.snapshot_id && (isPendingStatus || isNotReadyMessage)) {
+        return {
+            snapshotId: payload.snapshot_id,
+            message: payload.message || 'Snapshot is still being processed'
+        };
+    }
+
+    return null;
+}
+
 function normalizeJob(job) {
     return {
         id: job.job_id || job.job_posting_id || job.id || null,
@@ -28,7 +48,7 @@ function normalizeJob(job) {
 }
 
 async function searchJobs(params) {
-    const limit = Math.min(Math.max(Number(params.limit) || 10, 1), 100);
+    const limit = Math.min(Math.max(Number(params.limit) || 5, 1), 25);
     const input = {
         location: params.location,
         keyword: params.keyword,
@@ -41,6 +61,17 @@ async function searchJobs(params) {
     };
 
     const payload = await scrapeLinkedIn(input, limit);
+    const pendingSnapshot = getPendingSnapshot(payload);
+    if (pendingSnapshot) {
+        return {
+            jobs: [],
+            nextCursor: null,
+            snapshotId: pendingSnapshot.snapshotId,
+            status: 'pending',
+            message: pendingSnapshot.message
+        };
+    }
+
     if (payload?.snapshot_id && !getRecords(payload).length) {
         return {
             jobs: [],

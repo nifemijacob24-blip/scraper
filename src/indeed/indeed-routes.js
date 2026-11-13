@@ -5,7 +5,7 @@ function createIndeedRouter(logApiRequest) {
     const router = express.Router();
 
 router.get('/jobs/search', async (req, res) => {
-    const { query, location, cursor, locality, fromage, radius, sort, job_type, limit } = req.query;
+    const { query, location, cursor, locality, fromage, radius, sort, job_type, country, limit } = req.query;
     if (!query || typeof query !== 'string' || !query.trim()) {
         return res.status(400).json({ success: false, error: "Missing required parameter 'query'." });
     }
@@ -18,6 +18,7 @@ router.get('/jobs/search', async (req, res) => {
     const params = {
         query: query.trim(),
         location: typeof location === 'string' ? location.trim() : undefined,
+        country: typeof country === 'string' ? country.trim() : undefined,
         cursor,
         locality,
         fromage,
@@ -29,6 +30,18 @@ router.get('/jobs/search', async (req, res) => {
 
     try {
         const result = await searchJobs(params);
+        if (result.status === 'pending') {
+            await logApiRequest(req, '/v1/indeed/jobs/search', 0, params, 202);
+            return res.status(202).json({
+                success: true,
+                status: 'pending',
+                message: result.message || 'Bright Data is still collecting Indeed jobs. Retry shortly.',
+                snapshot_id: result.snapshotId,
+                credits_charged: 0,
+                credits_remaining: req.user.credits
+            });
+        }
+
         req.user.credits -= cost;
         await logApiRequest(req, '/v1/indeed/jobs/search', cost, params, 200);
         return res.json({

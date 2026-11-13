@@ -28,7 +28,28 @@ function normalizeJob(job) {
     };
 }
 
-function buildSearchInput({ query, location, locality, fromage, radius, sort, job_type }) {
+function getPendingSnapshot(payload) {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+        return null;
+    }
+
+    const status = String(payload.status || '').toLowerCase();
+    const message = String(payload.message || '').toLowerCase();
+    if (payload.snapshot_id && (
+        ['closing', 'pending', 'running', 'processing'].includes(status) ||
+        message.includes('not ready') ||
+        message.includes('try again')
+    )) {
+        return {
+            snapshotId: payload.snapshot_id,
+            message: payload.message || 'Snapshot is still being processed'
+        };
+    }
+
+    return null;
+}
+
+function buildSearchInput({ query, location, locality, fromage, radius, sort, job_type, country }) {
     const mode = process.env.BRIGHTDATA_INDEED_SEARCH_INPUT_MODE || 'keyword';
     if (mode === 'url') {
         const searchUrl = new URL('https://www.indeed.com/jobs');
@@ -41,26 +62,47 @@ function buildSearchInput({ query, location, locality, fromage, radius, sort, jo
         return { url: searchUrl.toString() };
     }
 
+    const normalizedCountry = (country || 'US').trim().toUpperCase();
+    const domain = locality
+        ? (locality.includes('.') ? locality : `${locality}.indeed.com`)
+        : (normalizedCountry === 'FR' ? 'fr.indeed.com' : 'indeed.com');
+    const datePosted = {
+        '1': 'Last 24 hours',
+        '3': 'Last 3 days',
+        '7': 'Last 7 days',
+        '14': 'Last 14 days',
+        '30': 'Last 30 days'
+    }[String(fromage || '')] || fromage || '';
+
     const input = {
-        keyword: query,
-        ...(location ? { location } : {}),
-        ...(locality ? { locality } : {}),
-        ...(fromage ? { fromage } : {}),
-        ...(radius ? { radius: Number(radius) } : {}),
-        ...(sort ? { sort } : {}),
-        ...(job_type ? { job_type } : {})
+        country: normalizedCountry,
+        domain,
+        keyword_search: query,
+        location: location || '',
+        date_posted: datePosted,
+        posted_by: '',
+        location_radius: radius ? String(radius) : ''
     };
     return input;
 }
 
 async function searchJobs(params) {
-    const limit = Math.min(Math.max(Number(params.limit) || 25, 1), 100);
+    const usesKeywordDiscovery = (process.env.BRIGHTDATA_INDEED_SEARCH_INPUT_MODE || 'keyword') !== 'url';
     const payload = await scrapeIndeed(
         buildSearchInput(params),
         process.env.BRIGHTDATA_INDEED_SEARCH_DATASET_ID || DATASET_ID,
-        limit,
-        { discoverBy: 'keyword' }
+        usesKeywordDiscovery ? { discoverBy: 'keyword' } : {}
     );
+    const pendingSnapshot = getPendingSnapshot(payload);
+    if (pendingSnapshot) {
+        return {
+            jobs: [],
+            nextCursor: null,
+            snapshotId: pendingSnapshot.snapshotId,
+            status: 'pending',
+            message: pendingSnapshot.message
+        };
+    }
 
     return {
         jobs: firstArray(payload).map(normalizeJob),
@@ -74,8 +116,7 @@ async function getJobDetails(jobId, locality) {
     jobUrl.searchParams.set('jk', jobId);
     const payload = await scrapeIndeed(
         { url: jobUrl.toString() },
-        process.env.BRIGHTDATA_INDEED_DETAILS_DATASET_ID || DATASET_ID,
-        1
+        process.env.BRIGHTDATA_INDEED_DETAILS_DATASET_ID || DATASET_ID
     );
     const job = firstArray(payload)[0];
     return job ? normalizeJob(job) : null;

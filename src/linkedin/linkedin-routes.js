@@ -58,7 +58,7 @@ function createLinkedInRouter(logApiRequest) {
                 return res.status(202).json({
                     success: true,
                     status: 'pending',
-                    message: 'Bright Data is still collecting LinkedIn jobs. Poll the snapshot in Bright Data or retry with a narrower search.',
+                    message: result.message || 'Bright Data is still collecting LinkedIn jobs. Poll the snapshot in Bright Data or retry with a narrower search.',
                     snapshot_id: result.snapshotId,
                     credits_charged: 0,
                     credits_remaining: req.user.credits
