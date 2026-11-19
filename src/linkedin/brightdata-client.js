@@ -26,7 +26,7 @@ async function lurkRequest(path, params) {
         });
     } catch (error) {
         if (error.name === 'AbortError' || error.name === 'TimeoutError') {
-            throw new Error(`LurkAPI LinkedIn request timed out after ${timeoutMs}ms.`);
+            throw new Error(`LinkedIn request timed out after ${timeoutMs}ms.`);
         }
         throw error;
     }
@@ -37,13 +37,19 @@ async function lurkRequest(path, params) {
         payload = text ? JSON.parse(text) : null;
     } catch {
         const detail = text.trim().replace(/\s+/g, ' ').slice(0, 200);
-        throw new Error(`LurkAPI returned invalid JSON (${response.status}): ${detail || 'empty response'}`);
+        throw new Error(`Upstream returned invalid JSON (${response.status}): ${detail || 'empty response'}`);
     }
 
     if (!response.ok || payload?.success === false) {
-        const upstreamMessage = payload?.error || payload?.message || response.statusText;
-        const code = payload?.code ? ` ${payload.code}` : '';
-        const error = new Error(`LurkAPI request failed (${response.status})${code}: ${upstreamMessage}`);
+        let upstreamMessage;
+        if (response.status === 429) {
+            upstreamMessage = 'Rate limit exceeded';
+        } else if ([502, 503, 504].includes(response.status)) {
+            upstreamMessage = 'Upstream LinkedIn service temporarily unavailable';
+        } else {
+            upstreamMessage = payload?.error || payload?.message || 'LinkedIn job service request failed';
+        }
+        const error = new Error(upstreamMessage);
         error.status = response.ok ? 502 : response.status;
         error.code = payload?.code;
         throw error;

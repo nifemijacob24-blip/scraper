@@ -67,7 +67,11 @@ function createLinkedInRouter(logApiRequest) {
             return res.status(status).json({
                 success: false,
                 code: error.code,
-                error: error.message
+                error: status === 429
+                    ? 'Rate limit exceeded'
+                    : (status === 502
+                        ? 'Upstream LinkedIn job data temporarily unavailable'
+                        : error.message)
             });
         }
     });
@@ -107,7 +111,11 @@ function createLinkedInRouter(logApiRequest) {
             return res.status(status).json({
                 success: false,
                 code: error.code,
-                error: error.message
+                error: status === 429
+                    ? 'Rate limit exceeded'
+                    : (status === 502
+                        ? 'Upstream LinkedIn job details temporarily unavailable'
+                        : error.message)
             });
         }
     });
