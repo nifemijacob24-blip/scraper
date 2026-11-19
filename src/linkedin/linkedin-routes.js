@@ -1,33 +1,29 @@
 const express = require('express');
-const { searchJobs } = require('./linkedin-service');
+const { searchJobs, getJobDetails } = require('./linkedin-service');
 
 function createLinkedInRouter(logApiRequest) {
     const router = express.Router();
 
     router.get('/jobs/search', async (req, res) => {
         const {
-            location,
+            query,
             keyword,
-            country,
-            time_range,
-            company,
-            location_radius,
-            selective_search,
-            jobs_to_not_include,
-            limit
+            location,
+            datePosted,
+            date_posted,
+            companyId,
+            company_id,
+            cursor
         } = req.query;
 
-        if (!keyword || typeof keyword !== 'string' || !keyword.trim()) {
-            return res.status(400).json({
-                success: false,
-                error: "Missing required parameter 'keyword'."
-            });
-        }
+        const searchQuery = typeof query === 'string'
+            ? query.trim()
+            : (typeof keyword === 'string' ? keyword.trim() : '');
 
-        if (!location || typeof location !== 'string' || !location.trim()) {
+        if (!searchQuery) {
             return res.status(400).json({
                 success: false,
-                error: "Missing required parameter 'location'."
+                error: "Missing required parameter 'query'."
             });
         }
 
@@ -40,31 +36,19 @@ function createLinkedInRouter(logApiRequest) {
         }
 
         const params = {
-            location: location.trim(),
-            keyword: keyword.trim(),
-            country,
-            time_range,
-            company,
-            location_radius,
-            selective_search,
-            jobs_to_not_include,
-            limit
+            query: searchQuery,
+            location: typeof location === 'string' ? location.trim() : undefined,
+            datePosted: typeof datePosted === 'string'
+                ? datePosted.trim()
+                : (typeof date_posted === 'string' ? date_posted.trim() : undefined),
+            companyId: typeof companyId === 'string'
+                ? companyId.trim()
+                : (typeof company_id === 'string' ? company_id.trim() : undefined),
+            cursor: typeof cursor === 'string' ? cursor.trim() : undefined
         };
 
         try {
             const result = await searchJobs(params);
-            if (result.status === 'pending') {
-                await logApiRequest(req, '/v1/linkedin/jobs/search', 0, params, 202);
-                return res.status(202).json({
-                    success: true,
-                    status: 'pending',
-                    message: result.message || 'Bright Data is still collecting LinkedIn jobs. Poll the snapshot in Bright Data or retry with a narrower search.',
-                    snapshot_id: result.snapshotId,
-                    credits_charged: 0,
-                    credits_remaining: req.user.credits
-                });
-            }
-
             req.user.credits -= cost;
             await logApiRequest(req, '/v1/linkedin/jobs/search', cost, params, 200);
 
@@ -72,15 +56,57 @@ function createLinkedInRouter(logApiRequest) {
                 success: true,
                 credits_charged: cost,
                 credits_remaining: req.user.credits,
-                keyword: params.keyword,
-                location: params.location,
+                query: params.query,
+                location: params.location || null,
                 ...result
             });
         } catch (error) {
             console.error('[LinkedIn jobs search]', error);
-            await logApiRequest(req, '/v1/linkedin/jobs/search', 0, params, 502);
-            return res.status(502).json({
+            await logApiRequest(req, '/v1/linkedin/jobs/search', 0, params, error.status || 502);
+            const status = error.status >= 400 && error.status < 600 ? error.status : 502;
+            return res.status(status).json({
                 success: false,
+                code: error.code,
+                error: error.message
+            });
+        }
+    });
+
+    router.get('/job', async (req, res) => {
+        const url = typeof req.query.url === 'string' ? req.query.url.trim() : '';
+        if (!url) {
+            return res.status(400).json({
+                success: false,
+                error: "Missing required parameter 'url'."
+            });
+        }
+
+        const cost = 1;
+        if (req.user.credits < cost) {
+            return res.status(403).json({
+                success: false,
+                error: `Insufficient credits. This request requires ${cost} credit.`
+            });
+        }
+
+        const params = { url };
+        try {
+            const job = await getJobDetails(url);
+            req.user.credits -= cost;
+            await logApiRequest(req, '/v1/linkedin/job', cost, params, 200);
+            return res.json({
+                success: true,
+                credits_charged: cost,
+                credits_remaining: req.user.credits,
+                job
+            });
+        } catch (error) {
+            console.error('[LinkedIn job details]', error);
+            await logApiRequest(req, '/v1/linkedin/job', 0, params, error.status || 502);
+            const status = error.status >= 400 && error.status < 600 ? error.status : 502;
+            return res.status(status).json({
+                success: false,
+                code: error.code,
                 error: error.message
             });
         }

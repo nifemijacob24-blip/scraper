@@ -1,38 +1,32 @@
-const BRIGHTDATA_API_URL = 'https://api.brightdata.com/datasets/v3/scrape';
+const LURKAPI_BASE_URL = 'https://api.lurkapi.com/v1/linkedin';
 
-async function scrapeLinkedIn(input, limitPerInput) {
-    const rawToken = process.env.BRIGHTDATA_API_TOKEN;
+async function lurkRequest(path, params) {
+    const rawToken = process.env.LURKAPI_API_KEY;
     if (!rawToken || !rawToken.trim()) {
-        throw new Error('Missing BRIGHTDATA_API_TOKEN in environment configuration');
+        throw new Error('Missing LURKAPI_API_KEY in environment configuration');
     }
-    const token = rawToken.trim().replace(/^Bearer\s+/i, '');
 
-    const datasetId = process.env.BRIGHTDATA_LINKEDIN_JOBS_DATASET_ID || 'gd_lpfll7v5hcqtkxl6l';
-    const url = new URL(BRIGHTDATA_API_URL);
-    url.searchParams.set('dataset_id', datasetId);
-    url.searchParams.set('notify', 'false');
-    url.searchParams.set('include_errors', 'true');
-    url.searchParams.set('type', 'discover_new');
-    url.searchParams.set('discover_by', 'keyword');
+    const url = new URL(`${LURKAPI_BASE_URL}${path}`);
+    for (const [key, value] of Object.entries(params || {})) {
+        if (value !== undefined && value !== null && value !== '') {
+            url.searchParams.set(key, String(value));
+        }
+    }
 
-    const timeoutMs = Number(process.env.BRIGHTDATA_LINKEDIN_TIMEOUT_MS) || 90000;
+    const timeoutMs = Number(process.env.LURKAPI_LINKEDIN_TIMEOUT_MS) || 90000;
     let response;
     try {
         response = await fetch(url, {
-            method: 'POST',
+            method: 'GET',
             headers: {
-                Authorization: ['Bearer', token].join(' '),
-                'Content-Type': 'application/json'
+                'x-api-key': rawToken.trim(),
+                Accept: 'application/json'
             },
-            body: JSON.stringify({
-                input: [input],
-                limit_per_input: limitPerInput
-            }),
             signal: AbortSignal.timeout(timeoutMs)
         });
     } catch (error) {
         if (error.name === 'AbortError' || error.name === 'TimeoutError') {
-            throw new Error(`Bright Data LinkedIn request timed out after ${timeoutMs}ms. Try a smaller limit or narrower search.`);
+            throw new Error(`LurkAPI LinkedIn request timed out after ${timeoutMs}ms.`);
         }
         throw error;
     }
@@ -43,15 +37,27 @@ async function scrapeLinkedIn(input, limitPerInput) {
         payload = text ? JSON.parse(text) : null;
     } catch {
         const detail = text.trim().replace(/\s+/g, ' ').slice(0, 200);
-        throw new Error(`Bright Data returned invalid JSON (${response.status}): ${detail || 'empty response'}`);
+        throw new Error(`LurkAPI returned invalid JSON (${response.status}): ${detail || 'empty response'}`);
     }
 
-    if (!response.ok) {
-        const upstreamMessage = payload?.message || payload?.error || response.statusText;
-        throw new Error(`Bright Data request failed (${response.status}): ${upstreamMessage}`);
+    if (!response.ok || payload?.success === false) {
+        const upstreamMessage = payload?.error || payload?.message || response.statusText;
+        const code = payload?.code ? ` ${payload.code}` : '';
+        const error = new Error(`LurkAPI request failed (${response.status})${code}: ${upstreamMessage}`);
+        error.status = response.ok ? 502 : response.status;
+        error.code = payload?.code;
+        throw error;
     }
 
     return payload;
 }
 
-module.exports = { scrapeLinkedIn };
+async function searchLinkedInJobs(params) {
+    return lurkRequest('/jobs/search', params);
+}
+
+async function getLinkedInJob(url) {
+    return lurkRequest('/job', { url });
+}
+
+module.exports = { searchLinkedInJobs, getLinkedInJob };
